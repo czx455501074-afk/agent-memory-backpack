@@ -1,5 +1,5 @@
 import { homedir } from 'node:os'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { isAbsolute, dirname, relative, resolve, sep } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { resolveClientConfig } from './resolve-config.mjs'
@@ -54,6 +54,9 @@ export async function loadClientConfig(env = process.env) {
     token: raw.token,
     projectId: raw.projectId.trim(),
     projectRoot: resolve(raw.projectRoot),
+    // Where the shared database lives. The adapter needs it to start a core
+    // when none is running; the credential's own directory is authoritative.
+    dataDir: dirname(configPath),
   })
 }
 

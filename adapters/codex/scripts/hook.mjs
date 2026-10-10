@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createAdapterLogger } from "./log.mjs";
 import { resolveClientConfig } from "./resolve-config.mjs";
+import { ensureCoreRunning } from "./ensure-core.mjs";
 
 const MAX_STDIN_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 4500;
@@ -81,10 +83,10 @@ function readScopeConfig() {
     return { diagnostic: "client configuration has no absolute projectRoot" };
   }
 
-  return { config, projectRoot: config.projectRoot };
+  return { config, projectRoot: config.projectRoot, configPath: path };
 }
 
-function loadConfig(config) {
+function loadConfig(config, configPath) {
   if (typeof config.projectId !== "string" || !config.projectId.trim()) {
     throw new Error("Agent Memory Backpack client configuration requires projectId");
   }
@@ -120,7 +122,40 @@ function loadConfig(config) {
     token: config.token,
     projectId: config.projectId.trim(),
     projectRoot: config.projectRoot,
+    // The credential's directory is where the shared database lives, which the
+    // core needs when it has to be started.
+    dataDir: dirname(configPath),
   };
+}
+
+/**
+ * Start the shared core for this session if nothing is listening yet.
+ *
+ * Only called on SessionStart. This hook is one short-lived process per event,
+ * so spawning on every prompt or tool call would race many attempts at a single
+ * port; a session start fires once and early enough that the first tool call
+ * already finds the core warm.
+ *
+ * Failures are logged, never raised: a core that will not start must not look
+ * like a broken plugin, and the gate path already reports an unreachable core
+ * as a clear refusal.
+ */
+async function startCoreIfNeeded(config, logger) {
+  const coreEntry = [join(dirname(fileURLToPath(import.meta.url)), "..", "runtime", "cli.js")]
+    .find((path) => existsSync(path));
+  try {
+    const outcome = await ensureCoreRunning({
+      endpoint: config.endpoint.origin,
+      dataDir: config.dataDir,
+      coreEntry: coreEntry ?? join(dirname(fileURLToPath(import.meta.url)), "..", "runtime", "cli.js"),
+    });
+    if (outcome.started) logger.info("core.started", { endpoint: config.endpoint.origin });
+    else if (outcome.reason !== "already-running") {
+      logger.warn("core.start_failed", { reason: outcome.reason, detail: outcome.detail ?? "" });
+    }
+  } catch (error) {
+    logger.warn("core.start_failed", { reason: "unexpected", detail: error instanceof Error ? error.message : "unknown" });
+  }
 }
 
 function projectScope(input, projectRoot) {
@@ -362,7 +397,7 @@ async function main() {
 
   let config;
   try {
-    config = loadConfig(scopeConfig.config);
+    config = loadConfig(scopeConfig.config, scopeConfig.configPath);
   } catch (error) {
     logger.error("hook.config_load_failed", { event, message: error.message });
     if (event === PRE_TOOL_USE) {
@@ -376,6 +411,11 @@ async function main() {
   logger.info("hook.start", { event, projectId: config.projectId, sessionId: String(input.session_id ?? "") });
   const started = Date.now();
   try {
+    // Starting the core belongs to SessionStart only. This hook is a short-lived
+    // process per event, so firing a spawn on every prompt or tool call would
+    // race many attempts at one port; a new session is once, and early enough
+    // that the first tool call already finds a warm core.
+    if (event === "SessionStart") await startCoreIfNeeded(config, logger);
     if (event === "SessionStart" || event === "UserPromptSubmit") {
       await prepare(input, config);
     } else if (event === PRE_TOOL_USE) {

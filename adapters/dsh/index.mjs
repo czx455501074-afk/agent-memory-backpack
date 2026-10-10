@@ -1,6 +1,24 @@
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { createClient, isRecordValue, isWithinProject, loadClientConfig } from './core-client.mjs'
 import { createAdapterLogger } from './log.mjs'
+import { ensureCoreRunning } from './ensure-core.mjs'
+
+/** The packaged core entry point, resolved beside this adapter. */
+const ADAPTER_DIR = dirname(fileURLToPath(import.meta.url))
+/**
+ * Where the core entry point may live.
+ *
+ * Packaged: `dsh-plugin/runtime/cli.js` beside this file. A development checkout
+ * has no such copy, so `dist/src/cli.js` two levels up is tried as well. Only
+ * the first that exists is used; a missing entry is reported, never raised.
+ */
+const CORE_ENTRY_CANDIDATES = [
+  join(ADAPTER_DIR, 'runtime', 'cli.js'),
+  join(ADAPTER_DIR, '..', '..', 'dist', 'src', 'cli.js'),
+]
 
 export const name = 'agent-memory-backpack'
 export const inject = ['tools']
@@ -140,6 +158,37 @@ export async function apply(ctx) {
   }
   logger.info('adapter.config', {
     endpoint: config.endpoint, projectId: config.projectId, projectRoot: config.projectRoot,
+  })
+
+  // The core is a local service, but asking a user to run it by hand turns a
+  // plugin into an operation; when they forget, every tool fails with no hint
+  // why. Start it here instead.
+  //
+  // Deliberately *not* awaited. Loading a plugin must stay fast, and the core
+  // takes seconds to become healthy; blocking the host's plugin load on it would
+  // trade one delay for another. The first tool call waits for the core anyway,
+  // so the work overlaps with whatever else the session does first.
+  //
+  // Failures are logged, never thrown: a core that will not start must not look
+  // like a broken plugin, and the adapter's tools already report an unreachable
+  // core clearly.
+  const coreEntry = CORE_ENTRY_CANDIDATES.find(path => existsSync(path))
+  // Tied to the plugin's lifecycle: an unloaded plugin stops waiting. A poll that
+  // outlives its plugin is a leak, and in tests it surfaces as asynchronous
+  // activity reported after the test ended.
+  const coreAbort = new AbortController()
+  ctx.effect(() => () => coreAbort.abort(), 'agent-memory-backpack: stop waiting for the core')
+  void ensureCoreRunning({
+    endpoint: config.endpoint, dataDir: config.dataDir,
+    coreEntry: coreEntry ?? CORE_ENTRY_CANDIDATES[0], signal: coreAbort.signal,
+  }).then(outcome => {
+    if (outcome.reason === 'already-running') logger.debug('core.already_running', { endpoint: config.endpoint })
+    else if (outcome.started) logger.info('core.started', { endpoint: config.endpoint, entry: coreEntry })
+    else logger.warn('core.start_failed', { reason: outcome.reason, detail: outcome.detail ?? '' })
+  }).catch(error => {
+    // `ensureCoreRunning` is written not to throw; this guards a future edit and
+    // keeps a rejection from surfacing as an unhandled one.
+    logger.warn('core.start_failed', { reason: 'unexpected', detail: error instanceof Error ? error.message : 'unknown' })
   })
 
   const client = createClient(config)

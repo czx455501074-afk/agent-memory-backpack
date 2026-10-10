@@ -37,11 +37,20 @@ function json(res, status, value) {
 async function readBody(req) {
   const chunks = []
   for await (const chunk of req) chunks.push(chunk)
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  const text = Buffer.concat(chunks).toString('utf8')
+  // A bodyless request is normal: the adapter probes `GET /health` before it
+  // talks to the core, and an unconditional parse threw on the empty string,
+  // surfacing as an unhandled rejection after the test had ended.
+  if (!text.trim()) return undefined
+  return JSON.parse(text)
 }
 
 async function startServer() {
   server = createServer(async (req, res) => {
+    // The health probe is answered before anything else and needs no credential,
+    // exactly like the real core. Without this the probe would fall through to
+    // the body parse and be reported as a malformed request.
+    if (req.url === '/health') return json(res, 200, { protocolVersion: 1, status: 'ok' })
     const body = await readBody(req)
     state.requests.push({
       path: req.url, body, authorization: req.headers.authorization,

@@ -37,7 +37,34 @@ for (const target of ['core', 'codex-plugin']) {
   });
   if (installed.status !== 0) throw new Error(`Runtime installation failed: ${target}`);
 }
+// The DSH adapter starts the shared core itself, so its package must carry the
+// core runtime as well. Shipping only the adapter would let the plugin load and
+// then fail every tool call with "core unavailable", which is the failure this
+// project keeps having to apologise for.
+//
+// The packages stay separate rather than sharing one runtime copy because each
+// is installed by a different host into a different tree; a relative path from
+// one to the other does not survive either host's install step.
 cpSync(join(root, 'adapters/dsh'), join(out, 'dsh-plugin'), { recursive: true });
+cpSync(join(root, 'dist/src'), join(out, 'dsh-plugin/runtime'), { recursive: true });
+{
+  const dir = join(out, 'dsh-plugin');
+  // The adapter package itself has no runtime dependencies; declaring the core's
+  // means `npm ci` below has something to install.
+  const dshManifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({
+    ...dshManifest, dependencies: { ...manifest.dependencies },
+  }, null, 2));
+  cpSync(join(root, 'package-lock.json'), join(dir, 'package-lock.json'));
+  const npmCli = process.env.npm_execpath;
+  if (!npmCli || !existsSync(npmCli) || !statSync(npmCli).isFile() || !npmCli.toLowerCase().endsWith('.js')) {
+    throw new Error('Run packaging via npm run pack:local so npm_execpath identifies the npm CLI JavaScript file.');
+  }
+  const installed = spawnSync(process.execPath, [npmCli, 'ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], {
+    cwd: dir, stdio: 'inherit', windowsHide: true,
+  });
+  if (installed.status !== 0) throw new Error('Runtime installation failed: dsh-plugin');
+}
 // The desktop console ships as source. It is an Electron app, so its runtime is
 // the user's Electron rather than an npm dependency of the core; shipping the
 // source keeps the artifact small and lets the console be updated independently.

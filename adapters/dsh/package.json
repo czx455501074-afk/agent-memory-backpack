@@ -22,7 +22,8 @@
     "log.mjs",
     "cordis.patch.yml",
     "dsh-plugin.naming.json",
-    "resolve-config.mjs"
+    "resolve-config.mjs",
+    "ensure-core.mjs"
   ],
   "engines": {
     "node": ">=24.13.0 <25"
