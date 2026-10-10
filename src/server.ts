@@ -1,0 +1,197 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
+import { z } from 'zod';
+import { Store } from './store.js';
+import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, DomainError } from './schema.js';
+import { coreSchema, type CoreConfig } from './config.js';
+import { exportArchive, importArchive, inspectArchive } from './archive.js';
+
+const MAX_BODY = 65536;
+function matches(a: string, b: string) { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
+function reply(res: ServerResponse, status: number, value: unknown) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+  res.end(JSON.stringify(value));
+}
+async function readBody(req: IncomingMessage): Promise<unknown> {
+  if (!req.headers['content-type']?.startsWith('application/json')) throw new DomainError('content_type', 'JSON required', 415);
+  let size = 0; const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    const bytes = Buffer.from(chunk); size += bytes.length;
+    if (size > MAX_BODY) throw new DomainError('too_large', 'Request too large', 413);
+    chunks.push(bytes);
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { throw new DomainError('invalid_json', 'Invalid JSON'); }
+}
+/**
+ * Endpoints that change the effective library, or that review changes to it.
+ *
+ * The plan requires that an agent may propose but must not gain normative
+ * management power, and acceptance case 18 tests exactly that. Blocking only the
+ * approval URL would have been a partial fix: `supersede` and `structure` write a
+ * new effective revision directly, so an adapter that could call them could still
+ * change what every other session reads, without any review. They are therefore
+ * admin-only alongside the review endpoints.
+ */
+const ADMIN_ONLY = new Set([
+  '/v1/proposals/list', '/v1/proposals/approve', '/v1/proposals/reject',
+  '/v1/rescan/interval', '/v1/rescan/mark',
+  '/v1/knowledge/supersede', '/v1/knowledge/structure',
+  // Migration moves the whole library, so it belongs to the human. An agent that
+  // could export would be able to read every entry in one call regardless of
+  // project scope, and an agent that could import would be able to write entries
+  // straight into the effective library, bypassing both the candidate queue and
+  // the project scope check that `prepare` applies.
+  //
+  // `/v1/backup/inspect` is deliberately NOT here: it reports only counts, file
+  // names and a timestamp, which `/v1/stats` already exposes, so it grants an
+  // agent nothing new while letting it answer "what is in this file?".
+  '/v1/backup/export', '/v1/backup/import',
+]);
+
+/**
+ * Guidance returned when an adapter tries an admin-only operation.
+ *
+ * A bare 403 tells an agent nothing about what to do instead. This names the
+ * alternative the plan actually intends: submit a candidate and let a human
+ * decide.
+ */
+const ADMIN_ONLY_HINT = 'This operation changes the effective knowledge base and requires the admin credential. '
+  + 'Submit a candidate instead (amb_submit_experience) and let a human review it.';
+
+export function createCoreServer(store: Store, config: CoreConfig) {
+  const validated = coreSchema.parse(config);
+  if (new Set(validated.clients.map(c => c.token)).size !== validated.clients.length)
+    throw new Error('Adapter credentials must be distinct');
+  const server = createServer(async (req, res) => {
+    try {
+      if (req.headers.origin) throw new DomainError('origin_denied', 'Browser requests not enabled in P0', 403);
+      const address = server.address();
+      const port = address && typeof address === 'object' ? address.port : validated.port;
+      if (![`127.0.0.1:${port}`, `localhost:${port}`].includes(req.headers.host ?? ''))
+        throw new DomainError('host_denied', 'Invalid host', 403);
+      if (req.method === 'GET' && req.url === '/health') return reply(res, 200, { protocolVersion: 1, status: 'ok', phase: 'P0' });
+      if (req.method !== 'POST') throw new DomainError('method', 'POST required', 405);
+      const header = req.headers.authorization ?? '';
+      const principal = validated.clients.find(c => matches(header, `Bearer ${c.token}`));
+      if (!principal) throw new DomainError('unauthorized', 'Adapter authentication required', 401);
+      if (req.headers['x-amb-protocol'] !== '1') throw new DomainError('protocol_mismatch', 'Unsupported or missing protocol version', 426);
+      const role = principal.role;
+      const body = await readBody(req);
+      const envelope = z.object({ projectId: z.string(), adapter: z.string().optional() }).passthrough().parse(body);
+      if (envelope.projectId !== principal.projectId || (envelope.adapter && envelope.adapter !== principal.id))
+        throw new DomainError('scope_denied', 'Credential cannot access that project or adapter identity', 403);
+      // Role check before the handler runs, so a management endpoint cannot be
+      // reached by an adapter at all rather than being guarded case by case.
+      if (ADMIN_ONLY.has(req.url ?? '') && role !== 'admin')
+        throw new DomainError('forbidden', ADMIN_ONLY_HINT, 403);
+      store.cleanup();
+      switch (req.url) {
+        case '/v1/prepare': { const p = contextSchema.parse(body); return reply(res, 200, store.prepare(p.projectId, p.query)); }
+        case '/v1/search': { const p = contextSchema.parse(body); return reply(res, 200, { workflows: store.search(p.projectId, p.query), knowledgeRevision: store.revision }); }
+        case '/v1/expand': { const p = expandSchema.parse(body); return reply(res, 200, store.expand(p.projectId, p.workflowId, p.stageId)); }
+        case '/v1/gate': { const p = gateSchema.parse(body); return reply(res, 200, store.gate(p.projectId, p.toolName)); }
+        case '/v1/proposals': { const p = proposalSchema.parse(body); return reply(res, 200, store.submit(principal.id, p)); }
+        case '/v1/events': { const p = eventSchema.parse(body); return reply(res, 200, store.event(principal.id, p)); }
+        case '/v1/proposals/list': { const p = z.object({ projectId: z.string(), state: z.string().optional() }).parse(body); return reply(res, 200, { proposals: store.listProposals(p.projectId, p.state) }); }
+        // Approval carries the reviewer-supplied structured entry; the discovery text is never promoted as-is.
+        // `allowGlobalScope` must be stated explicitly, because promoting a
+        // project-scoped proposal to a global entry applies it everywhere.
+        case '/v1/proposals/approve': {
+          const p = z.object({
+            projectId: z.string(), id: z.string(), entry: knowledgeSchema,
+            allowGlobalScope: z.boolean().default(false),
+          }).parse(body);
+          return reply(res, 200, { knowledgeRevision: store.approveProposal(p.id, p.entry, { allowGlobalScope: p.allowGlobalScope }) });
+        }
+        case '/v1/proposals/reject': { const p = z.object({ projectId: z.string(), id: z.string() }).parse(body); store.rejectProposal(p.id); return reply(res, 200, { state: 'rejected' }); }
+        // Filtered by project: an earlier version returned every norm in the
+        // database, so one project's credential could read another project's
+        // normative text. `scopedEntries()` applies the same scope rule as
+        // prepare, gate and search while keeping the Entry shape callers expect.
+        case '/v1/norms': { const p = z.object({ projectId: z.string() }).parse(body); return reply(res, 200, { norms: store.scopedEntries(p.projectId).filter(e => e.content.kind === 'norm'), knowledgeRevision: store.revision }); }
+        case '/v1/knowledge/read': { const p = z.object({ projectId: z.string(), knowledgeId: z.string(), includeLeaves: z.boolean().optional() }).parse(body); return reply(res, 200, store.readKnowledge(p.projectId, p.knowledgeId, p.includeLeaves ?? false)); }
+        case '/v1/stats': { const p = z.object({ projectId: z.string() }).parse(body); return reply(res, 200, store.stats()); }
+        // Rescan cadence: an adapter asks whether a scan is due instead of
+        // rescanning on every session start.
+        case '/v1/rescan/state': { const p = z.object({ projectId: z.string(), at: z.number().int().optional() }).parse(body); const state = store.rescanState(); return reply(res, 200, { ...state, due: store.rescanDue(p.at) }); }
+        case '/v1/rescan/interval': { const p = z.object({ projectId: z.string(), intervalMs: z.number().int() }).parse(body); return reply(res, 200, store.setRescanInterval(p.intervalMs)); }
+        case '/v1/rescan/mark': { const p = z.object({ projectId: z.string(), at: z.number().int().optional() }).parse(body); return reply(res, 200, store.markRescanned(p.at)); }
+        // Working-time correction: replace or complement an earlier experience
+        // after verifying it in practice. History is always retained.
+        case '/v1/knowledge/supersede': {
+          const p = z.object({
+            projectId: z.string(), oldId: z.string(), newId: z.string(),
+            action: z.enum(['supersede', 'supplement']).default('supersede'),
+            reason: z.string().min(1).max(500), evidence: z.string().min(1).max(2000),
+          }).parse(body);
+          return reply(res, 200, store.supersede({ ...p, origin: 'agent', projectId: p.projectId }));
+        }
+        case '/v1/knowledge/history': { const p = z.object({ projectId: z.string(), knowledgeId: z.string() }).parse(body); return reply(res, 200, store.history(p.knowledgeId)); }
+        // Structuring: the caller supplies the authored workflow; nothing is
+        // inferred from the adopted Markdown.
+        case '/v1/knowledge/structure': {
+          const p = z.object({
+            projectId: z.string(), skillId: z.string(), workflow: workflowSchema,
+            derivedBy: z.enum(['user', 'agent']).default('agent'),
+            evidence: z.string().min(1).max(2000),
+          }).parse(body);
+          return reply(res, 200, store.structureSkill({ skillId: p.skillId, workflow: p.workflow, derivedBy: p.derivedBy, evidence: p.evidence, projectId: p.projectId }));
+        }
+        case '/v1/knowledge/unstructured': { const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body); return reply(res, 200, { skills: store.unstructuredSkills(p.limit) }); }
+        case '/v1/tasks/record': { const p = z.object({ projectId: z.string(), task: taskSchema }).parse(body); return reply(res, 200, store.recordTask(p.projectId, p.task)); }
+        case '/v1/tasks/list': { const p = z.object({ projectId: z.string(), status: taskStatus.optional() }).parse(body); return reply(res, 200, { tasks: store.tasks(p.projectId, p.status) }); }
+        case '/v1/tasks/handoff': { const p = z.object({ projectId: z.string(), taskId: z.string() }).parse(body); return reply(res, 200, store.handoff(p.taskId, p.projectId)); }
+        /**
+         * Migration: write every authority row into one portable file, read one
+         * back, or merge one in.
+         *
+         * The path is supplied by the caller because the core cannot ask a
+         * desktop user where to put a file; the Electron console opens a native
+         * save dialog in its main process and passes the chosen path here. Only
+         * the path travels, never the file contents, so the 64 KB request limit
+         * does not apply and the archive is built from the database instead of
+         * being uploaded over HTTP.
+         */
+        case '/v1/backup/export': {
+          // `overwrite` is the caller asserting that a human already answered the
+          // replace question. The console opens a native save dialog with
+          // `showOverwriteConfirmation`, so the user has confirmed; without this
+          // flag the core could only see "the file exists" and refuse, making the
+          // dialog's confirmation meaningless and a second export impossible.
+          // It defaults to false because a caller that skipped the dialog must
+          // not be able to silently destroy an existing archive.
+          const p = z.object({
+            projectId: z.string(), file: z.string().min(1).max(4096),
+            dryRun: z.boolean().default(false), overwrite: z.boolean().default(false),
+          }).parse(body);
+          const result = exportArchive(store, { file: p.file, dryRun: p.dryRun, overwrite: p.overwrite });
+          return reply(res, 200, {
+            ...result,
+            note: '归档包含全部知识、历史版本、任务与候选队列，但不含任何凭据。把它复制到另一台设备，装上插件后在「数据迁移」里导入即可。',
+          });
+        }
+        case '/v1/backup/inspect': {
+          const p = z.object({ projectId: z.string(), file: z.string().min(1).max(4096) }).parse(body);
+          return reply(res, 200, inspectArchive(p.file));
+        }
+        case '/v1/backup/import': {
+          const p = z.object({
+            projectId: z.string(), file: z.string().min(1).max(4096),
+            dryRun: z.boolean().default(false), onConflict: z.enum(['skip', 'fail']).default('skip'),
+          }).parse(body);
+          const result = importArchive(store, { file: p.file, dryRun: p.dryRun, onConflict: p.onConflict });
+          return reply(res, 200, { ...result, note: '合并式导入：只新增，不删除。本机更新或分叉的条目会保留并计入 conflicts。' });
+        }
+        default: throw new DomainError('not_found', 'Unknown endpoint', 404);
+      }
+    } catch (error) {
+      if (error instanceof DomainError) return reply(res, error.status, { code: error.code, message: error.message });
+      if (error instanceof z.ZodError) return reply(res, 400, { code: 'invalid_request', message: 'Request fields are invalid' });
+      return reply(res, 500, { code: 'internal_error', message: 'Core operation failed' });
+    }
+  });
+  server.requestTimeout = 10000;
+  server.headersTimeout = 5000;
+  return server;
+}

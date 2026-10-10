@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "policy": "dsh-plugin-naming/v1",
+  "plugin": {
+    "namespace": "amb",
+    "name": "knowledge",
+    "coordinate": "agent-memory-backpack/backpack",
+    "packageName": "dsh-agent-memory-backpack"
+  },
+  "names": {
+    "pluginNames": ["agent-memory-backpack"],
+    "loaderIds": ["agent-memory-backpack"],
+    "services": [],
+    "tools": [
+      "amb_inspect_archive",
+      "amb_knowledge_history",
+      "amb_prepare",
+      "amb_read_knowledge",
+      "amb_read_stage",
+      "amb_search_workflows",
+      "amb_self_check",
+      "amb_structure_skill",
+      "amb_submit_experience",
+      "amb_supersede_experience",
+      "amb_unstructured_skills"
+    ],
+    "commands": [],
+    "skills": [],
+    "skillProviders": [],
+    "events": [],
+    "settingsNamespaces": [],
+    "routes": []
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "name": "agent-memory-backpack",
+  "version": "0.1.0-p0.1",
+  "type": "module",
+  "description": "Shared workflow knowledge core with DeepSeek Harness and Codex desktop adapters",
+  "license": "MIT",
+  "keywords": [
+    "agent",
+    "knowledge-base",
+    "skills",
+    "mcp",
+    "deepseek-harness",
+    "codex"
+  ],
+  "engines": {
+    "node": ">=24.13.0 <25"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js test/*.test.mjs",
+    "start": "node dist/src/cli.js serve",
+    "doctor": "node dist/src/cli.js doctor",
+    "logs": "node dist/src/cli.js logs",
+    "console": "electron console/main.cjs",
+    "accept:desktop": "node scripts/desktop-accept.mjs",
+    "pack:local": "node scripts/package.mjs",
+    "install:local": "node scripts/amb-install.mjs",
+    "uninstall:local": "node scripts/amb-uninstall.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.1",
+    "electron": "^44.7.0",
+    "typescript": "7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/czx455501074-afk/agent-memory-backpack.git"
+  },
+  "homepage": "https://github.com/czx455501074-afk/agent-memory-backpack",
+  "bugs": {
+    "url": "https://github.com/czx455501074-afk/agent-memory-backpack/issues"
+  }
+}

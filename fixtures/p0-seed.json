@@ -1,0 +1,44 @@
+{
+  "entries": [
+    {
+      "id": "p0-test-rule",
+      "kind": "norm",
+      "title": "P0 测试禁用工具规范",
+      "scope": { "kind": "global" },
+      "baseRevision": 0,
+      "body": "P0 行为测试专用规范：不得调用 amb_p0_blocked。此条目只用于自动化测试，不代表用户真实规范。",
+      "deniedTools": ["amb_p0_blocked"]
+    },
+    {
+      "id": "p0-cn-workflow",
+      "kind": "workflow",
+      "title": "中文示例：本地流程资料检索与核对",
+      "scope": { "kind": "project", "projectId": "project-demo" },
+      "baseRevision": 0,
+      "overview": "在开始一项本地工作前，检索适用的完整流程，读取必要阶段，并核对完成条件。",
+      "triggers": ["需要查找并执行本地知识流程"],
+      "categories": [["本地检索", "工作准备"], ["流程执行", "完成核对"]],
+      "tags": ["P0测试", "中文流程"],
+      "preconditions": ["已确定当前项目标识", "只在用户授权范围内执行后续操作"],
+      "isEntryPoint": true,
+      "stages": [
+        {
+          "id": "locate",
+          "title": "检索完整流程",
+          "instructions": "按任务关键词检索完整流程入口，并确认其适用范围与前提。",
+          "checks": ["返回的是完整流程入口", "适用项目与当前项目相符"],
+          "dependencies": []
+        },
+        {
+          "id": "read-and-check",
+          "title": "读取阶段并核对结果",
+          "instructions": "读取当前阶段的完整说明，完成必要检查，并依据完成判据报告结果。",
+          "checks": ["必要依赖均可用", "完成判据逐项核对"],
+          "dependencies": []
+        }
+      ],
+      "completion": ["适用流程及阶段已确认", "必要检查结果已记录"],
+      "recovery": "若流程或必要依赖不可用，停止执行该流程并记录缺失项。"
+    }
+  ]
+}

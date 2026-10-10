@@ -1,0 +1,37 @@
+{
+  "name": "dsh-agent-memory-backpack",
+  "version": "0.1.0-p0.1",
+  "description": "Agent Memory Backpack shared knowledge adapter for DeepSeek Harness with management UI",
+  "type": "module",
+  "main": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.mjs"
+    },
+    "./core-client": {
+      "default": "./core-client.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["index.mjs", "index.d.ts", "core-client.mjs", "log.mjs", "cordis.patch.yml", "dsh-plugin.naming.json"],
+  "engines": { "node": ">=24.13.0 <25" },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.4 <5",
+    "@deepseek-ai/dsh-agent": ">=0.2.0-rc.1 <0.3",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1 <0.3",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <0.3"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "verifiedWith": {
+      "note": "Versions this adapter was actually exercised against. A host outside this list is supported on a best-effort basis: capabilities are probed at load time and a missing one fails loudly rather than degrading silently.",
+      "runtime": "0.2.0-rc.2",
+      "cordis": "4.0.4"
+    },
+    "noClientHalf": {
+      "note": "This plugin deliberately declares no dsh.client browser half. Its UI is a separate Electron application that talks to the core directly, so there is nothing for the host's client module loader to mount. Declaring one would require a window.__ModuleLoader__ bundle and would fail at load time."
+    }
+  }
+}

@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <!-- Local app: no remote content, no inline eval. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;">
+  <title>Agent Memory Backpack 知识控制台</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="masthead">
+      <div class="masthead__identity">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <h1>Agent Memory Backpack 知识控制台</h1>
+          <p class="masthead__sub">本地共享规范与完整流程</p>
+        </div>
+      </div>
+      <dl class="target" id="target">
+        <div><dt>项目</dt><dd id="target-project">—</dd></div>
+        <div><dt>身份</dt><dd id="target-adapter">—</dd></div>
+        <div><dt>核心</dt><dd id="target-endpoint">—</dd></div>
+        <div><dt>状态</dt><dd id="target-connection" class="pill pill--idle">未连接</dd></div>
+      </dl>
+    </header>
+
+    <nav class="tabs" id="tabs" role="tablist">
+      <button role="tab" data-view="status" class="tab tab--active">总览</button>
+      <button role="tab" data-view="proposals" class="tab">候选审阅 <span class="count" id="count-proposals"></span></button>
+      <button role="tab" data-view="norms" class="tab">规范</button>
+      <button role="tab" data-view="unstructured" class="tab">待结构化 <span class="count" id="count-unstructured"></span></button>
+      <button role="tab" data-view="tasks" class="tab">任务日记</button>
+      <button role="tab" data-view="workflows" class="tab">流程检索</button>
+      <button role="tab" data-view="doctor" class="tab">自检 <span class="count" id="count-doctor"></span></button>
+      <button role="tab" data-view="migrate" class="tab">数据迁移</button>
+    </nav>
+
+    <main class="panel" id="panel" aria-live="polite">
+      <div class="placeholder">正在读取核心…</div>
+    </main>
+
+    <footer class="statusbar">
+      <span id="foot-note">令牌仅保存在主进程，渲染进程不接触凭据。</span>
+      <button id="refresh" class="ghost">刷新</button>
+    </footer>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

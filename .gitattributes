@@ -1,0 +1,23 @@
+# Normalize line endings so a Windows checkout and a Unix checkout produce
+# identical file contents in the repository. Without this, Git rewrites every
+# text file on the first clone and the artifact hashes in the packaging step
+# differ between platforms.
+* text=auto eol=lf
+
+# Binary payloads must never be converted.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.sqlite binary
+*.exe binary
+*.dll binary
+
+# Line-ending sensitive formats.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Generated files that should not appear in diffs.
+package-lock.json -diff linguist-generated

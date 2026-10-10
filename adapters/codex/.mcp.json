@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "amb": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["runtime/mcp.js"],
+      "cwd": ".",
+      "env_vars": ["AMB_CONFIG"]
+    }
+  }
+}
