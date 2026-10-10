@@ -86,7 +86,11 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   const checks: Check[] = [];
   const versions: Record<string, string> = { ...(options.runtimeVersions ?? {}) };
   const dataDir = resolve(options.dataDir);
-  const clientPath = options.clientPath ?? join(dataDir, 'client.json');
+  // An adapter's credential now lives under its own name in the shared data
+  // directory. Falling back to a bare `client.json` keeps older installs working,
+  // and a caller that names a path still wins.
+  const clientPath = options.clientPath
+    ?? (existsSync(join(dataDir, 'codex-client.json')) ? join(dataDir, 'codex-client.json') : join(dataDir, 'client.json'));
 
   versions.plugin = pluginVersion();
 

@@ -205,6 +205,23 @@ npm run uninstall:local -- --purge-data --yes
 - ✅ 权限分离：适配器凭据只能读取与提交候选；审阅、推翻、导入必须用管理凭据
 - ✅ 单文件归档导出导入（`.ambpack`），零外部依赖，跨设备迁移
 
+## 两个桌面怎么共用同一份数据
+
+不需要你配任何东西。两端都默认读取同一个数据目录，各取自己那份凭据：
+
+```
+~/.agent-memory-backpack/
+├── core.json           核心配置（端口、项目）
+├── knowledge.sqlite    ← 唯一的知识库，两端共用
+├── dsh-client.json     DSH 读这份
+├── codex-client.json   Codex 读这份
+└── admin-client.json   控制台读这份（审阅/迁移需要）
+```
+
+三份凭据的 `endpoint` 和 `projectId` 相同，只有 token 与角色不同——所以是**一个核心、一个库**，而权限仍然分离。DSH 用 `dsh-client.json`、Codex 用 `codex-client.json`，名字不同、目录相同，解析结果必然落在同一个库上。
+
+想放到别处（或做隔离测试）用环境变量覆盖：`AMB_DSH_CONFIG`、`AMB_CONFIG`、`AMB_CONSOLE_CONFIG`。**覆盖只在指向的文件确实存在时生效**：写错的路径会打印一条警告并回落到共享默认目录，而不是让插件直接失效。
+
 ## 隐私与信任：三个常见问题
 
 **Q: 会不会把我的数据传到外部？**  

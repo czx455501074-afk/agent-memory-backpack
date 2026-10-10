@@ -5,6 +5,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createAdapterLogger } from "./log.mjs";
+import { resolveClientConfig } from "./resolve-config.mjs";
 
 const MAX_STDIN_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 4500;
@@ -59,9 +60,12 @@ async function readInput() {
 }
 
 function readScopeConfig() {
-  const path = resolve(
-    process.env.AMB_CONFIG || join(homedir(), ".agent-memory-backpack", "client.json"),
-  );
+  // Resolution lives in the shared module so both adapters land on the same
+  // core and the same database. A stale AMB_CONFIG now falls back to the shared
+  // default and reports why, instead of disabling the plugin with no explanation.
+  const resolved = resolveClientConfig('codex');
+  if (resolved.warning) process.stderr.write(`Agent Memory Backpack: ${resolved.warning}\n`);
+  const path = resolved.path;
 
   let config;
   try {

@@ -2,6 +2,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
+import { resolveClientConfig } from './resolve-config.mjs'
 
 const REQUEST_TIMEOUT_MS = 5_000
 
@@ -10,17 +11,22 @@ function isRecord(value) {
 }
 
 export async function loadClientConfig(env = process.env) {
-  const explicitPath = env.AMB_DSH_CONFIG?.trim() || env.AMB_CONFIG?.trim()
-  const configPath = explicitPath
-    ? resolve(explicitPath)
-    : resolve(homedir(), '.agent-memory-backpack', 'dsh-client.json')
+  // Shared resolution: both adapters must read the same core and the same
+  // database. A stale AMB_DSH_CONFIG / AMB_CONFIG now falls back to the shared
+  // default with a warning, rather than failing with "not configured" and
+  // leaving the user to guess which pointer went bad.
+  const resolved = resolveClientConfig('dsh', env)
+  if (resolved.warning) {
+    console.warn(`agent-memory-backpack: ${resolved.warning}`)
+  }
+  const configPath = resolved.path
 
   let raw
   try {
     raw = JSON.parse(await readFile(configPath, 'utf8'))
   } catch (cause) {
     if (cause?.code === 'ENOENT') {
-      throw new Error('Agent Memory Backpack DSH client is not configured. Set AMB_DSH_CONFIG or create ~/.agent-memory-backpack/dsh-client.json.')
+      throw new Error(`Agent Memory Backpack DSH client is not configured. Run "amb-install" or create ${configPath}.`)
     }
     throw new Error('Agent Memory Backpack client configuration could not be read or parsed.')
   }

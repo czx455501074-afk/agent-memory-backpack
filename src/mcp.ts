@@ -125,6 +125,10 @@ export function createMcp(client: CoreClient) {
 // The entry is exclusively the stdio server. Importing tests uses createMcp without launching it.
 import { pathToFileURL } from 'node:url';
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  try { await createMcp(new CoreClient(readClientConfig())).connect(new StdioServerTransport()); }
+  // This entry point serves the Codex adapter, so it reads the Codex credential
+  // from the shared data directory by default. An explicit AMB_CONFIG still wins,
+  // but only when it names a file that exists — a stale pointer used to disable
+  // the plugin silently.
+  try { await createMcp(new CoreClient(readClientConfig(undefined, 'codex'))).connect(new StdioServerTransport()); }
   catch (error) { console.error((error as Error).message); process.exitCode = 1; }
 }

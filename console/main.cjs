@@ -16,7 +16,8 @@
 
 const electron = require('electron');
 const { readFileSync, existsSync } = require('node:fs');
-const { dirname, join } = require('node:path');
+const { dirname, join, resolve } = require('node:path');
+const { homedir } = require('node:os');
 const { pathToFileURL } = require('node:url');
 
 // When ELECTRON_RUN_AS_NODE is set, Electron degrades to plain Node and
@@ -112,16 +113,33 @@ function resolveRuntime() {
   throw new Error(`Cannot find the core runtime. Looked in: ${candidates.join(', ')}`);
 }
 
+/**
+ * Which credential the console loads.
+ *
+ * The console is the human's review surface, so when nobody names a file its
+ * default is the admin credential in the shared data directory — not the adapter
+ * credential the environment usually points at, which would be refused for every
+ * review action.
+ *
+ * An explicitly named path must exist. Falling back from it would be worse than
+ * failing: the user asked for a specific library and would silently get a
+ * different one, and a test that names a missing file expects the refusal.
+ */
 function resolveConfigPath() {
   const fromArgv = process.argv.find(arg => arg.startsWith('--config='))?.slice('--config='.length);
-  const path = fromArgv || process.env.AMB_CONSOLE_CONFIG || process.env.AMB_CONFIG;
-  if (!path) throw new Error('Set AMB_CONSOLE_CONFIG (or AMB_CONFIG) to an adapter client.json path, or pass --config=PATH.');
-  // Checked rather than left to readFileSync: a raw ENOENT does not tell the user
-  // which setting was wrong or what to do about it.
-  if (!existsSync(path)) {
-    throw new Error(`Adapter config not found: ${path}. Generate one with "cli init", or point AMB_CONSOLE_CONFIG at an existing client.json.`);
+  const named = fromArgv || process.env.AMB_CONSOLE_CONFIG || process.env.AMB_CONFIG;
+  if (named) {
+    const path = resolve(named);
+    // Checked rather than left to readFileSync: a raw ENOENT does not tell the user
+    // which setting was wrong or what to do about it.
+    if (!existsSync(path)) {
+      throw new Error(`Adapter config not found: ${path}. Generate one with "cli init", or point AMB_CONSOLE_CONFIG at an existing client.json.`);
+    }
+    return path;
   }
-  return path;
+  const admin = join(homedir(), '.agent-memory-backpack', 'admin-client.json');
+  if (existsSync(admin)) return admin;
+  throw new Error(`Set AMB_CONSOLE_CONFIG (or AMB_CONFIG) to a client.json path, or pass --config=PATH. Expected ${admin} to exist.`);
 }
 
 /**

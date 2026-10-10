@@ -15,8 +15,18 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["index.mjs", "index.d.ts", "core-client.mjs", "log.mjs", "cordis.patch.yml", "dsh-plugin.naming.json"],
-  "engines": { "node": ">=24.13.0 <25" },
+  "files": [
+    "index.mjs",
+    "index.d.ts",
+    "core-client.mjs",
+    "log.mjs",
+    "cordis.patch.yml",
+    "dsh-plugin.naming.json",
+    "resolve-config.mjs"
+  ],
+  "engines": {
+    "node": ">=24.13.0 <25"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.4 <5",
     "@deepseek-ai/dsh-agent": ">=0.2.0-rc.1 <0.3",
@@ -24,7 +34,9 @@
     "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <0.3"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "verifiedWith": {
       "note": "Versions this adapter was actually exercised against. A host outside this list is supported on a best-effort basis: capabilities are probed at load time and a missing one fails loudly rather than degrading silently.",
       "runtime": "0.2.0-rc.2",

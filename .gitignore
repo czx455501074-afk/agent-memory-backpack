@@ -43,3 +43,6 @@ Thumbs.db
 # Internal planning records: the collaboration process behind the plan, not the
 # product documentation. Kept locally; excluded from the published surface.
 docs/plans/
+
+# Environment-detection cache written by the zerotoken skill; machine-specific.
+.zerotoken/

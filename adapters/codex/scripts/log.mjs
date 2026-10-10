@@ -43,7 +43,7 @@ function redact(value, depth = 0) {
   return out;
 }
 
-/** Where the adapter writes its log: beside its config, or the default data dir. */
+/** Where the adapter writes its log: beside its config, or the shared data dir. */
 export function defaultLogPath(env = process.env) {
   const explicit = env.AMB_LOG_DIR?.trim();
   if (explicit) return resolve(explicit);

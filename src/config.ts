@@ -1,7 +1,7 @@
-import { z } from 'zod';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { z } from 'zod';
 import { identifier } from './schema.js';
 
 export const defaultDataDir = () => join(homedir(), '.agent-memory-backpack');
@@ -35,7 +35,53 @@ export const coreSchema = z.object({
 export type ClientConfig = z.infer<typeof clientSchema>;
 export type CoreConfig = z.infer<typeof coreSchema>;
 export type Role = z.infer<typeof roleSchema>;
-export function readClientConfig(path = process.env.AMB_CONFIG ?? join(defaultDataDir(), 'client.json')): ClientConfig {
-  try { return clientSchema.parse(JSON.parse(readFileSync(path, 'utf8'))); }
-  catch { throw new Error('Agent Memory Backpack client configuration missing or invalid. Run init; set AMB_CONFIG to the generated adapter config.'); }
+
+/**
+ * The credential file an adapter should read when the caller names none.
+ *
+ * The rule that makes sharing work for any user, on any machine: both adapters
+ * default to the shared data directory and pick their file by adapter id, so DSH
+ * reads `dsh-client.json` and Codex reads `codex-client.json`. Different files,
+ * same endpoint and project, therefore one core and one database.
+ *
+ * An explicit environment variable overrides — tests and isolated runs need
+ * that — but only when it names a file that actually exists. A stale pointer
+ * otherwise disabled the adapter with a message that never mentioned the
+ * pointer, which is indistinguishable from a broken install.
+ *
+ * The adapters' own copy lives in each adapter's resolve-config module; a test
+ * asserts both resolve the same way for the same inputs.
+ */
+export interface ResolvedConfigPath { path: string; warning: string | null }
+
+export function resolveConfigPath(adapterId: 'dsh' | 'codex', env: NodeJS.ProcessEnv = process.env): ResolvedConfigPath {
+  const dir = defaultDataDir();
+  const own = join(dir, adapterId + '-client.json');
+  // Older installs wrote the Codex credential to a bare client.json.
+  const legacy = join(dir, 'client.json');
+  const fromDsh = adapterId === 'dsh' ? env.AMB_DSH_CONFIG : undefined;
+  const explicit = (fromDsh ?? env.AMB_CONFIG ?? '').trim();
+  if (explicit) {
+    const named = resolve(explicit);
+    if (existsSync(named)) return { path: named, warning: null };
+    const fallback = existsSync(own) ? own : legacy;
+    const variable = adapterId === 'dsh' ? 'AMB_DSH_CONFIG/AMB_CONFIG' : 'AMB_CONFIG';
+    const warning = variable + ' points at ' + named + ', which does not exist; using '
+      + fallback + ' instead.';
+    return { path: fallback, warning };
+  }
+  if (existsSync(own)) return { path: own, warning: null };
+  if (existsSync(legacy)) return { path: legacy, warning: null };
+  return { path: own, warning: null };
+}
+
+export function readClientConfig(path?: string, adapterId: 'dsh' | 'codex' = 'codex'): ClientConfig {
+  const resolved = resolveConfigPath(adapterId, process.env);
+  const target = path ?? resolved.path;
+  if (!path && resolved.warning) process.stderr.write('Agent Memory Backpack: ' + resolved.warning + '\n');
+  try { return clientSchema.parse(JSON.parse(readFileSync(target, 'utf8'))); }
+  catch {
+    throw new Error('Agent Memory Backpack client configuration missing or invalid: ' + target
+      + '. Run init, or set AMB_CONFIG to a generated adapter config.');
+  }
 }
