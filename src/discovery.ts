@@ -378,10 +378,20 @@ export function discover(roots: string[] = defaultScanRoots(), maxFiles = 5_000)
           let childInfo;
           try { childInfo = lstatSync(full); } catch { continue; }
           if (childInfo.isSymbolicLink()) continue;
-          if (childInfo.isDirectory()) { collect(full); continue; }
+          if (childInfo.isDirectory()) {
+            // The same exclusion the top-level walk applies, repeated here because
+            // this subtree is walked separately: the walk screens a directory
+            // before descending, but its screening never reaches these children.
+            // Without it a skill's own `history/` archive, `tmp/`, or a stray
+            // `node_modules/` was adopted as reference leaves — so a skill that
+            // had been tidied up was pulled back in with its discarded drafts.
+            if (EXCLUDED_SEGMENTS.has(child.toLowerCase())) continue;
+            collect(full);
+            continue;
+          }
           if (!childInfo.isFile()) continue;
-          // A leaf's own name is what the name-based rules care about; its parent
-          // directories were already screened when they were walked.
+          // A leaf's own name is what the name-based rules care about; the
+          // directories above it were screened by the branch above.
           const leafText = readableMarkdown(full, child, child, childInfo.size);
           if (leafText === undefined) continue;
           const leafHash = sha256(leafText);

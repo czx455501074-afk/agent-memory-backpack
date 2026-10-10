@@ -97,6 +97,35 @@ test('技能叶子随入口归组，不作为孤立片段采纳', async () => {
   } finally { await cleanup(root); }
 });
 
+test('技能下的 history/tmp 等运行态目录不被收作叶子', async () => {
+  // A skill that has been tidied up keeps its discarded drafts under `history/`.
+  // Those directories are excluded from the top-level walk by name, but the leaf
+  // subtree is walked separately and did not repeat the check — so a tidied skill
+  // was adopted complete with the very material that had been archived away.
+  const root = await fixture();
+  try {
+    const dir = join(root, 'skills', 'archived');
+    await mkdir(join(dir, 'references', 'leaves'), { recursive: true });
+    await mkdir(join(dir, 'history', 'old'), { recursive: true });
+    await mkdir(join(dir, 'tmp'), { recursive: true });
+    await writeFile(join(dir, 'SKILL.md'), '# 已归档技能\n\n## 触发\n需要时。\n');
+    await writeFile(join(dir, 'references', 'notes.md'), '# 参考\n\n有效内容。\n');
+    await writeFile(join(dir, 'history', 'old', 'draft.md'), '# 废弃草稿\n\n不应被采纳。\n');
+    await writeFile(join(dir, 'tmp', 'scratch.md'), '# 临时\n\n不应被采纳。\n');
+
+    const report = discover([dir]);
+    const entry = report.candidates[0]!;
+    assert.equal(entry.kind, 'skill');
+    assert.equal(entry.leaves?.length, 1, '只应收到 references 下的有效文档');
+    assert.match(entry.leaves![0]!.path, /notes\.md$/);
+    assert.equal(
+      (entry.leaves ?? []).some(leaf => /[\\/](history|tmp)[\\/]/.test(leaf.path)),
+      false,
+      'history/ 与 tmp/ 下的内容不得成为技能叶子',
+    );
+  } finally { await cleanup(root); }
+});
+
 test('技能目录外的孤立 Markdown 不被当作完整方法采纳', async () => {
   const root = await fixture();
   try {
