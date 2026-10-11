@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute, resolve } from 'node:path';
 import { Store } from '../src/store.js';
 import { discover } from '../src/discovery.js';
-import type { Knowledge, Workflow } from '../src/schema.js';
+import type { Knowledge, KnowledgeDraft, Workflow, WorkflowDraft } from '../src/schema.js';
 
 async function scratch(prefix: string): Promise<string> {
   return await mkdtemp(join(tmpdir(), prefix));
@@ -35,7 +35,7 @@ async function adoptSkill(s: Store, root: string): Promise<string> {
 }
 
 /** A workflow the caller authored, deliberately not derived from the Markdown. */
-const authoredWorkflow = (id: string): Workflow => ({
+const authoredWorkflow = (id: string): WorkflowDraft => ({
   id, kind: 'workflow', title: '已结构化的部署流程', scope: { kind: 'global' }, baseRevision: 0,
   overview: '按作者理解的顺序执行部署并逐项核对。',
   triggers: ['需要部署到测试环境'], categories: [['部署']], tags: [], isEntryPoint: true,
@@ -129,7 +129,7 @@ test('结构化必须提供依据，且只能作用于已采纳的技能', async
         async () => s.structureSkill({ skillId: 'nope', workflow: authoredWorkflow('wf-2'), derivedBy: 'user', evidence: 'e' }),
         /unavailable/,
       );
-      s.import([{ id: 'plain-norm', kind: 'norm', title: '规范', scope: { kind: 'global' }, baseRevision: 0, body: '正文。', deniedTools: [], hostProvided: false } as Knowledge]);
+      s.import([{ id: 'plain-norm', kind: 'norm', title: '规范', scope: { kind: 'global' }, baseRevision: 0, body: '正文。', deniedTools: [], hostProvided: false } as KnowledgeDraft]);
       await assert.rejects(
         async () => s.structureSkill({ skillId: 'plain-norm', workflow: authoredWorkflow('wf-3'), derivedBy: 'user', evidence: 'e' }),
         /Only an adopted skill/,

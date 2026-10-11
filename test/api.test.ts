@@ -3,16 +3,16 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { Store } from '../src/store.js';
 import { createCoreServer } from '../src/server.js';
-import type { Knowledge, Workflow } from '../src/schema.js';
+import type { Knowledge, KnowledgeDraft, Workflow, WorkflowDraft } from '../src/schema.js';
 
 const token = 'a'.repeat(64), adminToken = 'c'.repeat(64);
 const PROJECT = 'p0';
-const norm = (over: Record<string, unknown> = {}): Knowledge => ({
+const norm = (over: Record<string, unknown> = {}): KnowledgeDraft => ({
   id: 'mgmt-norm', kind: 'norm', title: '管理界面测试规范',
   scope: { kind: 'project', projectId: PROJECT }, baseRevision: 0,
   body: '只用于管理 API 测试的规范正文。', deniedTools: [], hostProvided: false, ...over,
-} as Knowledge);
-const workflow = (id: string, baseRevision = 0): Workflow => ({
+} as KnowledgeDraft);
+const workflow = (id: string, baseRevision = 0): WorkflowDraft => ({
   id, kind: 'workflow', title: `流程 ${id}`, scope: { kind: 'project', projectId: PROJECT }, baseRevision,
   overview: '管理 API 测试用完整流程。', triggers: ['测试'], categories: [['测试']], tags: [],
   preconditions: ['已提供项目上下文'],

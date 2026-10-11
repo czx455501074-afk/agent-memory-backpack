@@ -17,7 +17,7 @@ import { MAX_BODY_CHARS } from './schema.js';
  */
 
 export type AdoptClass = 'adoptable' | 'excluded';
-export type AdoptKind = 'norm' | 'preference' | 'memory' | 'skill';
+export type AdoptKind = 'norm' | 'preference' | 'memory' | 'skill' | 'journal';
 export type AdoptChange = 'new' | 'duplicate' | 'conflict';
 
 /**
@@ -250,11 +250,27 @@ const HOST_LOADED_INSTRUCTIONS = new Set(['agents.md', 'claude.md', 'agent.md'])
  */
 const JOURNAL_STEM = /^\d{4}-\d{2}-\d{2}$/;
 
-/** Classify a document by its filename; the path plays no part in the decision. */
+/** Files that hold stated working preferences rather than rules. */
+const PREFERENCE_FILES = new Set(['preferences.md', 'preference.md', 'user-preferences.md']);
+
+/**
+ * Classify a document by its filename; the path plays no part in the decision.
+ *
+ * A filename can only tell the types apart when the convention is explicit. The
+ * design treats rules, preferences, facts, experience and diaries as separate
+ * types, but a single `AGENTS.md` mixes rules with habits in prose, and splitting
+ * it needs semantic judgement — which is the model classifier's job, not the
+ * scanner's. The scanner therefore claims only what a name can prove: an
+ * instruction file is a norm (the reading that cannot be ignored), a preferences
+ * file is a preference, and everything else keeps its own rule or stays out.
+ */
 function classifyKnowledgeDoc(name: string): { kind: AdoptKind; rationale: string } | undefined {
   const lower = name.toLowerCase();
   const dot = lower.lastIndexOf('.');
   const stem = dot > 0 ? lower.slice(0, dot) : lower;
+  if (PREFERENCE_FILES.has(lower)) {
+    return { kind: 'preference', rationale: 'working-preferences file: how the user prefers to work, not a rule to enforce' };
+  }
   if (lower === 'agents.md' || lower === 'claude.md' || lower === 'agent.md') {
     return { kind: 'norm', rationale: 'agent instruction file: current working requirements and preferences' };
   }
@@ -262,7 +278,7 @@ function classifyKnowledgeDoc(name: string): { kind: AdoptKind; rationale: strin
     return { kind: 'memory', rationale: 'agent memory file: durable facts to remember across sessions' };
   }
   if (JOURNAL_STEM.test(stem)) {
-    return { kind: 'memory', rationale: 'dated journal entry: a record of what was worked on and learned that day' };
+    return { kind: 'journal', rationale: 'dated journal entry: a record of what was worked on and learned that day' };
   }
   if (lower === 'skill.md') {
     return { kind: 'skill', rationale: 'skill entry document: a reusable procedure with triggers and prerequisites' };

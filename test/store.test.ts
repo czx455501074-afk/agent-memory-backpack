@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 import { Store } from '../src/store.js';
-import { DomainError, type Knowledge, type Workflow } from '../src/schema.js';
+import { DomainError, type Knowledge, type KnowledgeDraft, type Workflow, type WorkflowDraft, type Scope } from '../src/schema.js';
 
 const fixturePath = fileURLToPath(new URL('../../fixtures/p0-seed.json', import.meta.url));
 const tempDirs = new Set<string>();
@@ -24,7 +24,7 @@ async function fixtureEntries(): Promise<Knowledge[]> {
   return parsed.entries;
 }
 
-function workflow(id: string, scope: Workflow['scope'], baseRevision = 0, dependencies: Workflow['stages'][number]['dependencies'] = []): Workflow {
+function workflow(id: string, scope: Scope, baseRevision = 0, dependencies: Workflow['stages'][number]['dependencies'] = []): WorkflowDraft {
   return {
     id, kind: 'workflow', title: `流程 ${id}`, scope, baseRevision,
     overview: `用于测试 ${id} 的完整流程入口。`,

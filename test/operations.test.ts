@@ -8,7 +8,7 @@ import { Logger } from '../src/log.js';
 import { doctor, compareHostVersion, pluginVersion, summarizeDoctor } from '../src/doctor.js';
 import { exportSkills, renderSkill, EXPORT_MARKER } from '../src/export-skills.js';
 import { Store } from '../src/store.js';
-import type { Knowledge } from '../src/schema.js';
+import { knowledgeSchema, type Knowledge, type KnowledgeDraft } from '../src/schema.js';
 
 async function scratch(prefix: string): Promise<string> {
   return await mkdtemp(join(tmpdir(), prefix));
@@ -198,13 +198,15 @@ test('自检报告插件日志状态：缺失时提示，存在时给出大小',
 // ---------------------------------------------------------------------------
 
 function workflowFixture(id: string): Knowledge {
-  return {
+  // Parsed, because `renderSkill` consumes a stored entry: the parse is what fills
+  // the defaulted metadata, and it is also what the store does before writing.
+  return knowledgeSchema.parse({
     id, kind: 'workflow', title: `流程 ${id}`, scope: { kind: 'global' }, baseRevision: 0,
     overview: '完整流程概览。', triggers: ['需要执行时'], categories: [['测试']], tags: [], isEntryPoint: true,
     preconditions: ['已确认环境'],
     stages: [{ id: 'step', title: '第一步', instructions: '执行并核对。', checks: ['结果可核对'], dependencies: [] }],
     completion: ['全部检查通过'], recovery: '失败时停止并记录。',
-  };
+  });
 }
 
 test('导出为普通 SKILL.md：脱离插件仍是标准文档', async () => {

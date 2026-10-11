@@ -5,13 +5,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import { Store } from '../src/store.js';
-import { type Knowledge, DomainError } from '../src/schema.js';
+import { Knowledge, KnowledgeDraft, DomainError } from '../src/schema.js';
 import { exportAll, importAll, BACKUP_MARKER } from '../src/backup.js';
 
 const roots: string[] = [], stores: Store[] = [];
 function root() { const path = mkdtempSync(join(tmpdir(), 'backpack-backup-')); roots.push(path); return path; }
 function open() { const directory = root(), path = join(directory, 'knowledge.sqlite'); const store = new Store(path, () => 1000); stores.push(store); return { store, directory, path }; }
-function memory(id = 'memory', baseRevision = 0, body = 'Personal knowledge'): Knowledge {
+function memory(id = 'memory', baseRevision = 0, body = 'Personal knowledge'): KnowledgeDraft {
   return { id, baseRevision, body, kind: 'memory', title: id, scope: { kind: 'global' } };
 }
 function populated() {

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { Store } from '../src/store.js';
-import type { Knowledge } from '../src/schema.js';
+import type { Knowledge, KnowledgeDraft } from '../src/schema.js';
 
 async function scratch(prefix: string): Promise<string> {
   return await mkdtemp(join(tmpdir(), prefix));
@@ -17,18 +17,18 @@ async function cleanup(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
-const norm = (id: string, body: string, base = 0): Knowledge => ({
+const norm = (id: string, body: string, base = 0): KnowledgeDraft => ({
   id, kind: 'norm', title: `规范 ${id}`, scope: { kind: 'global' },
   baseRevision: base, body, deniedTools: [], hostProvided: false,
-} as Knowledge);
+} as KnowledgeDraft);
 
 // `readKnowledge` only serves skills and memories, so durable-body checks use a
 // memory. The entry kind is irrelevant to what is being tested (that a rejected or
 // interrupted write leaves nothing behind).
-const memory = (id: string, body: string, base = 0): Knowledge => ({
+const memory = (id: string, body: string, base = 0): KnowledgeDraft => ({
   id, kind: 'memory', title: `记忆 ${id}`, scope: { kind: 'global' },
   baseRevision: base, body,
-} as Knowledge);
+} as KnowledgeDraft);
 
 /**
  * Durability, which the earlier audit noted had no test at all.

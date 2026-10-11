@@ -6,9 +6,9 @@ import { join, relative, isAbsolute, resolve } from 'node:path';
 import { Store } from '../src/store.js';
 import { discover, rescanDiff, summarizeRescan } from '../src/discovery.js';
 import { applyRescan } from '../src/rescan.js';
-import type { Knowledge } from '../src/schema.js';
+import type { Knowledge, KnowledgeDraft } from '../src/schema.js';
 
-const norm = (id: string, body: string, baseRevision = 0): Knowledge => ({
+const norm = (id: string, body: string, baseRevision = 0): KnowledgeDraft => ({
   id, kind: 'norm', title: `规范 ${id}`, scope: { kind: 'global' },
   baseRevision, body, deniedTools: [], hostProvided: false,
 });
@@ -218,7 +218,7 @@ test('重扫描在本地编辑被覆盖时明确告警，且两版都留在历�
       await adoptAll(s, root);
       const entry = s.allEntries()[0]!;
       // The user edits the adopted copy inside the plugin.
-      s.import([{ ...entry.content, baseRevision: entry.revision, body: '用户在插件内修改过的版本。' } as Knowledge]);
+      s.import([{ ...entry.content, baseRevision: entry.revision, body: '用户在插件内修改过的版本。' } as KnowledgeDraft]);
 
       await writeFile(join(root, 'AGENTS.md'), '# 契约\n\n来源更新版。\n');
       const outcome = applyRescan(s, [root]);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Store } from '../src/store.js';
-import { type Knowledge } from '../src/schema.js';
+import type { Knowledge, KnowledgeDraft } from '../src/schema.js';
 
 /**
  * Retrieval relevance.
@@ -13,7 +13,7 @@ import { type Knowledge } from '../src/schema.js';
  * those entries were injected.
  */
 
-const memory = (id: string, title: string, body: string): Knowledge =>
+const memory = (id: string, title: string, body: string): KnowledgeDraft =>
   ({ id, baseRevision: 0, body, kind: 'memory', title, scope: { kind: 'global' } });
 
 function store(): Store {

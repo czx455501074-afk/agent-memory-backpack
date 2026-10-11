@@ -3,22 +3,22 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { Store } from '../src/store.js';
 import { createCoreServer } from '../src/server.js';
-import type { Knowledge, Workflow } from '../src/schema.js';
+import type { Knowledge, KnowledgeDraft, Workflow, WorkflowDraft } from '../src/schema.js';
 
 const token = 'a'.repeat(64), adminToken = 'c'.repeat(64);
 const PROJECT = 'p0';
-const workflow = (id: string, title: string): Workflow => ({
+const workflow = (id: string, title: string): WorkflowDraft => ({
   id, kind: 'workflow', title, scope: { kind: 'project', projectId: PROJECT }, baseRevision: 0,
   overview: `${title} 的完整流程入口。`, triggers: ['测试触发'], categories: [['测试']], tags: [],
   preconditions: ['已提供项目上下文'],
   stages: [{ id: 'step', title: '执行', instructions: '执行并核对。', checks: ['结果可核对'], dependencies: [] }],
   completion: ['完成'], recovery: '失败时停止并记录。', isEntryPoint: false,
 });
-const norm = (): Knowledge => ({
+const norm = (): KnowledgeDraft => ({
   id: 'task-norm', kind: 'norm', title: '任务交接规范',
   scope: { kind: 'project', projectId: PROJECT }, baseRevision: 0,
   body: '交接时需重新确认文件与环境状态。', deniedTools: [], hostProvided: false,
-} as Knowledge);
+} as KnowledgeDraft);
 
 async function fixture() {
   const store = new Store(':memory:');

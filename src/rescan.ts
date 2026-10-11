@@ -16,9 +16,20 @@ import type { Store } from './store.js';
  *    basis would be destructive, so removal stays a deliberate act.
  */
 
-/** Convert a discovered candidate into a knowledge entry, preserving text verbatim. */
+/**
+ * Convert a discovered candidate into a knowledge entry, preserving text verbatim.
+ *
+ * Provenance and evidence are recorded from what the scan actually did rather than
+ * defaulted: these documents are the user's own files, and the plugin read their
+ * bytes itself. Recording anything weaker (or stronger) would misstate the basis
+ * on which the entry is trusted — the design requires those two facts to be
+ * distinguishable, and a scan is the one place they are known for certain.
+ */
 export function candidateToKnowledge(candidate: AdoptedCandidate): Knowledge {
-  const base = { id: candidate.id, title: candidate.title, scope: { kind: 'global' as const }, baseRevision: 0 };
+  const base = {
+    id: candidate.id, title: candidate.title, scope: { kind: 'global' as const }, baseRevision: 0,
+    labels: [] as string[], provenance: 'user' as const, evidence: 'observed' as const, platforms: [] as Array<'dsh' | 'codex'>,
+  };
   if (candidate.kind === 'skill') {
     return {
       ...base, kind: 'skill', body: candidate.body,
@@ -27,6 +38,20 @@ export function candidateToKnowledge(candidate: AdoptedCandidate): Knowledge {
     };
   }
   if (candidate.kind === 'memory') return { ...base, kind: 'memory', body: candidate.body };
+  // A dated file the user wrote themselves. Stored as a journal rather than as a
+  // generic memory so its nature is visible: what happened on a day is a record,
+  // not a durable fact about the project, and the two are read differently.
+  if (candidate.kind === 'journal') {
+    return {
+      ...base, kind: 'journal',
+      did: candidate.body.slice(0, 2000),
+      problems: '', experienceLanded: [], outcome: 'unverified' as const, unfinished: [],
+    };
+  }
+  // A stated working preference, distinct from a rule the user must obey.
+  if (candidate.kind === 'preference') {
+    return { ...base, kind: 'preference', body: candidate.body, stated: true };
+  }
   return { ...base, kind: 'norm', body: candidate.body, deniedTools: [], hostProvided: candidate.hostProvided };
 }
 

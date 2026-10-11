@@ -1,13 +1,26 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { DomainError, knowledgeSchema, workflowSchema, type Knowledge, type Workflow, type Scope } from './schema.js';
+import { DomainError, knowledgeSchema, workflowSchema, type Knowledge, type KnowledgeDraft, type WorkflowDraft, type Workflow, type Scope } from './schema.js';
 
 type Row = Record<string, unknown>;
 type Entry = { id: string; revision: number; status: string; content: Knowledge };
 export type TaskStatus = 'in_progress' | 'paused' | 'completed' | 'cancelled' | 'failed';
 const DAY = 86400000;
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const applicable = (scope: Scope, projectId: string) => scope.kind === 'global' || scope.projectId === projectId;
+/**
+ * Whether a scope applies to the caller's project and task.
+ *
+ * A task-scoped entry applies only to that task, and to nothing when the caller
+ * has no task in hand. That is the whole point of the scope: "这一次用 Banana"
+ * must not become a rule for every later task, and the only way to guarantee that
+ * is to make it inapplicable when the task is unknown rather than when it differs.
+ */
+const applicable = (scope: Scope, projectId: string, taskId?: string): boolean => {
+  if (scope.kind === 'global') return true;
+  if (scope.projectId !== projectId) return false;
+  if (scope.kind === 'task') return taskId !== undefined && scope.taskId === taskId;
+  return true;
+};
 function searchable(value: string): string {
   // Unicode words plus CJK bigrams: deterministic Chinese recall without an external model.
   const words = value.toLowerCase().match(/[a-z0-9_-]+|[\p{Script=Han}]+/gu) ?? [];
@@ -175,7 +188,7 @@ export class Store {
       ORDER BY k.id`).all().map(row => this.decode(row));
   }
   /** Admin-only offline import. Every update requires the observed per-item revision. */
-  import(entries: Knowledge[]): number {
+  import(entries: KnowledgeDraft[]): number {
     const validated = entries.map(entry => knowledgeSchema.parse(entry));
     if (new Set(validated.map(x => x.id)).size !== validated.length)
       throw new DomainError('duplicate_id', 'Import contains duplicate IDs');
@@ -308,24 +321,38 @@ export class Store {
       ? matchIds(this.db, tokens)
       : entries.map(entry => entry.id);
     const result: Array<{
-      id: string; revision: number; kind: 'skill' | 'memory'; title: string;
-      excerpt: string; chars: number; leafCount: number; needsStructure: boolean;
+      id: string; revision: number; kind: 'skill' | 'memory' | 'preference' | 'journal';
+      title: string; excerpt: string; chars: number; leafCount: number; needsStructure: boolean;
+      /** Set for preferences, so a reader can tell a stated habit from an inferred one. */
+      stated?: boolean;
+      /** Set for journals, so success, failure and unverified stay distinguishable. */
+      outcome?: 'success' | 'failure' | 'unverified';
+      provenance: string;
     }> = [];
     for (const id of ids) {
       const entry = all.get(id);
       if (!entry) continue;
       const content = entry.content;
-      // Only adopted skills and memories belong here; norms are read through
-      // norms() and workflows through search(), each with its own shape.
-      if (content.kind !== 'skill' && content.kind !== 'memory') continue;
+      // Norms are read through `norms()` and workflows through `search()`, each
+      // with its own shape. Temporary material is deliberately absent: it is only
+      // valid until it expires, and its lifecycle is handled separately.
+      //
+      // Narrowed by kind rather than by an `includes` check, because only this form
+      // tells the type system which fields exist — a journal has no `body`, it has
+      // what the task did.
+      if (content.kind !== 'skill' && content.kind !== 'memory'
+        && content.kind !== 'preference' && content.kind !== 'journal') continue;
       if (!applicable(content.scope, projectId)) continue;
-      const body = content.body;
+      const body = content.kind === 'journal' ? content.did : content.body;
       result.push({
         id: entry.id, revision: entry.revision, kind: content.kind, title: content.title,
         excerpt: body.length > excerptChars ? `${body.slice(0, excerptChars)}…` : body,
         chars: body.length,
         leafCount: content.kind === 'skill' ? content.leaves.length : 0,
         needsStructure: content.kind === 'skill' ? content.needsStructure : false,
+        stated: content.kind === 'preference' ? content.stated : undefined,
+        outcome: content.kind === 'journal' ? content.outcome : undefined,
+        provenance: content.provenance,
       });
       if (result.length >= limit) break;
     }
@@ -499,7 +526,7 @@ export class Store {
    *  - when the proposal named a target workflow, the entry must be that entry.
    *    Otherwise an unrelated entry could be approved under its cover.
    */
-  approveProposal(id: string, entry: Knowledge, options: { allowGlobalScope?: boolean } = {}): number {
+  approveProposal(id: string, entry: KnowledgeDraft, options: { allowGlobalScope?: boolean } = {}): number {
     const validated = knowledgeSchema.parse(entry);
     return this.transaction(() => {
       const row = this.db.prepare('SELECT state,payload FROM proposals WHERE id=?').get(id) as
@@ -607,7 +634,7 @@ export class Store {
    * the batch can be revoked precisely later. Adoption never touches the source
    * file: only this database changes.
    */
-  adopt(entries: Array<{ source: { path: string; hash: string }; kind: string; title: string; knowledge: Knowledge }>): { adoptedAt: number; knowledgeRevision: number; count: number; skipped: Array<{ id: string; reason: string }> } {
+  adopt(entries: Array<{ source: { path: string; hash: string }; kind: string; title: string; knowledge: KnowledgeDraft }>): { adoptedAt: number; knowledgeRevision: number; count: number; skipped: Array<{ id: string; reason: string }> } {
     if (entries.length === 0) throw new DomainError('empty_batch', 'Adoption requires at least one entry', 400);
     const adoptedAt = this.now();
     return this.transaction(() => {
@@ -644,9 +671,11 @@ export class Store {
       }
       // importInsideTransaction performs the CAS and dependency checks; the
       // caller must already hold a transaction, so nothing is half-written.
-      const knowledgeRevision = this.importInsideTransaction(aligned.map(entry => entry.knowledge));
+      const knowledgeRevision = this.importInsideTransaction(aligned.map(entry => knowledgeSchema.parse(entry.knowledge)));
       for (const entry of aligned) {
-        const revision = entry.knowledge.baseRevision + 1;
+        // Parsed above, so the defaulted fields are present; read back through the
+        // same schema rather than trusting the draft's optional one.
+        const revision = knowledgeSchema.parse(entry.knowledge).baseRevision + 1;
         // The ledger is append-only, so the row id includes the batch time: the
         // same source adopted twice (a revoke followed by a re-adopt) is two real
         // events and must not collide on a content-derived key.
@@ -731,7 +760,8 @@ export class Store {
    */
   structureSkill(input: {
     skillId: string;
-    workflow: Workflow;
+    /** A draft: the store parses it, so a caller need not restate defaulted fields. */
+    workflow: WorkflowDraft;
     derivedBy: 'user' | 'agent';
     evidence: string;
     /** Scope the caller acts within; the skill and the new workflow must be visible to it. */

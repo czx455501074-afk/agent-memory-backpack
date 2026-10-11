@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute, resolve } from 'node:path';
 import { Store } from '../src/store.js';
 import { discover } from '../src/discovery.js';
-import type { Knowledge } from '../src/schema.js';
+import type { Knowledge, KnowledgeDraft } from '../src/schema.js';
 
 /** Adopt exactly what discovery reported, preserving body verbatim. */
 function toEntries(root: string) {
@@ -125,7 +125,7 @@ test('被用户修改过的采纳条目在撤销时保留，不被静默丢弃',
       const adopted = s.adopt(toEntries(root));
       const target = s.allEntries().find(e => e.content.kind === 'norm')!;
       // The user edits an adopted entry after adoption.
-      s.import([{ ...target.content, baseRevision: target.revision, body: '用户后来修改过的正文。' } as Knowledge]);
+      s.import([{ ...target.content, baseRevision: target.revision, body: '用户后来修改过的正文。' } as KnowledgeDraft]);
       assert.equal(s.allEntries().length, 2);
 
       const revoked = s.revokeAdoption(adopted.adoptedAt);

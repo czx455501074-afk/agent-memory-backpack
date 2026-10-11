@@ -259,7 +259,11 @@ test('日期命名的日记被识别为知识，而不是当作孤立片段丢�
     const report = discover([root]);
     const journal = report.candidates.find(c => c.source.path.endsWith('2026-09-25.md'));
     assert.ok(journal, '日期命名的日记必须被采纳');
-    assert.equal(journal.kind, 'memory', '日记以 memory 类型入库（知识库没有独立的 journal 类型）');
+    // A journal is its own type, not a generic memory. The design lists them
+    // separately and they are read differently: a diary records what happened,
+    // while a memory states a fact about the project. Filing one as the other
+    // would let "we tried X today" be retrieved as "X is true".
+    assert.equal(journal.kind, 'journal', '日记以独立的 journal 类型入库');
     assert.match(journal.rationale, /journal/i, '理由必须说明它是日记，便于用户核对');
     assert.ok(report.candidates.some(c => c.source.path.endsWith('MEMORY.md')), '记忆文件仍应被采纳');
     // A non-dated name in the same folder is still ordinary Markdown, so the rule

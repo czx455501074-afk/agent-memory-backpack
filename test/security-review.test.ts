@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { Store } from '../src/store.js';
 import { createCoreServer } from '../src/server.js';
-import type { Knowledge, Workflow } from '../src/schema.js';
+import type { Knowledge, KnowledgeDraft, Workflow, WorkflowDraft } from '../src/schema.js';
 
 /**
  * Regression tests for the permission and isolation defects found by a
@@ -18,12 +18,12 @@ import type { Knowledge, Workflow } from '../src/schema.js';
 const TOKEN = 'a'.repeat(64);
 const ADMIN = 'b'.repeat(64);
 
-const norm = (id: string, body: string, projectId: string, base = 0): Knowledge => ({
+const norm = (id: string, body: string, projectId: string, base = 0): KnowledgeDraft => ({
   id, kind: 'norm', title: `规范 ${id}`, scope: { kind: 'project', projectId },
   baseRevision: base, body, deniedTools: [], hostProvided: false,
-} as Knowledge);
+} as KnowledgeDraft);
 
-const workflow = (id: string, projectId: string, base = 0): Workflow => ({
+const workflow = (id: string, projectId: string, base = 0): WorkflowDraft => ({
   id, kind: 'workflow', title: `流程 ${id}`, scope: { kind: 'project', projectId }, baseRevision: base,
   overview: '测试流程。', triggers: ['测试'], categories: [['测试']], tags: [], isEntryPoint: false,
   preconditions: ['前提'],
@@ -143,7 +143,7 @@ test('门禁工具名按规范化比较，大小写与空白不再绕过', async
   // was denied, so a prohibition looked enforced but was not.
   const f = await fixture();
   try {
-    f.store.import([{ ...norm('deny-bash', '禁止 Bash。', 'alpha'), deniedTools: ['Bash'] } as Knowledge]);
+    f.store.import([{ ...norm('deny-bash', '禁止 Bash。', 'alpha'), deniedTools: ['Bash'] } as KnowledgeDraft]);
     for (const variant of ['Bash', 'bash', 'BASH', 'Bash ', ' bash', '\tBash']) {
       const verdict = f.store.gate('alpha', variant);
       assert.equal(verdict.decision, 'deny', `变体 ${JSON.stringify(variant)} 必须被拒绝`);
