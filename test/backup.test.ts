@@ -19,7 +19,9 @@ function populated() {
   source.store.import([memory()]);
   source.store.import([memory('memory', 1, 'Updated personal knowledge'), memory('retired')]);
   source.store.retire('retired', 1);
-  source.store.db.prepare('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('task', 'project', 'Task', 'paused', 'Summary', 'Notes', 3, '["next step"]', 1000, 1000, null);
+  // Named columns, so adding a column to the task record does not break this test.
+  source.store.db.prepare(`INSERT INTO tasks(id,project_id,title,status,summary,notes,knowledge_revision,unfinished,created_at,updated_at,completed_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run('task', 'project', 'Task', 'paused', 'Summary', 'Notes', 3, '["next step"]', 1000, 1000, null);
   source.store.db.prepare('INSERT INTO adoptions VALUES(?,?,?,?,?,?,?,?,?)').run('adoption', 'C:/notes/MEMORY.md', 'memory', 'Memory', 'hash', 'memory', 1, 1000, null);
   source.store.db.prepare('INSERT INTO supersessions VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(1, 'retired', 1, 'memory', 2, 'supplement', 'Reason', 'Evidence', 'user', 0, 1000);
   source.store.submit('principal', { idempotencyKey: 'proposal', projectId: 'project', discovery: 'A discovery' });

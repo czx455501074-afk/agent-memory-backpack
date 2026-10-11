@@ -236,11 +236,32 @@ export const gateSchema = z.object({
 }).strict();
 export const expandSchema = z.object({ projectId: identifier, workflowId: identifier, stageId: identifier }).strict();
 export const taskStatus = z.enum(['in_progress', 'paused', 'completed', 'cancelled', 'failed']);
+/**
+ * A task record.
+ *
+ * The design lists the fields a task must carry, and the original implementation
+ * had about half of them: no start or completion time, no links to the experience
+ * or proposals the task produced, and no knowledge version. Without `sessionIds`
+ * the design's "one task spans several sessions, one session may hold several
+ * tasks" cannot be expressed at all, which is why it is a list rather than a
+ * single id.
+ */
 export const taskSchema = z.object({
   id: identifier, title: shortText, status: taskStatus,
   summary: z.string().trim().max(2000).default(''),
   notes: z.string().trim().max(4000).default(''),
   unfinished: z.array(shortText).max(50).default([]),
+  /** Sessions this task ran in. A task outlives any one of them. */
+  sessionIds: z.array(z.string().min(1).max(256)).max(50).default([]),
+  /** Knowledge entries this task produced or changed. */
+  relatedExperiences: z.array(identifier).max(100).default([]),
+  /** Proposals submitted during this task, whether or not approved. */
+  relatedProposals: z.array(identifier).max(100).default([]),
+  /** Files the next session should check before continuing. */
+  files: z.array(shortText).max(100).default([]),
+  /** What was verified, and how. Kept separate from `summary`, which is prose. */
+  verified: z.string().trim().max(2000).default(''),
+  startedAt: z.number().int().nonnegative().optional(),
 }).strict();
 
 export class DomainError extends Error {

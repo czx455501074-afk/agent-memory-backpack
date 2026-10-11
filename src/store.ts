@@ -132,7 +132,17 @@ export class Store {
         summary TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
         knowledge_revision INTEGER NOT NULL, unfinished TEXT NOT NULL DEFAULT '[]',
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-        completed_at INTEGER);
+        completed_at INTEGER,
+        -- Added when the task record grew to the design's field list. Declared here
+        -- so a fresh database has them, and added by migration below so an existing
+        -- one does too: a column that only exists on new installs is a bug that
+        -- surfaces months later on the one machine that matters.
+        session_ids TEXT NOT NULL DEFAULT '[]',
+        related_experiences TEXT NOT NULL DEFAULT '[]',
+        related_proposals TEXT NOT NULL DEFAULT '[]',
+        files TEXT NOT NULL DEFAULT '[]',
+        verified TEXT NOT NULL DEFAULT '',
+        started_at INTEGER);
       CREATE INDEX IF NOT EXISTS tasks_project ON tasks(project_id, updated_at DESC);
       -- Adoption ledger: records exactly which knowledge entries a discovery run
       -- promoted, so one undo can retract precisely that batch and nothing else.
@@ -161,7 +171,36 @@ export class Store {
       INSERT OR IGNORE INTO meta VALUES ('rescanIntervalMs',86400000);
       INSERT OR IGNORE INTO meta VALUES ('scanRoots','');
     `);
+    this.migrate();
     this.cleanup();
+  }
+  /**
+   * Bring an existing database up to the current column set.
+   *
+   * `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a
+   * column added after the first release reaches new installs only. Reading the
+   * table's actual columns and adding what is missing is what keeps an existing
+   * library working — the alternative is a migration that silently applies to
+   * everyone except the users who already had data.
+   *
+   * Additive only: a column is never dropped or rewritten here, because the data in
+   * it is the user's and this code cannot know what a later version expects.
+   */
+  private migrate(): void {
+    const additions: Array<[string, string]> = [
+      ['tasks', 'session_ids TEXT NOT NULL DEFAULT \'[]\''],
+      ['tasks', 'related_experiences TEXT NOT NULL DEFAULT \'[]\''],
+      ['tasks', 'related_proposals TEXT NOT NULL DEFAULT \'[]\''],
+      ['tasks', 'files TEXT NOT NULL DEFAULT \'[]\''],
+      ['tasks', 'verified TEXT NOT NULL DEFAULT \'\''],
+      ['tasks', 'started_at INTEGER'],
+    ];
+    for (const [table, definition] of additions) {
+      const column = definition.split(' ')[0]!;
+      const existing = this.db.prepare(`PRAGMA table_info(${table})`).all().map(row => String((row as { name: string }).name));
+      if (existing.includes(column)) continue;
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+    }
   }
   close() { this.db.close(); }
   get revision(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='revision'").get()!.value); }
@@ -575,30 +614,66 @@ export class Store {
    * session may hold several tasks. Re-recording an existing ID only refreshes
    * state, so a retry never creates a duplicate diary entry.
    */
-  recordTask(projectId: string, payload: { id: string; title: string; status: TaskStatus; summary?: string; notes?: string; unfinished?: string[] }) {
+  /**
+   * Record or update a task.
+   *
+   * Fields are merged rather than replaced when a call omits them: a call that only
+   * updates the status must not erase the links an earlier call established. The
+   * previous version overwrote every column with the caller's defaults, so a status
+   * ping silently dropped the notes and unfinished list.
+   */
+  recordTask(projectId: string, payload: {
+    id: string; title: string; status: TaskStatus;
+    summary?: string; notes?: string; unfinished?: string[];
+    sessionIds?: string[]; relatedExperiences?: string[]; relatedProposals?: string[];
+    files?: string[]; verified?: string; startedAt?: number;
+  }) {
     return this.transaction(() => {
       // Scoped by project: an unscoped lookup let one project's credential
       // overwrite another project's task merely by reusing its id.
-      const existing = this.db.prepare('SELECT id,status,project_id FROM tasks WHERE id=?').get(payload.id) as
-        { id: string; status: string; project_id: string } | undefined;
-      if (existing && existing.project_id !== projectId) {
+      const existing = this.db.prepare('SELECT * FROM tasks WHERE id=?').get(payload.id) as Row | undefined;
+      if (existing && String(existing.project_id) !== projectId) {
         throw new DomainError('scope_denied', `Task ${payload.id} belongs to another project`, 403);
       }
       const now = this.now();
-      const unfinished = JSON.stringify(payload.unfinished ?? []);
+      // An explicit value wins; otherwise keep what is stored; otherwise start empty.
+      const keep = <T>(given: T | undefined, column: string, parse: (raw: string) => T, fallback: T): T => {
+        if (given !== undefined) return given;
+        if (existing) return parse(String(existing[column]));
+        return fallback;
+      };
+      const jsonList = (raw: string) => { try { return JSON.parse(raw) as string[]; } catch { return []; } };
+      const sessionIds = keep(payload.sessionIds, 'session_ids', jsonList, []);
+      const relatedExperiences = keep(payload.relatedExperiences, 'related_experiences', jsonList, []);
+      const relatedProposals = keep(payload.relatedProposals, 'related_proposals', jsonList, []);
+      const files = keep(payload.files, 'files', jsonList, []);
+      const verified = keep(payload.verified, 'verified', (raw) => raw, '');
+      const startedAt = payload.startedAt ?? (existing ? (existing.started_at === null ? undefined : Number(existing.started_at)) : now);
+      const terminal = ['completed', 'cancelled', 'failed'].includes(payload.status);
+
       if (existing) {
         // A task never silently moves out of a terminal state: a new status must come from an explicit call.
-        this.db.prepare(`UPDATE tasks SET title=?,status=?,summary=?,notes=?,unfinished=?,knowledge_revision=?,updated_at=?,
+        this.db.prepare(`UPDATE tasks SET title=?,status=?,summary=?,notes=?,unfinished=?,session_ids=?,
+          related_experiences=?,related_proposals=?,files=?,verified=?,started_at=?,
+          knowledge_revision=?,updated_at=?,
           completed_at=CASE WHEN ? IN ('completed','cancelled','failed') THEN COALESCE(completed_at,?) ELSE NULL END
           WHERE id=? AND project_id=?`)
-          .run(payload.title, payload.status, payload.summary ?? '', payload.notes ?? '', unfinished, this.revision, now,
-            payload.status, now, payload.id, projectId);
+          .run(payload.title, payload.status,
+            keep(payload.summary, 'summary', (raw) => raw, ''), keep(payload.notes, 'notes', (raw) => raw, ''),
+            JSON.stringify(keep(payload.unfinished, 'unfinished', jsonList, [])),
+            JSON.stringify(sessionIds), JSON.stringify(relatedExperiences), JSON.stringify(relatedProposals),
+            JSON.stringify(files), verified, startedAt ?? now,
+            this.revision, now, payload.status, now, payload.id, projectId);
         return { id: payload.id, status: payload.status, created: false };
       }
-      this.db.prepare(`INSERT INTO tasks(id,project_id,title,status,summary,notes,knowledge_revision,unfinished,created_at,updated_at,completed_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(payload.id, projectId, payload.title, payload.status,
-          payload.summary ?? '', payload.notes ?? '', this.revision, unfinished, now, now,
-          ['completed', 'cancelled', 'failed'].includes(payload.status) ? now : null);
+      this.db.prepare(`INSERT INTO tasks(id,project_id,title,status,summary,notes,knowledge_revision,
+        unfinished,session_ids,related_experiences,related_proposals,files,verified,started_at,
+        created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(payload.id, projectId, payload.title, payload.status,
+          payload.summary ?? '', payload.notes ?? '', this.revision,
+          JSON.stringify(payload.unfinished ?? []), JSON.stringify(sessionIds),
+          JSON.stringify(relatedExperiences), JSON.stringify(relatedProposals), JSON.stringify(files),
+          verified, startedAt ?? now, now, now, terminal ? now : null);
       return { id: payload.id, status: payload.status, created: true };
     });
   }
@@ -607,25 +682,208 @@ export class Store {
       ? 'SELECT * FROM tasks WHERE project_id=? AND status=? ORDER BY updated_at DESC'
       : 'SELECT * FROM tasks WHERE project_id=? ORDER BY updated_at DESC';
     const rows = status ? this.db.prepare(query).all(projectId, status) : this.db.prepare(query).all(projectId);
+    const list = (raw: unknown) => { try { return JSON.parse(String(raw)) as string[]; } catch { return []; } };
     return rows.map(row => ({
       id: String(row.id), projectId: String(row.project_id), title: String(row.title),
       status: String(row.status) as TaskStatus, summary: String(row.summary), notes: String(row.notes),
       knowledgeRevision: Number(row.knowledge_revision),
-      unfinished: JSON.parse(String(row.unfinished)) as string[],
+      unfinished: list(row.unfinished),
+      sessionIds: list(row.session_ids), relatedExperiences: list(row.related_experiences),
+      relatedProposals: list(row.related_proposals), files: list(row.files),
+      verified: String(row.verified ?? ''),
+      startedAt: row.started_at === null || row.started_at === undefined ? null : Number(row.started_at),
       createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
       completedAt: row.completed_at === null ? null : Number(row.completed_at),
     }));
   }
   getTask(id: string, projectId: string) { return this.tasks(projectId).find(task => task.id === id); }
-  /** Handoff carries what the other end needs and never implies process or credential transfer. */
+  /**
+   * Find the active task a session is working on.
+   *
+   * The design requires a task to be associable across sessions, and forbids using a
+   * window title as the identity. Looking the session up in `session_ids` is what
+   * makes "one task, several sessions" work: a later session sees the task a former
+   * one started rather than opening a new one each time.
+   */
+  taskForSession(projectId: string, sessionId: string) {
+    return this.tasks(projectId).find(task =>
+      task.sessionIds.includes(sessionId)
+      && (task.status === 'in_progress' || task.status === 'paused'));
+  }
+  /**
+   * Associate a session with a task, creating the task if this is its first session.
+   *
+   * Called when a session begins work. Without it the design's automatic recording
+   * has nothing to record against: every session would start a fresh task and the
+   * cross-session link would never exist.
+   */
+  startTaskForSession(projectId: string, sessionId: string, title: string) {
+    const existing = this.taskForSession(projectId, sessionId);
+    if (existing) {
+      if (!existing.sessionIds.includes(sessionId)) {
+        this.recordTask(projectId, {
+          id: existing.id, title: existing.title, status: existing.status,
+          sessionIds: [...existing.sessionIds, sessionId],
+        });
+      }
+      return { id: existing.id, created: false };
+    }
+    // A session with no task gets one, named from the session so the diary has a
+    // subject rather than an opaque id.
+    const id = `task-${createHash('sha256').update(`${projectId}\n${sessionId}`).digest('hex').slice(0, 16)}`;
+    const prior = this.getTask(id, projectId);
+    if (prior) {
+      this.recordTask(projectId, {
+        id, title: prior.title, status: 'in_progress',
+        sessionIds: [...new Set([...prior.sessionIds, sessionId])],
+      });
+      return { id, created: false };
+    }
+    this.recordTask(projectId, {
+      id, title: title.slice(0, 200) || '未命名任务', status: 'in_progress',
+      sessionIds: [sessionId], startedAt: this.now(),
+    });
+    return { id, created: true };
+  }
+  /**
+   * Generate the diary for a task.
+   *
+   * Built from what the task actually recorded — its own facts and its event
+   * stream — not from a model's summary of the conversation. The design requires
+   * the diary to be "based on facts" and to distinguish success, failure and
+   * unverified; a generated narrative would blur exactly those distinctions.
+   */
+  generateJournal(taskId: string, projectId: string) {
+    const task = this.getTask(taskId, projectId);
+    if (!task) throw new DomainError('not_found', 'Task is unavailable', 404);
+    const events = this.db.prepare('SELECT payload, created_at FROM events ORDER BY created_at').all()
+      .map(row => { try { return JSON.parse(String(row.payload)) as { taskId?: string; kind?: string; summary?: string }; } catch { return {}; } })
+      .filter(payload => payload.taskId === taskId);
+    const stops = events.filter(event => event.kind === 'turn_stopped').length;
+    const did = task.summary
+      || `任务「${task.title}」共记录 ${events.length} 个事件${stops ? `，其中 ${stops} 次中断` : ''}。`;
+    const outcome: 'success' | 'failure' | 'unverified' =
+      task.status === 'completed' ? (task.verified ? 'success' : 'unverified')
+      : task.status === 'failed' ? 'failure'
+      : 'unverified';
+    return {
+      id: `journal-${task.id}`,
+      kind: 'journal' as const,
+      title: `任务日记：${task.title}`.slice(0, 200),
+      scope: { kind: 'project' as const, projectId },
+      baseRevision: 0,
+      labels: [] as string[],
+      // The plugin wrote this from its own records, so `agent` provenance is the
+      // accurate label: it is not something the user said, and calling it theirs
+      // would lend the diary an authority it does not have.
+      provenance: 'agent' as const,
+      evidence: 'observed' as const,
+      platforms: [] as Array<'dsh' | 'codex'>,
+      taskId: task.id,
+      did: did.slice(0, 2000),
+      problems: task.notes.slice(0, 2000),
+      experienceLanded: task.relatedExperiences,
+      outcome,
+      unfinished: task.unfinished,
+    };
+  }
+  /** Record the journal as knowledge, so it survives the task record. */
+  writeJournal(taskId: string, projectId: string) {
+    const journal = this.generateJournal(taskId, projectId);
+    const existing = this.current().find(entry => entry.content.kind === 'journal'
+      && (entry.content as { taskId?: string }).taskId === taskId);
+    const withRevision = existing
+      ? { ...journal, baseRevision: existing.revision }
+      : journal;
+    const revision = this.import([withRevision]);
+    return { journalId: journal.id, revision, replaced: Boolean(existing), outcome: journal.outcome };
+  }
+  /**
+   * Handoff carries what the other end needs and never implies process or credential transfer.
+   *
+   * The design lists goal, constraints, decisions, progress, unfinished work, file
+   * references, verification results, the knowledge version and a suggested next
+   * step. `files` is included because the design requires the receiving end to
+   * re-check the environment — naming the files is what makes that check possible,
+   * and the caveat states that the check has not been performed here.
+   */
   handoff(id: string, projectId: string) {
     const task = this.tasks(projectId).find(t => t.id === id);
     if (!task) throw new DomainError('not_found', 'Task is unavailable', 404);
+    // The next step is derived from what the task itself left open, not invented.
+    const nextStep = task.unfinished.length
+      ? `继续处理未完成项：${task.unfinished[0]}`
+      : task.status === 'completed'
+        ? '任务已完成；如需延展，请从相关经验或流程入口重新开始。'
+        : '任务仍在进行中；先核对下面的文件与环境状态，再继续。';
     return {
       task, knowledgeRevision: this.revision,
       norms: this.norms(projectId),
       workflows: this.search(projectId, task.title).map(w => ({ id: w.id, revision: w.revision, title: w.title, ready: w.ready })),
-      caveat: '接收端需重新确认文件与环境状态；本交接不迁移运行中的进程、凭据或工具权限。',
+      /** Files the receiving end must re-check; naming them is the point. */
+      files: task.files,
+      /** What was verified, and whether anything was verified at all. */
+      verification: { verified: task.verified || null, taskStatus: task.status },
+      suggestion: nextStep,
+      caveat: '接收端需重新确认文件与环境状态；本交接不迁移运行中的进程、凭据或工具权限。'
+        + ' 上面的 files 只是需要核对的清单，不代表已经核对过。',
+    };
+  }
+  /**
+   * Export a task as readable Markdown, and as the full record for backup.
+   *
+   * Two shapes for two purposes, as the design specifies: the Markdown is for a
+   * person reading what happened, the JSON is for moving the data. The Markdown
+   * deliberately states the outcome rather than implying it — an unverified task
+   * must not read like a successful one.
+   */
+  exportTask(id: string, projectId: string) {
+    const task = this.tasks(projectId).find(t => t.id === id);
+    if (!task) throw new DomainError('not_found', 'Task is unavailable', 404);
+    const events = this.db.prepare('SELECT payload, created_at FROM events ORDER BY created_at').all()
+      .map(row => {
+        let payload: Record<string, unknown> = {};
+        try { payload = JSON.parse(String(row.payload)) as Record<string, unknown>; } catch { /* torn row */ }
+        return { created_at: Number(row.created_at), taskId: payload.taskId, kind: payload.kind, summary: payload.summary };
+      })
+      .filter(event => event.taskId === id);
+    const stamp = (value: number | null) => value === null ? '—' : new Date(value).toISOString().replace('T', ' ').slice(0, 16);
+    const outcomeLabel = { success: '完成（有验证依据）', failure: '失败', unverified: '未验证' } as const;
+    const outcome = task.status === 'completed' ? (task.verified ? 'success' : 'unverified')
+      : task.status === 'failed' ? 'failure' : 'unverified';
+
+    const markdown = [
+      `# 任务记录：${task.title}`, '',
+      `**任务 ID**：${task.id}  `,
+      `**项目**：${projectId}  `,
+      `**时间**：${stamp(task.startedAt ?? task.createdAt)} ~ ${stamp(task.completedAt)}  `,
+      `**状态**：${outcomeLabel[outcome]}（${task.status}）  `,
+      `**知识版本**：${task.knowledgeRevision}`, '',
+      '## 摘要', task.summary || '（无）', '',
+      '## 进展',
+      ...(events.length
+        ? events.map(event => `- ${stamp(event.created_at)} ${String(event.kind ?? '事件')}${event.summary ? `：${String(event.summary)}` : ''}`)
+        : ['- （无事件记录）']), '',
+      '## 关联知识',
+      ...(task.relatedExperiences.length ? task.relatedExperiences.map(id => `- 经验：${id}`) : ['- 经验：（无）']),
+      ...(task.relatedProposals.length ? task.relatedProposals.map(id => `- 提案：${id}`) : ['- 提案：（无）']), '',
+      '## 验证',
+      task.verified ? task.verified : '未提供验证依据（按未验证记录）', '',
+      '## 未解决项',
+      ...(task.unfinished.length ? task.unfinished.map(item => `- [ ] ${item}`) : ['- （无）']), '',
+      '## 需要核对的文件',
+      ...(task.files.length ? task.files.map(file => `- ${file}`) : ['- （无）']), '',
+      '## 备注', task.notes || '（无）', '',
+      '---', '',
+      // Stated in the document itself, because the file outlives the session that
+      // produced it and a reader has no other way to know.
+      '> 本记录由任务的事实数据生成，不是行为指令。日记正文与临时资料采用不同的保留策略。',
+    ].join('\n');
+
+    return {
+      task,
+      markdown,
+      json: { task, events, exportedAt: this.now(), knowledgeRevision: this.revision },
     };
   }
   /**

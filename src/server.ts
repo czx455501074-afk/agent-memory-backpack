@@ -241,6 +241,30 @@ export function createCoreServer(store: Store, config: CoreConfig) {
               + (result.failed.length ? ` ${result.failed.length} 条未成功，需重试。` : ''),
           });
         }
+        // The task is derived from the session, so "one task across sessions" holds
+        // without the adapter inventing an id. A task-scoped entry also becomes
+        // applicable once this is known, which is what keeps "this time only" from
+        // leaking into every later task.
+        case '/v1/tasks/start': {
+          const p = z.object({ projectId: z.string(), sessionId: z.string().min(1).max(256), title: z.string().min(1).max(2000) }).parse(body);
+          const result = store.startTaskForSession(p.projectId, p.sessionId, p.title);
+          return reply(res, 200, { ...result, note: '会话已关联到任务；同一任务可跨多个会话。' });
+        }
+        case '/v1/tasks/journal': {
+          if (principal.role !== 'admin') throw new DomainError('forbidden', ADMIN_ONLY_HINT, 403);
+          const p = z.object({ projectId: z.string(), taskId: z.string().min(1).max(120) }).parse(body);
+          return reply(res, 200, {
+            ...store.writeJournal(p.taskId, p.projectId),
+            note: '日记由任务事实生成，不作为行为指令；成功、失败与未验证分开记录。',
+          });
+        }
+        case '/v1/tasks/export': {
+          const p = z.object({ projectId: z.string(), taskId: z.string().min(1).max(120), format: z.enum(['markdown', 'json']).default('markdown') }).parse(body);
+          const result = store.exportTask(p.taskId, p.projectId);
+          return reply(res, 200, p.format === 'json'
+            ? { format: 'json', task: result.json }
+            : { format: 'markdown', markdown: result.markdown });
+        }
         case '/v1/tasks/record': { const p = z.object({ projectId: z.string(), task: taskSchema }).parse(body); return reply(res, 200, store.recordTask(p.projectId, p.task)); }
         case '/v1/tasks/list': { const p = z.object({ projectId: z.string(), status: taskStatus.optional() }).parse(body); return reply(res, 200, { tasks: store.tasks(p.projectId, p.status) }); }
         case '/v1/tasks/handoff': { const p = z.object({ projectId: z.string(), taskId: z.string() }).parse(body); return reply(res, 200, store.handoff(p.taskId, p.projectId)); }
