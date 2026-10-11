@@ -176,11 +176,8 @@ export const journalSchema = z.object({
   outcome: z.enum(['success', 'failure', 'unverified']),
   unfinished: z.array(shortText).max(50).default([]),
 }).strict();
-/** Temporary material expires this long after it was saved. */
-export const MATERIAL_TTL_DAYS = 90;
 /**
  * Temporary material: a URL, its summary, and body only when needed.
- *
  * Expiry is stored rather than computed so a retention change does not silently
  * resurrect old material, and `renewalReason` exists because the design requires
  * an explicit renewal to say why — ordinary reading must not extend a lifetime.

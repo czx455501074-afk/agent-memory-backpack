@@ -62,6 +62,11 @@ const ADMIN_ONLY = new Set([
   // names and a timestamp, which `/v1/stats` already exposes, so it grants an
   // agent nothing new while letting it answer "what is in this file?".
   '/v1/backup/export', '/v1/backup/import',
+  // Renewal and purge both change how long material is kept, which the design
+  // reserves for the user: a renewal has to state a reason, and a purge destroys
+  // content. Saving stays open — an agent recording what it read is one of the
+  // three collection entry points the design names.
+  '/v1/material/renew', '/v1/material/purge',
 ]);
 
 /**
@@ -186,6 +191,56 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           return reply(res, 200, store.structureSkill({ skillId: p.skillId, workflow: p.workflow, derivedBy: p.derivedBy, evidence: p.evidence, projectId: p.projectId }));
         }
         case '/v1/knowledge/unstructured': { const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body); return reply(res, 200, { skills: store.unstructuredSkills(p.limit) }); }
+        /**
+         * Temporary material.
+         *
+         * Saving is open to adapters: an agent that read a page should be able to
+         * record it, and that is one of the three collection entry points the
+         * design names. Renewal and purge require the admin credential, because
+         * both change how long something is kept — a decision the design reserves
+         * for the user, and one that must carry a stated reason.
+         */
+        case '/v1/material/save': {
+          const p = z.object({
+            projectId: z.string(), id: z.string().min(1).max(120),
+            title: z.string().min(1).max(2000), url: z.string().min(1).max(2000),
+            summary: z.string().min(1).max(2000), body: z.string().max(60000).optional(),
+            taskId: z.string().min(1).max(120).optional(),
+            provenance: z.enum(['user', 'external', 'agent']).optional(),
+          }).parse(body);
+          const byAdapter = principal.role !== 'admin';
+          const result = store.saveMaterial({
+            ...p,
+            // An agent-recorded page is external material by definition: the design
+            // forbids page prose from acquiring the user's authority.
+            provenance: p.provenance ?? (byAdapter ? 'external' : 'user'),
+            body: p.body ?? '',
+          });
+          return reply(res, 200, {
+            ...result,
+            note: result.duplicate
+              ? '同样的页面已在库中，未重复保存，也未延长其到期时间。'
+              : '已作为临时资料保存，到期后自动退出检索并清理。普通读取不会延长它的期限。',
+          });
+        }
+        case '/v1/material/list': {
+          const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body);
+          return reply(res, 200, { material: store.liveMaterial(p.limit), stats: store.materialStats() });
+        }
+        case '/v1/material/renew': {
+          const p = z.object({ projectId: z.string(), id: z.string().min(1).max(120), reason: z.string().min(1).max(500) }).parse(body);
+          const result = store.renewMaterial(p.id, p.reason);
+          return reply(res, 200, { ...result, note: '已按明确理由续期；普通读取不会延长资料期限。' });
+        }
+        case '/v1/material/purge': {
+          const p = z.object({ projectId: z.string() }).parse(body);
+          const result = store.purgeExpiredMaterial();
+          return reply(res, 200, {
+            ...result,
+            note: '已到期资料的正文与索引已删除；失败项可重试。'
+              + (result.failed.length ? ` ${result.failed.length} 条未成功，需重试。` : ''),
+          });
+        }
         case '/v1/tasks/record': { const p = z.object({ projectId: z.string(), task: taskSchema }).parse(body); return reply(res, 200, store.recordTask(p.projectId, p.task)); }
         case '/v1/tasks/list': { const p = z.object({ projectId: z.string(), status: taskStatus.optional() }).parse(body); return reply(res, 200, { tasks: store.tasks(p.projectId, p.status) }); }
         case '/v1/tasks/handoff': { const p = z.object({ projectId: z.string(), taskId: z.string() }).parse(body); return reply(res, 200, store.handoff(p.taskId, p.projectId)); }

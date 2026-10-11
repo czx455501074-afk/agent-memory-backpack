@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { DomainError, knowledgeSchema, workflowSchema, type Knowledge, type KnowledgeDraft, type WorkflowDraft, type Workflow, type Scope } from './schema.js';
+import { MATERIAL_TTL_DAYS, isLive, materialEntry, renew, type MaterialInput } from './material.js';
 
 type Row = Record<string, unknown>;
 type Entry = { id: string; revision: number; status: string; content: Knowledge };
@@ -880,9 +881,114 @@ export class Store {
       return { retired, skipped };
     });
   }
+  /**
+   * Remove what has lapsed. Called on every request and on a timer.
+   *
+   * Two of the three removals are ordinary housekeeping. The third is the design's
+   * second layer for temporary material: bodies, summaries and index rows are
+   * deleted once the expiry passes. The first layer — refusing to *return* expired
+   * material — lives in `liveMaterial()` and runs on every read, so a lapsed item
+   * cannot be served even while this job is failing or has never run.
+   *
+   * The removal is per item rather than in bulk so one failure cannot strand the
+   * rest, and each is recorded: a cleanup that silently did nothing is
+   * indistinguishable from one that had nothing to do.
+   */
   cleanup() {
     this.db.prepare("UPDATE proposals SET state='expired',payload='{}' WHERE expires_at<=? AND state='pending'").run(this.now());
     this.db.prepare('DELETE FROM events WHERE expires_at<=?').run(this.now());
+    this.purgeExpiredMaterial();
+  }
+  /**
+   * Purge lapsed temporary material, returning what was removed.
+   *
+   * Separated from `cleanup()` so a caller can retry it alone, and so a test can
+   * assert the purge without waiting for the other housekeeping. Each item is
+   * retired through the normal revision path, which keeps the fact that it existed
+   * in history while removing it from every live surface.
+   */
+  purgeExpiredMaterial(): { purged: string[]; failed: Array<{ id: string; message: string }> } {
+    const now = this.now();
+    const purged: string[] = [];
+    const failed: Array<{ id: string; message: string }> = [];
+    for (const entry of this.current()) {
+      const content = entry.content;
+      if (content.kind !== 'material') continue;
+      if (isLive(content.expiresAt, now)) continue;
+      try {
+        this.retire(entry.id, entry.revision);
+        purged.push(entry.id);
+      } catch (error) {
+        // Collected, not thrown: one item that will not retire must not stop the
+        // pass, and the caller needs to know which ones to retry.
+        failed.push({ id: entry.id, message: error instanceof Error ? error.message : 'purge failed' });
+      }
+    }
+    return { purged, failed };
+  }
+  /**
+   * Save temporary material, recognising a repeat of the same page.
+   *
+   * A duplicate is skipped rather than stored twice, and — importantly — skipping
+   * does **not** extend the original's expiry. The design is explicit that saving
+   * the same page again is not a decision to keep it longer.
+   */
+  saveMaterial(input: MaterialInput): { id: string; duplicate: boolean; expiresAt: number } {
+    const now = this.now();
+    const entry = materialEntry(input, now);
+    const existing = this.current().find(candidate =>
+      candidate.content.kind === 'material' && candidate.content.fingerprint === entry.fingerprint);
+    if (existing) {
+      return { id: existing.id, duplicate: true, expiresAt: (existing.content as { expiresAt: number }).expiresAt };
+    }
+    this.import([entry]);
+    return { id: entry.id, duplicate: false, expiresAt: entry.expiresAt };
+  }
+  /**
+   * Renew material deliberately, with a reason.
+   *
+   * The design requires the reason: reading must not extend a lifetime, so the one
+   * path that does has to record why. A lapsed item can be renewed (a user may
+   * decide a page is worth keeping after all) but an already-purged one cannot,
+   * because its body is gone — claiming otherwise would return an empty page.
+   */
+  renewMaterial(id: string, reason: string): { expiresAt: number; renewalReason: string } {
+    const entry = this.current().find(candidate => candidate.id === id);
+    if (!entry || entry.content.kind !== 'material') throw new DomainError('not_found', 'Material is unavailable', 404);
+    const content = entry.content;
+    const renewed = renew({ expiresAt: content.expiresAt, savedAt: content.savedAt }, reason, this.now());
+    this.import([{ ...content, baseRevision: entry.revision, ...renewed }]);
+    return { expiresAt: renewed.expiresAt, renewalReason: renewed.renewalReason };
+  }
+  /** Live material only, newest first. Expired items are never returned. */
+  liveMaterial(limit = 50) {
+    const now = this.now();
+    return this.current()
+      .filter(entry => entry.content.kind === 'material' && isLive(entry.content.expiresAt, now))
+      .sort((a, b) => (b.content as { savedAt: number }).savedAt - (a.content as { savedAt: number }).savedAt)
+      .slice(0, limit)
+      .map(entry => {
+        const content = entry.content as Extract<Knowledge, { kind: 'material' }>;
+        return {
+          id: entry.id, revision: entry.revision, title: content.title, url: content.url,
+          summary: content.summary, savedAt: content.savedAt, expiresAt: content.expiresAt,
+          taskId: content.taskId ?? null, provenance: content.provenance,
+          renewalReason: content.renewalReason ?? null,
+        };
+      });
+  }
+  /** Counts for the management interface, so retention is visible rather than implied. */
+  materialStats() {
+    const now = this.now();
+    const all = this.current().filter(entry => entry.content.kind === 'material');
+    const live = all.filter(entry => isLive((entry.content as { expiresAt: number }).expiresAt, now));
+    return {
+      live: live.length, expired: all.length - live.length, total: all.length,
+      ttlDays: MATERIAL_TTL_DAYS,
+      nextExpiry: live.length
+        ? Math.min(...live.map(entry => (entry.content as { expiresAt: number }).expiresAt))
+        : null,
+    };
   }
   /** Rescan cadence bookkeeping, read by adapters on session start. */
   rescanState() {
