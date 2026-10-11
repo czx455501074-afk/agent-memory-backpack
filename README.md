@@ -177,21 +177,31 @@ node dist/src/cli.js export --data-dir $AMB --dir .agents/skills/amb --yes
 
 导出的是标准 Markdown，没有插件专有字段，宿主可原生读取。
 
-## 控制台管理面板
+## 管理界面
+
+界面由核心自己提供，不需要安装任何桌面程序，也没有要额外开着的窗口：
+
+```powershell
+node dist/src/cli.js ui --open     # 打印地址并打开浏览器
+```
+
+打开后可以查看状态总览、规范、候选、技能与记忆、任务。
+
+**为什么是网页而不是桌面应用**：核心本来就一直开着，网页只是它多提供的一个地址，因此不需要第二个进程、不需要额外运行时，也可以直接放进宿主自己的浏览器面板里。核心在跑，界面就在。
+
+**这个地址含管理凭据**（在 URL 片段里，浏览器不会把它发给服务端，因此不进请求日志），页面读完就把它从地址栏清掉、只留在内存中。**不要外发或贴到聊天里**。
+
+安全边界保持不变：核心仍然拒绝其它来源的浏览器请求（只放行它自己这个源），并且所有数据接口都要求凭据——同源不等于免认证。
+
+### Electron 桌面控制台（可选）
 
 ```powershell
 npm run console -- --config="$HOME/.agent-memory-backpack/admin-client.json"
 ```
 
-启动 Electron 桌面控制台，提供：
-- 知识库状态总览（条目计数、存储大小、版本号）
-- 候选经验审阅（批准/拒绝）
-- 数据迁移操作（导出/预览/导入归档，带原生文件对话框）
-- 自检面板（等价于 `cli doctor`，无需开终端）
+功能更全（含原生文件对话框的数据迁移与自检面板），但需要 Electron 二进制：`npm ci --ignore-scripts` 不会拉取它，先跑一次 `npm install`。若报 `ELECTRON_RUN_AS_NODE is set`，先 `Remove-Item Env:ELECTRON_RUN_AS_NODE`。
 
-**必须指向 admin 凭据**（`admin-client.json`）：批准、推翻与数据导入都是管理操作，适配器凭据会被核心正确拒绝。也可以用 `AMB_CONSOLE_CONFIG` 环境变量代替 `--config`。
-
-> 控制台依赖 Electron 二进制。如果 `npm ci --ignore-scripts` 跳过了它，先运行 `npm install` 补装。若启动时报 `ELECTRON_RUN_AS_NODE is set`，先执行 `Remove-Item Env:ELECTRON_RUN_AS_NODE`。
+> 大多数情况下用上面的网页版就够了；桌面版只在需要原生文件选择器时才有优势。
 
 ## 卸载
 
