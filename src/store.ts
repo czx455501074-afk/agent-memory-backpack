@@ -614,6 +614,119 @@ export class Store {
     });
   }
   /**
+   * Mark a proposal as needing more evidence.
+   *
+   * The design requires this fourth outcome beside approve and reject. It exists
+   * because the honest answer to a plausible but unsupported claim is neither: the
+   * claim may be true, so rejecting it loses information, and approving it would
+   * record an unverified statement as knowledge. The deadline comes from the design
+   * (thirty days), after which the proposal is archived rather than silently living
+   * on in the queue.
+   */
+  requestEvidence(id: string, reason: string): { state: string; dueAt: number } {
+    const text = reason.trim();
+    if (!text) throw new DomainError('invalid_request', 'A request for evidence must say what is missing', 400);
+    return this.transaction(() => {
+      const dueAt = this.now() + 30 * DAY;
+      // The reason is stored in the payload so a later reader can see what was asked
+      // for; without it the item comes back with no explanation of why it was held.
+      const row = this.db.prepare('SELECT payload FROM proposals WHERE id=?').get(id) as { payload: string } | undefined;
+      if (!row) throw new DomainError('not_found', 'Proposal is unavailable', 404);
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(row.payload) as Record<string, unknown>; } catch { /* keep empty */ }
+      payload.evidenceRequest = { reason: text.slice(0, 500), requestedAt: this.now(), dueAt };
+      const result = this.db.prepare("UPDATE proposals SET state='needs_evidence', expires_at=?, payload=? WHERE id=? AND state='pending'")
+        .run(dueAt, JSON.stringify(payload), id);
+      if (!result.changes) throw new DomainError('not_found', 'Proposal not found or not pending', 404);
+      return { state: 'needs_evidence', dueAt };
+    });
+  }
+  /**
+   * Apply one decision to many proposals.
+   *
+   * The design asks for batch operations so a user is not interrupted per candidate.
+   * Each proposal is handled on its own so one failure cannot strand the rest, and
+   * the outcome is reported per id rather than as a single count — a batch that says
+   * "5 approved" while two were refused for a stale base revision teaches the user
+   * nothing about which two.
+   */
+  reviewBatch(projectId: string, input: {
+    action: 'approve' | 'reject' | 'archive' | 'request-evidence';
+    ids: string[];
+    /** Required for approve: the reviewer-supplied entry for each id. */
+    entries?: Record<string, KnowledgeDraft>;
+    /** Required for request-evidence. */
+    reason?: string;
+    allowGlobalScope?: boolean;
+  }): { applied: string[]; failed: Array<{ id: string; message: string }> } {
+    const applied: string[] = [];
+    const failed: Array<{ id: string; message: string }> = [];
+    for (const id of input.ids) {
+      try {
+        // Every id is checked against the project before anything is written: a batch
+        // is exactly where an id from another project would otherwise slip through,
+        // since the caller supplies them as a list.
+        const row = this.db.prepare('SELECT payload FROM proposals WHERE id=?').get(id) as { payload: string } | undefined;
+        if (!row) throw new DomainError('not_found', 'Proposal is unavailable', 404);
+        let owner: unknown;
+        try { owner = (JSON.parse(row.payload) as { projectId?: unknown }).projectId; } catch { owner = undefined; }
+        if (owner !== projectId) throw new DomainError('scope_denied', `Proposal ${id} belongs to another project`, 403);
+
+        if (input.action === 'reject') this.rejectProposal(id);
+        else if (input.action === 'archive') this.archiveProposal(id);
+        else if (input.action === 'request-evidence') this.requestEvidence(id, input.reason ?? '');
+        else {
+          const entry = input.entries?.[id];
+          if (!entry) throw new DomainError('invalid_request', `No entry supplied for ${id}`, 400);
+          this.approveProposal(id, entry, { allowGlobalScope: input.allowGlobalScope });
+        }
+        applied.push(id);
+      } catch (error) {
+        failed.push({ id, message: error instanceof Error ? error.message : 'failed' });
+      }
+    }
+    return { applied, failed };
+  }
+  /**
+   * Take a proposal out of the queue without deciding it.
+   *
+   * Distinct from rejecting: the claim is not judged false, it is set aside so the
+   * queue reflects what someone intends to act on. The row is kept, because the
+   * design requires rejected and archived items to remain readable rather than
+   * disappearing when they leave the working list.
+   */
+  archiveProposal(id: string): void {
+    this.transaction(() => {
+      const result = this.db.prepare("UPDATE proposals SET state='archived' WHERE id=? AND state IN ('pending','needs_evidence')").run(id);
+      if (!result.changes) throw new DomainError('not_found', 'Proposal not found or not reviewable', 404);
+    });
+  }
+  /**
+   * Expire proposals whose deadline has passed.
+   *
+   * Two deadlines with different meanings, which is why they are handled together
+   * here rather than as one sweep:
+   *
+   *   - a pending proposal that was never reviewed lapses after its window;
+   *   - a needs_evidence proposal is archived when the request goes unanswered,
+   *     which is what the design means by a thirty-day automatic archive.
+   *
+   * Neither is deleted. The design requires the record to survive so a later reader
+   * can see what was proposed and that it was never resolved.
+   */
+  expireProposals(): { expired: string[]; archived: string[] } {
+    const now = this.now();
+    return this.transaction(() => {
+      const expired = this.db.prepare("SELECT id FROM proposals WHERE state='pending' AND expires_at<=?")
+        .all(now).map(row => String((row as { id: string }).id));
+      this.db.prepare("UPDATE proposals SET state='expired', payload='{}' WHERE state='pending' AND expires_at<=?").run(now);
+      const archived = this.db.prepare("SELECT id FROM proposals WHERE state='needs_evidence' AND expires_at<=?")
+        .all(now).map(row => String((row as { id: string }).id));
+      this.db.prepare("UPDATE proposals SET state='archived' WHERE state='needs_evidence' AND expires_at<=?").run(now);
+      return { expired, archived };
+    });
+  }
+  /**
    * Task identity is a stable ID the caller owns; a task may span sessions and a
    * session may hold several tasks. Re-recording an existing ID only refreshes
    * state, so a retry never creates a duplicate diary entry.
@@ -1157,7 +1270,9 @@ export class Store {
    * indistinguishable from one that had nothing to do.
    */
   cleanup() {
-    this.db.prepare("UPDATE proposals SET state='expired',payload='{}' WHERE expires_at<=? AND state='pending'").run(this.now());
+    // Proposal deadlines are handled by `expireProposals`, which distinguishes a
+    // lapsed pending item from an unanswered evidence request; both keep their rows.
+    this.expireProposals();
     this.db.prepare('DELETE FROM events WHERE expires_at<=?').run(this.now());
     this.purgeExpiredMaterial();
   }

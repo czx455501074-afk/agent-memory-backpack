@@ -50,6 +50,10 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
  */
 const ADMIN_ONLY = new Set([
   '/v1/proposals/list', '/v1/proposals/approve', '/v1/proposals/reject',
+  // The rest of the review lifecycle is the human's for the same reason approval is:
+  // holding a candidate for evidence, archiving it, or acting on many at once are all
+  // review decisions, and an agent that could call them could clear its own queue.
+  '/v1/proposals/request-evidence', '/v1/proposals/archive', '/v1/proposals/batch',
   '/v1/rescan/interval', '/v1/rescan/mark',
   '/v1/knowledge/supersede', '/v1/knowledge/structure',
   // Migration moves the whole library, so it belongs to the human. An agent that
@@ -154,6 +158,44 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           return reply(res, 200, { knowledgeRevision: store.approveProposal(p.id, p.entry, { allowGlobalScope: p.allowGlobalScope }) });
         }
         case '/v1/proposals/reject': { const p = z.object({ projectId: z.string(), id: z.string() }).parse(body); store.rejectProposal(p.id); return reply(res, 200, { state: 'rejected' }); }
+        /**
+         * The rest of the review lifecycle, admin-only like the endpoints above.
+         *
+         * Batch review exists so a user is not interrupted per candidate, and the
+         * outcome is reported per id rather than as one count: a batch that says
+         * "5 approved" while two were refused for a stale base revision tells the
+         * user nothing about which two.
+         */
+        case '/v1/proposals/request-evidence': {
+          const p = z.object({ projectId: z.string(), id: z.string(), reason: z.string().min(1).max(500) }).parse(body);
+          const result = store.requestEvidence(p.id, p.reason);
+          return reply(res, 200, {
+            ...result,
+            note: '该候选未判定真假：缺证据既不该批准，也不该当成假的丢掉。到期未补证会自动归档。',
+          });
+        }
+        case '/v1/proposals/archive': {
+          const p = z.object({ projectId: z.string(), id: z.string() }).parse(body);
+          store.archiveProposal(p.id);
+          return reply(res, 200, { state: 'archived', note: '已移出待办队列，记录仍可查阅。' });
+        }
+        case '/v1/proposals/batch': {
+          const p = z.object({
+            projectId: z.string(),
+            action: z.enum(['approve', 'reject', 'archive', 'request-evidence']),
+            ids: z.array(z.string().min(1)).min(1).max(200),
+            entries: z.record(z.string(), knowledgeSchema).optional(),
+            reason: z.string().min(1).max(500).optional(),
+            allowGlobalScope: z.boolean().default(false),
+          }).parse(body);
+          const result = store.reviewBatch(p.projectId, p);
+          return reply(res, 200, {
+            ...result,
+            note: result.failed.length
+              ? '部分条目未处理，逐条原因见 failed；其余已按动作执行。'
+              : '全部按要求处理。',
+          });
+        }
         // Filtered by project: an earlier version returned every norm in the
         // database, so one project's credential could read another project's
         // normative text. `scopedEntries()` applies the same scope rule as
