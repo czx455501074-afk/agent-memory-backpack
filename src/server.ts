@@ -1,10 +1,12 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
+import { dirname } from 'node:path';
 import { z } from 'zod';
 import { Store } from './store.js';
 import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, DomainError } from './schema.js';
 import { coreSchema, type CoreConfig } from './config.js';
 import { exportArchive, importArchive, inspectArchive } from './archive.js';
+import { capabilityManifest, operatingModeFromDisk } from './capabilities.js';
 import { UI_CSS, UI_HTML, UI_JS } from './ui.js';
 
 /**
@@ -201,6 +203,20 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         // normative text. `scopedEntries()` applies the same scope rule as
         // prepare, gate and search while keeping the Entry shape callers expect.
         case '/v1/norms': { const p = z.object({ projectId: z.string() }).parse(body); return reply(res, 200, { norms: store.scopedEntries(p.projectId).filter(e => e.content.kind === 'norm'), knowledgeRevision: store.revision }); }
+        case '/v1/preferences': { const p = z.object({ projectId: z.string() }).parse(body); return reply(res, 200, { preferences: store.scopedEntries(p.projectId).filter(e => e.content.kind === 'preference'), knowledgeRevision: store.revision }); }
+        case '/v1/capabilities': {
+          const p = z.object({ projectId: z.string() }).parse(body);
+          const home = process.env.USERPROFILE ?? process.env.HOME ?? '';
+          const dataDir = dirname(store.path);
+          return reply(res, 200, {
+            adapters: capabilityManifest(home),
+            ...operatingModeFromDisk(dataDir, true),
+          });
+        }
+        case '/v1/history/recent': {
+          const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body);
+          return reply(res, 200, { history: store.supersessions().slice(0, p.limit ?? 50) });
+        }
         case '/v1/knowledge/read': { const p = z.object({ projectId: z.string(), knowledgeId: z.string(), includeLeaves: z.boolean().optional() }).parse(body); return reply(res, 200, store.readKnowledge(p.projectId, p.knowledgeId, p.includeLeaves ?? false)); }
         // The caller's own projectId is echoed back so a UI can label what it is
         // showing. It is not a disclosure: the request already had to name it, and

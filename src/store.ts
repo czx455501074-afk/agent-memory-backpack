@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { DomainError, knowledgeSchema, workflowSchema, type Knowledge, type KnowledgeDraft, type WorkflowDraft, type Workflow, type Scope } from './schema.js';
+import { reviewDecision } from './policy.js';
 import { MATERIAL_TTL_DAYS, isLive, materialEntry, renew, type MaterialInput } from './material.js';
 
 type Row = Record<string, unknown>;
@@ -137,7 +138,7 @@ function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
 /** Single SQLite authority for the P0 fixture; not a semantic auto-promotion engine. */
 export class Store {
   readonly db: DatabaseSync;
-  constructor(path: string, private readonly now: () => number = Date.now) {
+  constructor(readonly path: string, private readonly now: () => number = Date.now) {
     this.db = new DatabaseSync(path);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000;
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -580,6 +581,22 @@ export class Store {
       if (payload.baseRevision !== undefined && entry.revision !== payload.baseRevision)
         throw new DomainError('revision_conflict', `Expected baseRevision ${payload.baseRevision} but current is ${entry.revision}`, 409);
     }
+    /**
+     * Which review tier this candidate falls into, decided here rather than at each
+     * call site.
+     *
+     * A submitted candidate is always an agent's own account, so its evidence is
+     * `self-reported` and its provenance `agent` — the two facts the design's boundary
+     * table keys on. That is why the tier is computed from what the submission
+     * actually is rather than from anything the submitter asserts about it: a caller
+     * that could declare its own change auto-applicable would not be governed by the
+     * table at all.
+     */
+    const decision = reviewDecision({
+      intent: 'new-experience',
+      provenance: 'agent',
+      evidence: 'self-reported',
+    });
     return this.transaction(() => {
       const fingerprint = digest(payload); const previous = this.db.prepare('SELECT id,fingerprint,state FROM proposals WHERE principal=? AND idem=?').get(principal, payload.idempotencyKey);
       if (previous) {
@@ -587,9 +604,13 @@ export class Store {
         return { id: previous.id, state: previous.state, duplicate: true };
       }
       const id = randomUUID();
+      // The tier travels with the proposal so a reviewer sees why it needs attention,
+      // and so a later change to the policy cannot retroactively make an old
+      // submission look like it was always low-risk.
+      const record = { ...payload, review: { tier: decision.tier, reason: decision.reason, constraint: decision.constraint } };
       this.db.prepare('INSERT INTO proposals(id,principal,idem,fingerprint,payload,state,created_at,expires_at,project_id) VALUES(?,?,?,?,?,?,?,?,?)')
-        .run(id, principal, payload.idempotencyKey, fingerprint, JSON.stringify(payload), 'pending', this.now(), this.now() + 30 * DAY, payload.projectId);
-      return { id, state: 'pending', duplicate: false };
+        .run(id, principal, payload.idempotencyKey, fingerprint, JSON.stringify(record), 'pending', this.now(), this.now() + 30 * DAY, payload.projectId);
+      return { id, state: 'pending', duplicate: false, review: decision };
     });
   }
   event(principal: string, payload: { eventId: string; [key: string]: unknown }) {

@@ -114,3 +114,25 @@ test('stats 回显调用方自己的项目 ID，供界面标注', async () => {
     assert.equal(typeof body.entries, 'number');
   } finally { await close(); }
 });
+
+test('界面支持偏好、平台能力清单与历史追溯端点', async () => {
+  const { origin, close } = await core();
+  try {
+    const prefRes = await post(origin, '/v1/preferences', {});
+    assert.equal(prefRes.status, 200);
+    const prefBody = await prefRes.json() as { preferences?: unknown[] };
+    assert.ok(Array.isArray(prefBody.preferences));
+
+    const capRes = await post(origin, '/v1/capabilities', {});
+    assert.equal(capRes.status, 200);
+    const capBody = await capRes.json() as { adapters?: Array<{ id: string; capabilities: Record<string, string> }>; mode?: string };
+    assert.equal(capBody.mode, 'Managed');
+    assert.ok(Array.isArray(capBody.adapters));
+    assert.equal(capBody.adapters.length, 2);
+
+    const histRes = await post(origin, '/v1/history/recent', {});
+    assert.equal(histRes.status, 200);
+    const histBody = await histRes.json() as { history?: unknown[] };
+    assert.ok(Array.isArray(histBody.history));
+  } finally { await close(); }
+});
