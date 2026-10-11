@@ -26,6 +26,8 @@ const USAGE = [
   '  --port N                核心监听端口（不传则沿用 cli init 的默认值 47631）',
   '  --admin-dir DIR         管理凭据单独存放目录（传给 cli init）',
   '  --build                 强制重新构建（默认仅在缺少 dist/src/cli.js 时构建）',
+  '  --no-sync               跳过「同步本地已有知识」这一步（默认会同步）',
+  '  --sync-roots PATH,...   只扫描这些位置（默认扫描 DSH/Codex 的规范与技能目录）',
   '  --codex-workspace PATH  用官方 codex CLI 把本插件装进该工作区（可选）',
   '  --start                 前台启动核心（cli serve），Ctrl+C 停止；默认不启动',
   '  --offline               自检跳过网络探测（等价于 cli doctor --offline）',
@@ -53,6 +55,7 @@ try {
       'data-dir': { type: 'string' }, project: { type: 'string' },
       'project-root': { type: 'string' }, port: { type: 'string' },
       'admin-dir': { type: 'string' }, build: { type: 'boolean', default: false },
+      'no-sync': { type: 'boolean', default: false }, 'sync-roots': { type: 'string' },
       'codex-workspace': { type: 'string' }, start: { type: 'boolean', default: false },
       offline: { type: 'boolean', default: false }, 'dry-run': { type: 'boolean', default: false },
     },
@@ -148,7 +151,7 @@ function findCodexCli() {
   return undefined;
 }
 
-const totalSteps = 6;
+const totalSteps = 7;
 say('Agent Memory Backpack 本地安装');
 say(`仓库根目录：${root}`);
 if (dryRun) say('模式：--dry-run（只打印命令，不写入任何东西）');
@@ -251,8 +254,55 @@ for (const name of credentialFiles) {
   say(`  ${existsSync(path) ? '[存在]' : '[缺失]'} ${path}`);
 }
 
-// ------------------------------------------------- [4/6] Codex 插件（可选）
-step(4, totalSteps, 'Codex 插件安装到工作区（可选）');
+// --------------------------------------------- [4/7] 同步本地已有知识（默认执行）
+//
+// 安装即同步，是用户明确要求的行为：装完插件就要能读到本机已有的规范和技能，
+// 而不是让用户再手动跑一遍 discover/adopt。
+//
+// 两阶段且可撤销，因为「同步」会写库：
+//   1. discover 只读，先看清会收进什么，原样打印给用户；
+//   2. adopt 才写入，并打印撤销命令。
+// 扫描对宿主只读，采纳只写插件自己的数据库，源文件不动。
+step(4, totalSteps, '同步本地已有知识（discover → adopt）');
+if (values['no-sync']) {
+  say('传了 --no-sync，跳过。之后随时可以手动执行：');
+  say(`  node dist/src/cli.js discover --data-dir "${dataDir}"`);
+  say(`  node dist/src/cli.js adopt    --data-dir "${dataDir}" --yes`);
+} else {
+  const roots = values['sync-roots']
+    ? String(values['sync-roots']).split(',').map(r => r.trim()).filter(Boolean)
+    : null;
+  const scopeArgs = roots ? ['--roots', roots.join(',')] : [];
+
+  if (dryRun) {
+    say(`干跑：将执行 discover（只读）${roots ? ` --roots ${roots.join(',')}` : '（默认扫描位置）'}`);
+    say(`干跑：将执行 adopt --yes（写入插件数据库，可撤销）`);
+  } else {
+    // 先只读扫描。这一步无论如何都跑：即使后面采纳失败，用户也看得到发现了什么。
+    say('--- 只读扫描（不写入任何内容）---');
+    const scanned = run(process.execPath, [cliPath, 'discover', '--data-dir', dataDir, ...scopeArgs], root);
+    if (scanned.status !== 0) {
+      say('扫描未成功，跳过采纳。上面的报错是原始输出。');
+      say(`  排查后可手动执行：node dist/src/cli.js discover --data-dir "${dataDir}"`);
+    } else {
+      say('');
+      say('--- 采纳（写入插件数据库；源文件不会被改动）---');
+      const adopted = run(process.execPath, [cliPath, 'adopt', '--data-dir', dataDir, ...scopeArgs, '--yes'], root);
+      say('');
+      if (adopted.status !== 0) {
+        // 采纳失败不是安装失败：核心功能仍然可用，知识可以稍后再同步。
+        say('采纳未成功。安装本身已完成，可稍后重试同步：');
+        say(`  node dist/src/cli.js adopt --data-dir "${dataDir}" --yes`);
+      } else {
+        say('同步完成。撤销命令已在上面的输出里（adopt --revoke <时间戳>）。');
+        say('说明：技能以原文保存并标记为「待结构化」，在有人给出结构之前不会被当作已核实流程。');
+      }
+    }
+  }
+}
+
+// ------------------------------------------------- [5/7] Codex 插件（可选）
+step(5, totalSteps, 'Codex 插件安装到工作区（可选）');
 if (!values['codex-workspace']) {
   say('未传 --codex-workspace，跳过。需要时用法：');
   say('  node scripts/amb-install.mjs --codex-workspace <你准备用于验证的工作区绝对路径>');
@@ -332,8 +382,8 @@ if (!values['codex-workspace']) {
   }
 }
 
-// ------------------------------------------------------- [5/6] 服务（可选）
-step(5, totalSteps, '启动核心（可选）');
+// ------------------------------------------------------- [6/7] 服务（可选）
+step(6, totalSteps, '启动核心（可选）');
 if (!values.start) {
   say('未传 --start，跳过。需要时：');
   say(`  node dist/src/cli.js serve --data-dir "${dataDir}"`);
@@ -342,8 +392,8 @@ if (!values.start) {
   say(`干跑：将执行 ${process.execPath} ${cliPath} serve --data-dir "${dataDir}"`);
 }
 
-// --------------------------------------------------------- [6/6] 自检
-step(6, totalSteps, '自检（cli doctor）');
+// --------------------------------------------------------- [7/7] 自检
+step(7, totalSteps, '自检（cli doctor）');
 if (values.start) {
   say('提示：--start 会在自检之后占用前台，所以自检先跑。核心起来后可在另一个终端重跑 doctor 核对「核心可达」。');
 }
