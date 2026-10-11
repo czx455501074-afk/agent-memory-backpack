@@ -89,8 +89,14 @@ export class Store {
     return { id: String(row.id), revision: Number(row.head), status: String(row.status), content: knowledgeSchema.parse(JSON.parse(String(row.content))) };
   }
   private current(): Entry[] {
+    // Ordered by id so the same library always yields the same sequence. Without
+    // it, SQLite returns rows in whatever order the plan produces, which made any
+    // caller that takes the first N pick an arbitrary subset — adopted skills
+    // appeared in the injected context in a different order run to run, and the
+    // entries that happened to come first varied with the build of SQLite.
     return this.db.prepare(`SELECT k.id,k.head,k.status,r.content FROM knowledge k
-      JOIN revisions r ON k.id=r.id AND k.head=r.revision WHERE k.status='active'`).all().map(row => this.decode(row));
+      JOIN revisions r ON k.id=r.id AND k.head=r.revision WHERE k.status='active'
+      ORDER BY k.id`).all().map(row => this.decode(row));
   }
   /** Admin-only offline import. Every update requires the observed per-item revision. */
   import(entries: Knowledge[]): number {
