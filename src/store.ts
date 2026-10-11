@@ -72,7 +72,17 @@ function queryTokens(query: string): string[] {
  * coverage ranking above already puts the best candidates first. Left as a known
  * limitation rather than a guess dressed up as a fix.
  */
-function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
+/**
+ * One match, with the reason it matched.
+ *
+ * The reason is carried out of the matcher rather than recomputed by callers: the
+ * design requires every retrieved item to be able to say *why it was retrieved*, and
+ * a second implementation of that answer would eventually disagree with the one
+ * that actually selected the row.
+ */
+interface Match { id: string; coverage: number; matched: string[] }
+
+function matchAll(db: DatabaseSync, tokens: string[], floor = 0.5): Match[] {
   if (!tokens.length) return [];
   const hitsFor = (token: string): Set<string> => {
     try {
@@ -87,9 +97,11 @@ function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
   const ranked = db.prepare('SELECT id FROM workflow_search WHERE workflow_search MATCH ? ORDER BY bm25(workflow_search)')
     .all(tokens.map(token => `"${token}"`).join(' OR ')).map(row => String((row as { id: string }).id));
 
+  const matchedFor = (id: string) => tokens.filter((_token, index) => perToken[index]!.has(id));
+
   // A single fragment carries no coverage signal: whether it appears is the only
   // question, its commonness has already been judged, and bm25 ordered the answer.
-  if (tokens.length === 1) return ranked;
+  if (tokens.length === 1) return ranked.map(id => ({ id, coverage: 1, matched: matchedFor(id) }));
 
   const covered = new Map<string, number>();
   for (const id of ranked) {
@@ -97,13 +109,29 @@ function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
     for (const hits of perToken) if (hits.has(id)) count += 1;
     covered.set(id, count / tokens.length);
   }
-  // Ordered by coverage first, then by the FTS ranking. The floor is relative to
-  // the best row so a query whose fragments are individually common still returns
-  // its closest matches instead of nothing.
+  /**
+   * The floor is relative to the best row, with no absolute minimum.
+   *
+   * An absolute floor of one half was tried and removed: a query of several
+   * fragments where only one is real — "导出设备", where "设备" appears in nothing —
+   * scored the correct entry at one third and discarded it. The user asked about
+   * exporting, and got silence because they added a word the library does not know.
+   * Anchoring to the best row instead means the strongest available matches come
+   * back and the weaker ones are pruned relative to them, which is what ranking is
+   * for. The single genuine risk — a common fragment matching widely — is
+   * constrained by `limit`, and by the fact that coverage ordering puts rows
+   * matching more of the query first.
+   */
   const best = Math.max(...covered.values());
-  const threshold = Math.max(floor, best * 0.6);
+  const threshold = best * floor;
   return ranked.filter(id => (covered.get(id) ?? 0) >= threshold)
-    .sort((a, b) => (covered.get(b) ?? 0) - (covered.get(a) ?? 0));
+    .sort((a, b) => (covered.get(b) ?? 0) - (covered.get(a) ?? 0))
+    .map(id => ({ id, coverage: covered.get(id) ?? 0, matched: matchedFor(id) }));
+}
+
+/** Just the ids, for callers that do not report a reason. */
+function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
+  return matchAll(db, tokens, floor).map(match => match.id);
 }
 
 /** Single SQLite authority for the P0 fixture; not a semantic auto-promotion engine. */
@@ -123,6 +151,12 @@ export class Store {
       CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY, principal TEXT NOT NULL,
         idem TEXT NOT NULL, fingerprint TEXT NOT NULL, payload TEXT NOT NULL,
         state TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+        -- The owning project is its own column rather than being read out of the
+        -- payload. The payload is cleared when a rejected proposal's retention
+        -- lapses, and a scope filter that depended on it made the record vanish from
+        -- its own project exactly when the design says it should remain readable as
+        -- a record of what was proposed.
+        project_id TEXT NOT NULL DEFAULT '',
         UNIQUE(principal,idem));
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, principal TEXT NOT NULL,
         event_id TEXT NOT NULL, fingerprint TEXT NOT NULL, payload TEXT NOT NULL,
@@ -194,6 +228,7 @@ export class Store {
       ['tasks', 'files TEXT NOT NULL DEFAULT \'[]\''],
       ['tasks', 'verified TEXT NOT NULL DEFAULT \'\''],
       ['tasks', 'started_at INTEGER'],
+      ['proposals', 'project_id TEXT NOT NULL DEFAULT \'\''],
     ];
     for (const [table, definition] of additions) {
       const column = definition.split(' ')[0]!;
@@ -201,6 +236,11 @@ export class Store {
       if (existing.includes(column)) continue;
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
     }
+    // Backfill from the payload for rows written before the column existed. A row
+    // whose payload was already cleared cannot be attributed and is left empty
+    // rather than guessed at; it stays reachable by id.
+    this.db.exec(`UPDATE proposals SET project_id = COALESCE(json_extract(payload, '$.projectId'), '')
+      WHERE project_id = '' AND payload <> '{}'`);
   }
   close() { this.db.close(); }
   get revision(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='revision'").get()!.value); }
@@ -305,14 +345,18 @@ export class Store {
     // typed. Injection is a different question, and `prepare()` decides it: an
     // empty query there means there is no basis for selection, so nothing is
     // injected rather than an arbitrary slice.
-    const ids = tokens.length ? matchIds(this.db, tokens) : entries.map(e => e.id);
+    const matches = tokens.length ? matchAll(this.db, tokens) : [];
+    const ids = tokens.length ? matches.map(match => match.id) : entries.map(e => e.id);
+    const reasonFor = new Map(matches.map(match => [match.id, match]));
     return ids.map(id => all.get(id)).filter((e): e is Entry => !!e && e.content.kind === 'workflow' && applicable(e.content.scope, projectId)).slice(0, limit).map(e => {
       const c = e.content as Workflow;
       let ready = true, unavailable: string | undefined;
       try { this.validateDependencies(e, all, new Set()); } catch (error) { ready = false; unavailable = (error as Error).message; }
       return { id: e.id, revision: e.revision, title: c.title, overview: c.overview,
         preconditions: c.preconditions, stages: c.stages.map(s => ({ id: s.id, title: s.title, checks: s.checks })),
-        completion: c.completion, recovery: c.recovery, categories: c.categories, ready, unavailable };
+        completion: c.completion, recovery: c.recovery, categories: c.categories, ready, unavailable,
+        // Same reason as `knowledge()`: an entry must be able to say why it appeared.
+        why: reasonFor.has(e.id) ? { matched: reasonFor.get(e.id)!.matched, coverage: reasonFor.get(e.id)!.coverage } : null };
     });
   }
   expand(projectId: string, id: string, stageId: string) {
@@ -357,9 +401,9 @@ export class Store {
     // Injection is decided elsewhere: `prepare()` skips this call entirely when
     // the query is empty, because an arbitrary slice of the library appearing in
     // every session is how an unrelated project opened with five media skills.
-    const ids = tokens.length
-      ? matchIds(this.db, tokens)
-      : entries.map(entry => entry.id);
+    const matches = tokens.length ? matchAll(this.db, tokens) : [];
+    const ids = tokens.length ? matches.map(match => match.id) : entries.map(entry => entry.id);
+    const reasonFor = new Map(matches.map(match => [match.id, match]));
     const result: Array<{
       id: string; revision: number; kind: 'skill' | 'memory' | 'preference' | 'journal';
       title: string; excerpt: string; chars: number; leafCount: number; needsStructure: boolean;
@@ -368,6 +412,8 @@ export class Store {
       /** Set for journals, so success, failure and unverified stay distinguishable. */
       outcome?: 'success' | 'failure' | 'unverified';
       provenance: string;
+      /** Why this entry was retrieved: which query fragments matched, and how much. */
+      why: { matched: string[]; coverage: number } | null;
     }> = [];
     for (const id of ids) {
       const entry = all.get(id);
@@ -393,6 +439,10 @@ export class Store {
         stated: content.kind === 'preference' ? content.stated : undefined,
         outcome: content.kind === 'journal' ? content.outcome : undefined,
         provenance: content.provenance,
+        // The design requires each retrieved entry to be able to say why it was
+        // retrieved. `null` when the caller asked for the catalog rather than
+        // searched, which is an honest answer: nothing selected it.
+        why: reasonFor.has(id) ? { matched: reasonFor.get(id)!.matched, coverage: reasonFor.get(id)!.coverage } : null,
       });
       if (result.length >= limit) break;
     }
@@ -441,8 +491,36 @@ export class Store {
     // skills. Norms are unaffected — they are the standing rules and apply
     // whether or not anything was asked.
     const hasQuery = queryTokens(query).length > 0;
+    const retrievalTokens = queryTokens(query);
     const workflows = hasQuery ? this.search(projectId, query) : [];
     const knowledge = hasQuery ? this.knowledge(projectId, query) : [];
+    /**
+     * The record of what this retrieval did, and what it could not find.
+     *
+     * The design requires the knowledge version, the retrieval reason and the known
+     * gaps to be recorded so a missed recall can be investigated afterwards. Without
+     * it the only available explanation for "it did not find that" is a guess, and
+     * the query that found nothing leaves no trace at all — which is exactly the case
+     * worth investigating, since a term matching nothing may mean missing coverage
+     * rather than an unanswerable question.
+     *
+     * A gap is a query fragment that matched no entry. It is reported as a possible
+     * coverage gap, not asserted as one: a term can legitimately be absent because
+     * the library has no such knowledge, or because nothing needed adopting.
+     */
+    const matchedTokens = new Set<string>();
+    for (const item of [...workflows, ...knowledge]) for (const token of item.why?.matched ?? []) matchedTokens.add(token);
+    const retrieval = {
+      query,
+      tokens: retrievalTokens,
+      matchedTokens: [...matchedTokens],
+      gaps: retrievalTokens.filter(token => !matchedTokens.has(token)),
+      selected: [
+        ...workflows.map(w => ({ id: w.id, kind: 'workflow' as const, why: w.why })),
+        ...knowledge.map(k => ({ id: k.id, kind: k.kind, why: k.why })),
+      ],
+      note: '这是本次检索的理由与未命中片段，供日后排查漏检；未命中不等于库中一定该有。',
+    };
     const context = [
       `Agent Memory Backpack 当前知识版本 ${this.revision}。以下规范来自本地权威库；流程是经验，不授予额外操作权限。`,
       ...(hostProvided.length
@@ -460,7 +538,7 @@ export class Store {
         + `\n摘要: ${k.excerpt}`),
       '发现新经验请提交候选，明确所属完整流程和步骤。Stop不表示任务已完成。',
     ].join('\n\n');
-    return { protocolVersion: 1, knowledgeRevision: this.revision, mode: 'Managed', norms, workflows, knowledge, context };
+    return { protocolVersion: 1, knowledgeRevision: this.revision, mode: 'Managed', norms, workflows, knowledge, context, retrieval };
   }
   gate(projectId: string, toolName: string) {
     const all = this.norms(projectId).filter(n => n.kind === 'norm');
@@ -509,7 +587,8 @@ export class Store {
         return { id: previous.id, state: previous.state, duplicate: true };
       }
       const id = randomUUID();
-      this.db.prepare('INSERT INTO proposals VALUES(?,?,?,?,?,?,?,?)').run(id, principal, payload.idempotencyKey, fingerprint, JSON.stringify(payload), 'pending', this.now(), this.now() + 30 * DAY);
+      this.db.prepare('INSERT INTO proposals(id,principal,idem,fingerprint,payload,state,created_at,expires_at,project_id) VALUES(?,?,?,?,?,?,?,?,?)')
+        .run(id, principal, payload.idempotencyKey, fingerprint, JSON.stringify(payload), 'pending', this.now(), this.now() + 30 * DAY, payload.projectId);
       return { id, state: 'pending', duplicate: false };
     });
   }
@@ -535,8 +614,10 @@ export class Store {
   listProposals(projectId: string, state?: string) {
     let query = 'SELECT id,principal,idem,payload,state,created_at,expires_at FROM proposals WHERE 1=1';
     const params: string[] = [];
-    // A proposal always records its project, so the filter is authoritative.
-    query += " AND json_extract(payload, '$.projectId') = ?";
+    // The scope filter reads the dedicated column, not the payload. Reading the
+    // payload meant a row whose payload had been cleared vanished from its own
+    // project's list — the opposite of keeping it as a readable record.
+    query += ' AND project_id = ?';
     params.push(projectId);
     if (state) {
       query += ' AND state=?';
@@ -607,9 +688,19 @@ export class Store {
       return revision;
     });
   }
+  /**
+   * Reject a proposal, keeping it readable for ninety days.
+   *
+   * The design gives a rejected proposal a retention period rather than keeping the
+   * text forever. The state stays afterwards, so the fact that something was
+   * proposed and refused survives; only the content lapses. That distinction matters
+   * for an audit: "a claim was made and rejected on this date" remains true and
+   * checkable long after the claim's text has been cleared.
+   */
   rejectProposal(id: string): void {
     this.transaction(() => {
-      const result = this.db.prepare("UPDATE proposals SET state='rejected' WHERE id=? AND state='pending'").run(id);
+      const result = this.db.prepare("UPDATE proposals SET state='rejected', expires_at=? WHERE id=? AND state='pending'")
+        .run(this.now() + 90 * DAY, id);
       if (!result.changes) throw new DomainError('not_found', 'Proposal not found or not pending', 404);
     });
   }
@@ -665,12 +756,11 @@ export class Store {
       try {
         // Every id is checked against the project before anything is written: a batch
         // is exactly where an id from another project would otherwise slip through,
-        // since the caller supplies them as a list.
-        const row = this.db.prepare('SELECT payload FROM proposals WHERE id=?').get(id) as { payload: string } | undefined;
+        // since the caller supplies them as a list. Read from the column so a cleared
+        // payload cannot make a foreign row look unattributable and slip past.
+        const row = this.db.prepare('SELECT project_id FROM proposals WHERE id=?').get(id) as { project_id: string } | undefined;
         if (!row) throw new DomainError('not_found', 'Proposal is unavailable', 404);
-        let owner: unknown;
-        try { owner = (JSON.parse(row.payload) as { projectId?: unknown }).projectId; } catch { owner = undefined; }
-        if (owner !== projectId) throw new DomainError('scope_denied', `Proposal ${id} belongs to another project`, 403);
+        if (row.project_id !== projectId) throw new DomainError('scope_denied', `Proposal ${id} belongs to another project`, 403);
 
         if (input.action === 'reject') this.rejectProposal(id);
         else if (input.action === 'archive') this.archiveProposal(id);
@@ -714,7 +804,7 @@ export class Store {
    * Neither is deleted. The design requires the record to survive so a later reader
    * can see what was proposed and that it was never resolved.
    */
-  expireProposals(): { expired: string[]; archived: string[] } {
+  expireProposals(): { expired: string[]; archived: string[]; clearedRejected: string[] } {
     const now = this.now();
     return this.transaction(() => {
       const expired = this.db.prepare("SELECT id FROM proposals WHERE state='pending' AND expires_at<=?")
@@ -723,7 +813,12 @@ export class Store {
       const archived = this.db.prepare("SELECT id FROM proposals WHERE state='needs_evidence' AND expires_at<=?")
         .all(now).map(row => String((row as { id: string }).id));
       this.db.prepare("UPDATE proposals SET state='archived' WHERE state='needs_evidence' AND expires_at<=?").run(now);
-      return { expired, archived };
+      // A rejected proposal's text lapses after its ninety days; the state remains,
+      // so the record still says a claim was made and refused.
+      const clearedRejected = this.db.prepare("SELECT id FROM proposals WHERE state='rejected' AND expires_at<=? AND payload<>'{}'")
+        .all(now).map(row => String((row as { id: string }).id));
+      this.db.prepare("UPDATE proposals SET payload='{}' WHERE state='rejected' AND expires_at<=?").run(now);
+      return { expired, archived, clearedRejected };
     });
   }
   /**
