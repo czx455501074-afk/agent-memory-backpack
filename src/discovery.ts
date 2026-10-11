@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
@@ -127,12 +127,19 @@ const EXCLUDED_SEGMENTS = new Set([
  * the exclusion rules still apply below each root.
  */
 export function defaultScanRoots(home = homedir(), cwd = process.cwd()): string[] {
+  // Memories and journals live beside the skills. They are included because a
+  // user's accumulated background is as much a part of "what this agent already
+  // knows" as its rules, and leaving them out meant the sync step reported an
+  // empty library while the material sat one directory away.
+  const memories = ['.dsh', '.codex', '.agents'].map(dir => join(home, dir, 'memories'));
+
   const roots = [
     join(home, '.dsh', 'AGENTS.md'),
     join(home, '.codex', 'AGENTS.md'),
     join(home, '.agents', 'skills'),
     join(home, '.dsh', 'skills'),
     join(home, '.codex', 'skills'),
+    ...memories,
     join(cwd, 'AGENTS.md'),
     join(cwd, '.agents', 'skills'),
   ];
@@ -229,14 +236,33 @@ export function exclusionReason(path: string, name: string): string | undefined 
 /** Instruction files the host loads natively, so they must not be re-injected. */
 const HOST_LOADED_INSTRUCTIONS = new Set(['agents.md', 'claude.md', 'agent.md']);
 
+/**
+ * A daily journal entry, named for its date.
+ *
+ * Both hosts write these (`daily/2026-09-25.md`), and without a rule they fell
+ * through to "markdown outside a skill entry" and were dropped — so the journal
+ * the user asked to sync was the one thing that never arrived.
+ *
+ * Matched on the stem rather than the directory: the date is the reliable part of
+ * the convention, and a `daily/` folder is not something every host uses. A file
+ * whose name is not a date is left to the other rules, so this cannot quietly
+ * start treating arbitrary Markdown as knowledge.
+ */
+const JOURNAL_STEM = /^\d{4}-\d{2}-\d{2}$/;
+
 /** Classify a document by its filename; the path plays no part in the decision. */
 function classifyKnowledgeDoc(name: string): { kind: AdoptKind; rationale: string } | undefined {
   const lower = name.toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  const stem = dot > 0 ? lower.slice(0, dot) : lower;
   if (lower === 'agents.md' || lower === 'claude.md' || lower === 'agent.md') {
     return { kind: 'norm', rationale: 'agent instruction file: current working requirements and preferences' };
   }
   if (lower === 'memory.md' || lower === '.memory.md') {
     return { kind: 'memory', rationale: 'agent memory file: durable facts to remember across sessions' };
+  }
+  if (JOURNAL_STEM.test(stem)) {
+    return { kind: 'memory', rationale: 'dated journal entry: a record of what was worked on and learned that day' };
   }
   if (lower === 'skill.md') {
     return { kind: 'skill', rationale: 'skill entry document: a reusable procedure with triggers and prerequisites' };
@@ -286,13 +312,48 @@ export function discover(roots: string[] = defaultScanRoots(), maxFiles = 5_000)
     return text;
   };
 
+  /**
+   * Real paths already scanned as a root.
+   *
+   * Two scan roots can name the same directory — one by its path, another through
+   * a junction — and walking it twice would report every document as a duplicate
+   * of itself. Recorded on the resolved path, which is what the second visit sees.
+   */
+  const resolvedRoots = new Set<string>();
+
   const visit = (path: string, relative: string): void => {
     if (inspected > maxFiles) return;
     let info;
     // lstat, not stat: a link must stay visible as a link so it is never followed.
     try { info = lstatSync(path); } catch { return; }
 
-    if (info.isSymbolicLink()) { excluded.push({ path, reason: 'symbolic link; not followed' }); return; }
+    if (info.isSymbolicLink()) {
+      // A configured or default root is the user's own pointer, so it is resolved.
+      //
+      // On this machine `~/.dsh/skills` and `~/.dsh/memories` are junctions into a
+      // shared data directory. Refusing to resolve them meant the default scan
+      // reported an almost empty library while the user's skills sat one link
+      // away: 62 candidates instead of 87, with nothing in the output saying the
+      // main skills directory had been skipped.
+      //
+      // Only the root is resolved. A link *inside* a tree is still refused, which
+      // is what stops a stray junction from walking out of the scanned area.
+      if (relative === '') {
+        let real: string;
+        try { real = realpathSync(path); } catch {
+          excluded.push({ path, reason: 'symbolic link; not followed (cannot be resolved)' });
+          return;
+        }
+        // Two roots can point at one directory; scanning it twice would report
+        // every document as a duplicate of itself.
+        if (resolvedRoots.has(real)) return;
+        resolvedRoots.add(real);
+        visit(real, '');
+        return;
+      }
+      excluded.push({ path, reason: 'symbolic link; not followed' });
+      return;
+    }
 
     if (info.isDirectory()) {
       const segment = basename(path).toLowerCase();

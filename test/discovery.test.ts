@@ -213,3 +213,58 @@ test('默认扫描根只返回存在的路径，不虚构主机位置', () => {
   // Absent locations must not appear.
   assert.equal(roots.includes(join('nonexistent-home', '.dsh', 'AGENTS.md')), false);
 });
+
+test('符号链接形式的扫描根被解析；树内部的链接仍不跟随', async () => {
+  // On the machines this runs on, `~/.dsh/skills` is a junction into a shared
+  // data directory. Refusing to resolve a *root* meant the default scan skipped
+  // the user's main skills folder entirely and reported 62 candidates instead of
+  // 87, with nothing in the output naming the directory it had dropped.
+  const real = await mkdtemp(join(tmpdir(), 'amb-root-real-'));
+  const outside = await mkdtemp(join(tmpdir(), 'amb-root-outside-'));
+  const holder = await mkdtemp(join(tmpdir(), 'amb-root-holder-'));
+  const link = join(holder, 'skills-link');
+  try {
+    await mkdir(join(real, 'real-skill'), { recursive: true });
+    await writeFile(join(real, 'real-skill', 'SKILL.md'), '# 真技能\n\n## 触发\n在链接后面。\n');
+    // A link inside the tree, which must still be refused.
+    await writeFile(join(outside, 'should-not-appear.md'), '# 不该出现\n');
+    await symlink(real, link, process.platform === 'win32' ? 'junction' : 'dir');
+
+    const report = discover([link]);
+    assert.equal(report.candidates.length, 1, `链接根应被解析并读到其内容，实际 ${report.candidates.length}`);
+    assert.match(report.candidates[0]!.title, /真技能/);
+
+    // The internal link is a separate case and must stay excluded.
+    await symlink(outside, join(real, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+    const second = discover([link]);
+    assert.equal(second.candidates.some(c => c.source.path.includes('escape')), false,
+      '根被解析不等于树内部的链接也可以跟随');
+    assert.ok(second.excluded.some(item => /symbolic link/.test(item.reason)));
+  } finally {
+    await cleanup(holder); await cleanup(real); await cleanup(outside);
+  }
+});
+
+test('日期命名的日记被识别为知识，而不是当作孤立片段丢弃', async () => {
+  // Both hosts write `daily/<date>.md`. Without a rule these fell to "markdown
+  // outside a skill entry" and were dropped — so the journal a user asked to sync
+  // was the one thing that never arrived, while its directory sat in the roots.
+  const root = await mkdtemp(join(tmpdir(), 'amb-journal-'));
+  try {
+    await mkdir(join(root, 'daily'), { recursive: true });
+    await writeFile(join(root, 'daily', '2026-09-25.md'), '# 9 月 25 日\n\n今天验证了迁移流程。\n');
+    await writeFile(join(root, 'daily', 'notes.md'), '# 随手记\n\n不是日期命名。\n');
+    await writeFile(join(root, 'MEMORY.md'), '# 长期记忆\n\n项目根在别处。\n');
+
+    const report = discover([root]);
+    const journal = report.candidates.find(c => c.source.path.endsWith('2026-09-25.md'));
+    assert.ok(journal, '日期命名的日记必须被采纳');
+    assert.equal(journal.kind, 'memory', '日记以 memory 类型入库（知识库没有独立的 journal 类型）');
+    assert.match(journal.rationale, /journal/i, '理由必须说明它是日记，便于用户核对');
+    assert.ok(report.candidates.some(c => c.source.path.endsWith('MEMORY.md')), '记忆文件仍应被采纳');
+    // A non-dated name in the same folder is still ordinary Markdown, so the rule
+    // cannot be read as "anything under daily/ is knowledge".
+    assert.equal(report.candidates.some(c => c.source.path.endsWith('notes.md')), false,
+      '同目录下非日期命名的 Markdown 不得因为文件夹名被当作日记');
+  } finally { await cleanup(root); }
+});
