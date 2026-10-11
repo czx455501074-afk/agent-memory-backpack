@@ -450,6 +450,7 @@ function renderTasks() {
           '<td>' + esc(task.summary || '—') + '</td>' +
           '<td><div class="card__actions" style="margin:0;">' +
           '<button class="ghost btn-sm task-view-journal" data-id="' + esc(task.id) + '">查看日记</button>' +
+          '<button class="ghost btn-sm task-handoff-btn" data-id="' + esc(task.id) + '">跨端接续</button>' +
           '<button class="ghost btn-sm task-export-md" data-id="' + esc(task.id) + '">导出 MD</button>' +
           '<button class="ghost btn-sm task-export-json" data-id="' + esc(task.id) + '">导出 JSON</button>' +
           '</div></td></tr>';
@@ -801,6 +802,26 @@ panel.addEventListener('click', function (event) {
       var box = document.getElementById('task-detail-box');
       if (box) box.innerHTML = '<div class="card"><div class="card__head"><span class="card__title">任务日记：' + esc(taskId) + '</span></div>' +
         '<div class="pre-box">' + esc(res.markdown || '无日记内容') + '</div></div>';
+    }).catch(reportError);
+    return;
+  }
+
+  if (target.classList.contains('task-handoff-btn')) {
+    var hTaskId = target.dataset.id;
+    post('/v1/tasks/handoff', { taskId: hTaskId }).then(function (res) {
+      var box = document.getElementById('task-detail-box');
+      if (box) {
+        var filesList = (res.files || []).length
+          ? res.files.map(function (f) { return '• 待核对文件: <code>' + esc(f) + '</code>'; }).join('<br>')
+          : '无明确指定的文件清单';
+        box.innerHTML = '<div class="card">' +
+          '<div class="card__head"><span class="card__title">跨端接续信息：' + esc(hTaskId) + '</span>' +
+          '<span class="pill pill--ok">知识版本 v' + esc(res.knowledgeRevision) + '</span></div>' +
+          '<p class="card__body"><strong>建议下一步：</strong>' + esc(res.suggestion) + '<br><br>' +
+          '<strong>待核对环境与文件：</strong><br>' + filesList + '<br><br>' +
+          '<span class="muted" style="font-size:12px;">' + esc(res.caveat) + '</span></p>' +
+          '</div>';
+      }
     }).catch(reportError);
     return;
   }

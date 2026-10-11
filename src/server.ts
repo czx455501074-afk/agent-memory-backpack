@@ -143,7 +143,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         throw new DomainError('forbidden', ADMIN_ONLY_HINT, 403);
       store.cleanup();
       switch (req.url) {
-        case '/v1/prepare': { const p = contextSchema.parse(body); return reply(res, 200, store.prepare(p.projectId, p.query)); }
+        case '/v1/prepare': { const p = contextSchema.parse(body); return reply(res, 200, store.prepare(p.projectId, p.query, { sessionId: p.sessionId, taskId: p.taskId })); }
         case '/v1/search': { const p = contextSchema.parse(body); return reply(res, 200, { workflows: store.search(p.projectId, p.query), knowledgeRevision: store.revision }); }
         case '/v1/expand': { const p = expandSchema.parse(body); return reply(res, 200, store.expand(p.projectId, p.workflowId, p.stageId)); }
         case '/v1/gate': { const p = gateSchema.parse(body); return reply(res, 200, store.gate(p.projectId, p.toolName)); }

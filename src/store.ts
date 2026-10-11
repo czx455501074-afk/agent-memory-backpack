@@ -536,7 +536,15 @@ export class Store {
       leaves: content.leaves.map(leaf => ({ path: leaf.path, body: includeLeaves ? leaf.body : '' })),
     };
   }
-  prepare(projectId: string, query: string) {
+  prepare(projectId: string, query: string, options?: { sessionId?: string; taskId?: string }) {
+    if (options?.sessionId) {
+      try {
+        const querySnippet = query ? query.split('\n')[0]?.slice(0, 50) : '';
+        this.startTaskForSession(projectId, options.sessionId, querySnippet || '会话工作任务');
+      } catch {
+        // Task association failure must never break retrieval
+      }
+    }
     const all = this.norms(projectId);
     // Instruction files the host already injects natively (DSH ships
     // dsh-agent-instructions; Codex reads the same names) stay indexed and
