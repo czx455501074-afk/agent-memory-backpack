@@ -23,7 +23,8 @@
     "cordis.patch.yml",
     "dsh-plugin.naming.json",
     "resolve-config.mjs",
-    "ensure-core.mjs"
+    "ensure-core.mjs",
+    "gate-cache.mjs"
   ],
   "engines": {
     "node": ">=24.13.0 <25"

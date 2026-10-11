@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -202,10 +203,25 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
   assert.deepEqual(denied, { kind: 'deny', reason: 'Test policy denial.' })
   assert.equal(delegated, false)
 
+  // Core unreachable, no snapshot: nothing was ever recorded to enforce, so the
+  // call proceeds. This used to assert a deny — which was the lockout, where an
+  // optional knowledge service being down stopped the agent from working at all.
   state.gateMode = 'unavailable'
-  const unavailable = await ctx.waterfall('tools/pre-execute', execution, async () => ({ kind: 'allow' }))
-  assert.equal(unavailable.kind, 'deny')
-  assert.match(unavailable.reason, /unavailable/)
+  let proceeded = false
+  const unavailable = await ctx.waterfall('tools/pre-execute', execution, async () => {
+    proceeded = true
+    return { kind: 'allow' }
+  })
+  assert.equal(unavailable.kind, 'allow', '无快照时不得因核心不可达而阻断一切')
+  assert.equal(proceeded, true, '调用应继续到下一个处理者')
+
+  // With a snapshot, a recorded prohibition still holds while the core is down, so
+  // killing the core cannot be a way to shed policy.
+  writeFileSync(join(tempDir, 'gate-snapshot.json'),
+    JSON.stringify({ deniedTools: ['ordinary_tool'], revision: 7, at: Date.now() }), 'utf8')
+  const fromSnapshot = await ctx.waterfall('tools/pre-execute', execution, async () => ({ kind: 'allow' }))
+  assert.equal(fromSnapshot.kind, 'deny', '快照记录的禁止项在核心不可达时仍须执行')
+  rmSync(join(tempDir, 'gate-snapshot.json'), { force: true })
 
   state.gateMode = 'allow'
   const allowed = await ctx.waterfall('tools/pre-execute', execution, async () => {

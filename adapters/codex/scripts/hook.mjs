@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { createAdapterLogger } from "./log.mjs";
 import { resolveClientConfig } from "./resolve-config.mjs";
 import { ensureCoreRunning } from "./ensure-core.mjs";
+import { decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from "./gate-cache.mjs";
 
 const MAX_STDIN_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 4500;
@@ -317,6 +318,13 @@ async function gate(input, config) {
   ) {
     throw new Error("Agent Memory Backpack gate response does not match protocol v1");
   }
+  // Recorded on every successful gate so a later outage still enforces the current
+  // prohibitions. A write failure costs freshness only; it must not fail this call.
+  saveSnapshot(config.dataDir, {
+    deniedTools: Array.isArray(result.deniedTools) ? result.deniedTools : [],
+    revision: result.knowledgeRevision,
+    at: Date.now(),
+  });
   if (result.decision === "deny") {
     deny(safeReason(result.reason, config.token));
   } else if (result.context.trim()) {
@@ -430,7 +438,23 @@ async function main() {
     // actionable, and it is the only place the real cause is kept.
     logger.error("hook.failed", { event, ms: Date.now() - started, message });
     if (event === PRE_TOOL_USE) {
-      deny("Agent Memory Backpack policy service is unavailable; this supported tool call was blocked.");
+      // The service being unreachable is not the same as "this call is denied".
+      //
+      // Denying here blocked every tool whenever the core was down, which made an
+      // optional knowledge service a single point of failure for the whole agent.
+      // The design requires degrading visibly: enforce what a snapshot still knows,
+      // and otherwise step back and say so.
+      const snapshot = loadSnapshot(config.dataDir);
+      const { mode } = operatingMode({ coreReachable: false, snapshot });
+      if (mode === "ReadOnlySnapshot") {
+        if (decideFromSnapshot(snapshot.record, input.tool_name) === "deny") {
+          deny(`${input.tool_name} is prohibited by the last policy snapshot; the core is currently unreachable.`);
+          return;
+        }
+        logger.warn("hook.degraded", { mode, detail: snapshot.detail ?? "" });
+        return;
+      }
+      logger.warn("hook.degraded", { mode, detail: snapshot?.detail ?? "" });
       return;
     }
     fail(message);

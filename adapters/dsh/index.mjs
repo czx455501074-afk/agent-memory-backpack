@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 import { createClient, isRecordValue, isWithinProject, loadClientConfig } from './core-client.mjs'
 import { createAdapterLogger } from './log.mjs'
 import { ensureCoreRunning } from './ensure-core.mjs'
+import { decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from './gate-cache.mjs'
 
 /** The packaged core entry point, resolved beside this adapter. */
 const ADAPTER_DIR = dirname(fileURLToPath(import.meta.url))
@@ -271,7 +272,6 @@ export async function apply(ctx) {
       return next()
     }
     let gate
-    checkedExecutions.set(exec, { decision: 'deny', reason: 'Agent Memory Backpack knowledge gate unavailable; this tool call was blocked.' })
     try {
       gate = assertGateResponse(await client.post('/v1/gate', {
         adapter: 'dsh',
@@ -281,15 +281,63 @@ export async function apply(ctx) {
         ...(exec.agent && revisions.has(exec.agent) ? { knowledgeRevision: revisions.get(exec.agent) } : {}),
       }, { signal: exec.signal }))
     } catch {
-      return { kind: 'deny', reason: 'Agent Memory Backpack knowledge gate unavailable; this tool call was blocked.' }
+      // The core is unreachable, which is NOT the same as "this call is denied".
+      //
+      // Denying here made the plugin a single point of failure: an optional
+      // knowledge service, when down, blocked `read`, `grep` and everything else,
+      // so a user could be locked out of their own work by a process they did not
+      // know was involved. The design requires degrading visibly instead, and names
+      // the modes: enforce what a snapshot still knows, and otherwise step back and
+      // say so rather than halting the agent.
+      const snapshot = loadSnapshot(config.dataDir)
+      const { mode } = operatingMode({ coreReachable: false, snapshot })
+      if (mode === 'ReadOnlySnapshot') {
+        const decision = decideFromSnapshot(snapshot.record, exec.name)
+        if (decision === 'deny') {
+          checkedExecutions.set(exec, { decision: 'deny', reason: `${exec.name} 由最近一次规则快照禁止（核心当前不可达）。` })
+          return { kind: 'deny', reason: `${exec.name} 由最近一次规则快照禁止（核心当前不可达）。` }
+        }
+        checkedExecutions.set(exec, { decision: 'allow', reason: 'snapshot allowed' })
+        warnDegradedOnce(exec.agent, mode, snapshot.detail)
+        return next()
+      }
+      // Ungoverned: nothing was ever recorded to enforce, so nothing is claimed and
+      // nothing is blocked.
+      checkedExecutions.set(exec, { decision: 'allow', reason: 'ungoverned' })
+      warnDegradedOnce(exec.agent, mode, snapshot?.detail)
+      return next()
     }
     const previousRevision = revisions.get(exec.agent)
     revisions.set(exec.agent, gate.knowledgeRevision)
+    // Recorded on every successful gate so a later outage still enforces the current
+    // prohibitions. A write failure only costs the snapshot its freshness; it must
+    // not fail the call that is succeeding.
+    saveSnapshot(config.dataDir, {
+      deniedTools: Array.isArray(gate.deniedTools) ? gate.deniedTools : [],
+      revision: gate.knowledgeRevision,
+      at: Date.now(),
+    })
     if (previousRevision !== gate.knowledgeRevision) injectCurrentContext(exec.agent, gate.context)
     checkedExecutions.set(exec, gate)
     if (gate.decision === 'deny') return { kind: 'deny', reason: gate.reason || 'Blocked by Agent Memory Backpack knowledge policy.' }
     return next()
   })
+
+  /**
+   * Say once per session that the gate is running degraded.
+   *
+   * Once, not per call: a warning repeated on every tool call is noise that trains
+   * the reader to ignore it, and the state does not change between calls. The
+   * wording distinguishes the two degraded modes, because "policy from a snapshot"
+   * and "no policy at all" call for different levels of trust.
+   */
+  const warnedDegraded = new WeakSet()
+  const warnDegradedOnce = (agent, mode, detail) => {
+    if (!agent || warnedDegraded.has(agent)) return
+    warnedDegraded.add(agent)
+    logger.warn('adapter.degraded', { mode, detail: detail ?? '' })
+    console.warn(`agent-memory-backpack: 运行模式 ${mode} — ${detail ?? ''}`)
+  }
 
   const registerTool = (tool) => ctx.effect(() => ctx.tools.register({
     ...tool,

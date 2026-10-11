@@ -489,6 +489,10 @@ export class Store {
           : 'No matching explicit tool prohibition'),
       knowledgeRevision: this.revision,
       context: all.filter(n => !n.hostProvided).map(n => `当前规范 ${n.id}@${n.revision}: ${n.body}`).join('\n'),
+      // The effective prohibition list, so an adapter can keep enforcing policy
+      // while the core is down. Not a new disclosure: the norm bodies above are
+      // already sent, and the deny list is a field inside them.
+      deniedTools: [...denied],
     };
   }
   submit(principal: string, payload: { idempotencyKey: string; projectId: string; workflowId?: string; baseRevision?: number; discovery: string }) {

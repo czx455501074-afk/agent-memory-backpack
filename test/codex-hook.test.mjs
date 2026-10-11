@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -257,7 +258,13 @@ test("PreToolUse adds current norm context without approving the tool", async ()
   assert.equal(service.requests[0].body.sessionId, "session-fixture");
 });
 
-test("PreToolUse blocks when the core is unavailable without exposing its response", async () => {
+test("PreToolUse degrades instead of blocking everything when the core is unavailable", async () => {
+  // This case used to assert that the hook blocks every tool call while the core is
+  // down. That was the lockout: an optional knowledge service, when unreachable,
+  // stopped the agent from reading or editing anything, and the only way back was to
+  // disable the plugin. The design requires degrading visibly instead, so with no
+  // snapshot there is nothing to enforce and the call proceeds — while still not
+  // leaking anything the core said.
   const service = await startServer((_request, response) => {
     response.writeHead(503, { "content-type": "text/plain" });
     response.end(`temporary failure ${TEST_TOKEN}`);
@@ -267,12 +274,41 @@ test("PreToolUse blocks when the core is unavailable without exposing its respon
     { hook_event_name: "PreToolUse", tool_name: "mcp__amb__amb_prepare" },
     config,
   );
-  const output = parseStdout(result);
 
-  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
-  assert.equal(output.hookSpecificOutput.hookEventName, "PreToolUse");
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, /service is unavailable/);
-  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(TEST_TOKEN));
+  // Nothing is claimed as governed, and nothing is blocked.
+  assert.equal(result.stdout.trim().includes("permissionDecision"), false,
+    "无快照时不得声称受规则约束，也不得阻断调用");
+  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(TEST_TOKEN),
+    "不得把核心的响应内容泄漏出去");
+});
+
+test("PreToolUse still enforces a recorded prohibition while the core is down", async () => {
+  // The complement of the case above: once the gate has run, its prohibitions
+  // survive the process, so killing the core is not a way to shed policy.
+  const service = await startServer((_request, response) => {
+    response.writeHead(503, { "content-type": "text/plain" });
+    response.end("down");
+  });
+  const config = await createConfig(service.endpoint);
+  const dataDir = dirname(config);
+  await writeFile(join(dataDir, "gate-snapshot.json"),
+    JSON.stringify({ deniedTools: ["mcp__amb__amb_prepare"], revision: 4, at: Date.now() }), "utf8");
+
+  const result = await runHook(
+    { hook_event_name: "PreToolUse", tool_name: "mcp__amb__amb_prepare" },
+    config,
+  );
+  const output = parseStdout(result);
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny",
+    "快照记录的禁止项在核心不可达时仍须执行");
+
+  // A tool the snapshot did not prohibit still proceeds.
+  const allowed = await runHook(
+    { hook_event_name: "PreToolUse", tool_name: "some_other_tool" },
+    config,
+  );
+  assert.equal(allowed.stdout.trim().includes("permissionDecision"), false,
+    "快照未禁止的工具不得被牵连阻断");
 });
 
 test("non-gating hook failures exit unsuccessfully and never claim success", async () => {
@@ -376,10 +412,20 @@ test("the default config path is ~/.agent-memory-backpack/client.json", async ()
     undefined,
     { USERPROFILE: dir },
   );
-  const output = parseStdout(result);
 
-  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, /unavailable/);
+  // The subject is "was the default path found and used", asserted through the
+  // plugin's own log rather than through a deny verdict. The deny used to be the
+  // signal, but refusing every call while the core is down was the lockout this
+  // project had to fix; the endpoint here is deliberately dead.
+  const logFile = join(homeConfigDir, "amb-plugin.log.jsonl");
+  assert.equal(existsSync(logFile), true, "插件应在默认数据目录写日志");
+  const entries = readFileSync(logFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const configEvent = entries.find(entry => entry.event === "adapter.config" || entry.event === "hook.start"
+    || entry.event === "hook.degraded" || entry.event === "hook.failed");
+  assert.ok(configEvent, `日志应记录使用了该配置：${JSON.stringify(entries.slice(-3))}`);
+
+  // And the unreachable core still must not leak anything it was told.
+  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(TEST_TOKEN));
 });
 
 test("missing or outside project cwd skips hooks without blocking or sending requests", async () => {
