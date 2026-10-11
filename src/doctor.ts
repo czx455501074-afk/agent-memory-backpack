@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync, accessSync, constants } from 'node:
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { clientSchema, coreSchema } from './config.js';
+import { capabilityManifest, operatingModeFromDisk } from './capabilities.js';
 import { Logger } from './log.js';
 
 /**
@@ -196,6 +197,56 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
       checks.push(fail('core-reachable', '核心可达', `无法连接核心: ${message.slice(0, 120)}`,
         '先启动核心：node dist/src/cli.js serve --data-dir <目录>'));
       checks.push(skip('protocol-match', '协议版本匹配', '核心不可达，无法核对'));
+    }
+  }
+
+  // --- operating mode -------------------------------------------------------
+  //
+  // Reported even when everything passes, because the mode is what tells a user
+  // whether their rules are actually being enforced. A self-check that said only
+  // "core OK" would leave the important question unanswered: if the core drops, do
+  // the protections survive, and does the plugin say so?
+  {
+    const reachable = checks.some(check => check.id === 'core-reachable' && check.status === 'pass');
+    const mode = operatingModeFromDisk(dataDir, reachable);
+    const label = { Managed: '受核心实时裁决', ReadOnlySnapshot: '按快照只读执行', Ungoverned: '未受规则约束' }[mode.mode];
+    checks.push({
+      id: 'operating-mode',
+      title: '运行模式',
+      status: mode.mode === 'Managed' ? 'pass' : mode.mode === 'ReadOnlySnapshot' ? 'warn' : 'warn',
+      detail: `${mode.mode}（${label}）— ${mode.detail}`,
+      ...(mode.mode === 'Ungoverned'
+        ? { hint: '核心不可达时不再阻断工具（这是有意的：一个可选知识服务不应锁死你的工作）。启动核心即可恢复 Managed：node dist/src/cli.js service start' }
+        : {}),
+    });
+  }
+
+  // --- adapter capabilities -------------------------------------------------
+  //
+  // Per the design, each end is marked separately and a shortfall is shown as a
+  // downgrade rather than reported as full support. The list is generated from the
+  // capability manifest rather than hand-written here, so the page and the CLI
+  // cannot drift apart.
+  {
+    const manifest = capabilityManifest();
+    for (const adapter of manifest) {
+      const unmet = Object.entries(adapter.capabilities)
+        .filter(([, state]) => state !== 'yes')
+        .map(([name]) => name);
+      const installedNote = adapter.installed
+        ? `已安装${adapter.version ? ` ${adapter.version}` : ''}`
+        : '未在该机器的已知位置找到已安装的包';
+      checks.push({
+        id: `capability-${adapter.id}`,
+        title: `${adapter.id} 能力清单`,
+        // Not a pass when something is missing: a capability gap is a fact about
+        // the product, and marking it green would hide the one thing this list is for.
+        status: unmet.length ? 'warn' : 'pass',
+        detail: `${installedNote}；` + (unmet.length
+          ? `不支持：${unmet.join('、')}`
+          : '设计能力齐备'),
+        ...(adapter.notes.length ? { hint: adapter.notes[0] } : {}),
+      });
     }
   }
 
