@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { Store } from './store.js';
@@ -13,6 +14,10 @@ import { defaultScanRoots, diff, discover, rescanDiff, summarize, summarizeResca
 import { applyRescan, candidateToKnowledge as toKnowledge } from './rescan.js';
 import { doctor, summarizeDoctor } from './doctor.js';
 import { Logger, LOG_LEVEL_ORDER, type LogLevel } from './log.js';
+import {
+  acquireLock, inspectLock, loginStartupStatus, probeHealth, recoverStale,
+  registerLoginStartup, releaseLock, startDetached, stopFromLock, unregisterLoginStartup,
+} from './service.js';
 import { exportSkills } from './export-skills.js';
 import { defaultArchiveName, exportArchive, importArchive, inspectArchive } from './archive.js';
 
@@ -36,6 +41,8 @@ const USAGE = [
   '  restore --file FILE [--yes] [--json]     inspect, then merge an .ambpack archive',
   '  export --dir DIR [--yes] [--kinds a,b]   write plain SKILL.md files',
   '  ui [--open]                              print the core-served management UI address',
+  '  service [status|start|stop|recover|enable-startup|disable-startup]',
+  '                                           resident core: single instance, health, login startup',
   '  doctor [--offline] [--json]              self-check; never prints credentials',
   '  logs [--source plugin] [--all-sources] [--level LVL] [--event NAME] [--json]',
   '  init [--project ID] [--port N] [--project-root PATH]',
@@ -81,6 +88,18 @@ const parsed = (() => {
 })();
 const { values, positionals } = parsed;
 const command = positionals[0]; const dir = resolve(values['data-dir'] ?? defaultDataDir());
+/** Repository root, derived from this file's own location rather than the cwd. */
+/**
+ * Repository root, derived from where this file actually is.
+ *
+ * Source runs from `src/` and the build runs from `dist/src/`, so one level up is
+ * the repository in the first case and the build directory in the second. Probing
+ * for the package manifest is what keeps this correct in both layouts; assuming
+ * one produced `dist/dist/src/cli.js` and a "run npm run build" error on a tree
+ * that was already built.
+ */
+const here = dirname(fileURLToPath(import.meta.url));
+const root = existsSync(join(here, '..', 'package.json')) ? resolve(here, '..') : resolve(here, '..', '..');
 try {
   if (command === 'discover') {
     // Install-time adoption: scan user agents for existing knowledge. Read-only by
@@ -270,6 +289,71 @@ try {
           + ' The skill text is retained in history and the conversion is recorded in the supersession ledger.',
       }, null, 2));
     } finally { store.close(); }
+  } else if (command === 'service') {
+    // Resident-core management: status, start, stop, recover, and login startup.
+    //
+    // The design asks for a user-level core that manages its own startup, is
+    // single-instance, and can be checked and recovered. This is that control
+    // surface. It is deliberately not a Windows service: a service runs as another
+    // account with its own data directory, which would put the user's knowledge
+    // somewhere they cannot see, and the design says user-level.
+    const action = positionals[1] ?? 'status';
+    const coreEntry = join(root, 'dist', 'src', 'cli.js');
+    const endpoint = (() => {
+      const corePath = join(dir, 'core.json');
+      if (!existsSync(corePath)) return null;
+      try { return `http://127.0.0.1:${(JSON.parse(readFileSync(corePath, 'utf8')) as { port: number }).port}`; }
+      catch { return null; }
+    })();
+
+    if (action === 'status') {
+      const lock = inspectLock(dir);
+      const health = endpoint ? await probeHealth(endpoint) : { healthy: false, detail: '未找到 core.json，无法确定端口' };
+      const startup = loginStartupStatus();
+      console.log(JSON.stringify({
+        lock: lock.state === 'absent' ? { state: 'absent' }
+          : lock.state === 'unreadable' ? { state: 'unreadable', detail: lock.detail }
+          : { state: lock.state, pid: lock.info.pid, port: lock.info.port, startedAt: lock.info.startedAt },
+        healthy: health.healthy, healthDetail: health.detail,
+        loginStartup: startup.registered, loginStartupDetail: startup.detail,
+        note: '锁表示"谁在运行"；健康探测表示"核心是否在回应"。两者分开报告，因为一个陈旧的锁和一个挂掉的核心是不同的问题。',
+      }, null, 2));
+    } else if (action === 'start') {
+      if (!existsSync(coreEntry)) throw new Error(`未找到核心入口：${coreEntry}。先运行 npm run build。`);
+      const lock = inspectLock(dir);
+      if (lock.state === 'held') {
+        console.log(JSON.stringify({ started: false, reason: 'already-running', pid: lock.info.pid, note: '已有核心在运行，未启动第二个。' }, null, 2));
+      } else {
+        if (lock.state === 'stale') console.log(`（清理了上一次异常退出留下的锁，pid ${lock.info.pid}。）`);
+        const logFile = join(dir, 'core-service.log');
+        const { pid } = startDetached(coreEntry, dir, logFile);
+        console.log(JSON.stringify({ started: true, pid, log: logFile, note: '核心已脱离本终端运行，关闭本窗口不会停止它。' }, null, 2));
+      }
+    } else if (action === 'stop') {
+      const result = stopFromLock(dir);
+      console.log(JSON.stringify({
+        ...result,
+        note: result.stopped
+          ? '已请求停止该进程；锁会由它自己在关闭后释放。'
+          : '没有停止任何进程。',
+      }, null, 2));
+    } else if (action === 'recover') {
+      const result = recoverStale(dir);
+      console.log(JSON.stringify({
+        ...result,
+        note: result.recovered
+          ? '已清理陈旧锁；下一次启动不会再被它挡住。'
+          : '没有发现陈旧锁，无需恢复。',
+      }, null, 2));
+    } else if (action === 'enable-startup' || action === 'disable-startup') {
+      const result = action === 'enable-startup'
+        ? registerLoginStartup(coreEntry, dir)
+        : unregisterLoginStartup();
+      console.log(JSON.stringify({ action, ...result }, null, 2));
+      if (!result.ok) process.exitCode = 1;
+    } else {
+      throw new Error(`未知的 service 动作：${action}。可用：status、start、stop、recover、enable-startup、disable-startup。`);
+    }
   } else if (command === 'ui') {
     // Print the address of the core-served management interface.
     //
@@ -493,6 +577,30 @@ try {
     const config = coreSchema.parse(JSON.parse(readFileSync(join(dir, 'core.json'), 'utf8')));
     const store = new Store(join(dir, 'knowledge.sqlite'));
     if (command === 'serve') {
+      // Single instance, taken before the socket is bound.
+      //
+      // The port alone is not a lock: between "is the port free" and "bind it"
+      // there is a window where two cores can both decide it is, and the loser
+      // then fails with an address-in-use error that reads like a defect rather
+      // than like "one is already running". The lock is exclusive, so one wins and
+      // the other is told who holds it.
+      const lock = acquireLock(dir, { pid: process.pid, port: config.port, startedAt: Date.now(), dataDir: dir });
+      if (!lock.acquired) {
+        const holder = lock.heldBy;
+        console.error(holder
+          ? `核心已在运行（pid ${holder.pid}，端口 ${holder.port}，启动于 ${new Date(holder.startedAt).toLocaleString()}）。`
+          : '核心启动失败：未能取得实例锁，且看不到持有者；请检查数据目录权限。');
+        process.exitCode = 1;
+        store.close();
+      } else {
+      if (lock.clearedStale) {
+        // Said out loud: a crash left this behind, and the next diagnosis should
+        // not have to rediscover why the previous run ended without cleaning up.
+        console.log(`已清理上一次异常退出留下的锁（pid ${lock.clearedStale.pid}）。`);
+      }
+      const releaseOnExit = () => releaseLock(dir);
+      process.once('exit', releaseOnExit);
+
       const server = createCoreServer(store, config);
       const cleanup = setInterval(() => store.cleanup(), 60000); cleanup.unref();
       // Persisted scan roots let a timer-driven rescan know what to walk; without
@@ -563,9 +671,14 @@ try {
       });
       const stop = () => {
         logger.info('core.stopping', { knowledgeRevision: store.revision });
-        clearInterval(cleanup); clearInterval(rescanTimer); server.close(() => store.close());
+        clearInterval(cleanup); clearInterval(rescanTimer);
+        // The lock goes with the process, in the order a restart expects: released
+        // only after the socket is closed, so the next core does not take the lock
+        // and then lose the port race to the one still shutting down.
+        server.close(() => { releaseLock(dir); store.close(); });
       };
       process.once('SIGINT', stop); process.once('SIGTERM', stop);
+      }
     } else {
       try {
         if (command === 'seed') {

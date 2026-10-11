@@ -1,0 +1,245 @@
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+
+/**
+ * Running the core as a user-level service.
+ *
+ * The design asks for a resident core that manages its own startup, is
+ * single-instance, and can be checked and recovered — and states plainly that it
+ * must not depend on some chat window staying open. A plugin that starts the core
+ * on load satisfies "it works" but not that: closing the host stops the knowledge
+ * base, and the next host start pays the cold-start cost again.
+ *
+ * What is here, and what is deliberately elsewhere:
+ *
+ *   - **Single instance** through an exclusive lock file. The port alone is not a
+ *     lock: the check-then-bind window means two cores can both decide the port is
+ *     free, and one then fails with an address-in-use error that reads like a bug.
+ *   - **Health and recovery** read from the same lock, so a stale lock left by a
+ *     crash is reported as stale rather than silently blocking every future start.
+ *   - **Login startup** is registered as a per-user scheduled task, not a registry
+ *     Run key: a task can be queried, and can be removed cleanly, which matters for
+ *     something the uninstaller is expected to undo.
+ *
+ * It is *not* a Windows service. A service runs as another account with its own
+ * data directory, which would put the user's knowledge somewhere they cannot see;
+ * the design says user-level, so this stays in the user's session.
+ */
+
+export interface LockInfo {
+  pid: number;
+  port: number;
+  startedAt: number;
+  /** Absolute path of the data directory this core serves. */
+  dataDir: string;
+}
+
+export const lockPath = (dataDir: string) => join(dataDir, 'core.lock');
+
+/**
+ * Whether a process is alive.
+ *
+ * Signal 0 performs the permission check without delivering a signal. It throws
+ * for a dead process, which is the answer, and also for one owned by another user
+ * — treated as alive, because "I cannot signal it" is not "it is gone", and the
+ * consequence of guessing wrong is two cores on one port.
+ */
+export function processAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
+export type LockState =
+  | { state: 'absent' }
+  | { state: 'held'; info: LockInfo }
+  /** The file exists but its process is gone: a crash, not a running core. */
+  | { state: 'stale'; info: LockInfo }
+  | { state: 'unreadable'; detail: string };
+
+/** Read the lock and say whether the core it names is actually running. */
+export function inspectLock(dataDir: string): LockState {
+  const file = lockPath(dataDir);
+  if (!existsSync(file)) return { state: 'absent' };
+  let info: LockInfo;
+  try { info = JSON.parse(readFileSync(file, 'utf8')) as LockInfo; }
+  catch (error) { return { state: 'unreadable', detail: error instanceof Error ? error.message : 'unknown' }; }
+  return { state: processAlive(info.pid) ? 'held' : 'stale', info };
+}
+
+/**
+ * Take the lock, or report who holds it.
+ *
+ * `wx` is the whole mechanism: it fails if the file exists, and the check and the
+ * create are one operation, so two processes starting together cannot both win.
+ * A stale lock is cleared first — its owner is gone, and refusing to start because
+ * of a file a crash left behind would need manual intervention for no reason.
+ */
+export function acquireLock(dataDir: string, info: LockInfo): { acquired: boolean; heldBy?: LockInfo; clearedStale?: LockInfo } {
+  mkdirSync(dataDir, { recursive: true });
+  const file = lockPath(dataDir);
+  const attempt = (): { acquired: boolean; heldBy?: LockInfo; clearedStale?: LockInfo } => {
+    try {
+      const fd = openSync(file, 'wx', 0o600);
+      writeSync(fd, JSON.stringify(info));
+      closeSync(fd);
+      return { acquired: true };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const existing = inspectLock(dataDir);
+      if (existing.state === 'held') return { acquired: false, heldBy: existing.info };
+      // Stale or unreadable: neither can be a live core, so it is replaced and the
+      // fact reported, rather than left for the user to discover.
+      rmSync(file, { force: true });
+      try {
+        const fd = openSync(file, 'wx', 0o600);
+        writeSync(fd, JSON.stringify(info));
+        closeSync(fd);
+        return { acquired: true, clearedStale: existing.state === 'stale' ? existing.info : undefined };
+      } catch (retry) {
+        if ((retry as NodeJS.ErrnoException).code === 'EEXIST') {
+          const now = inspectLock(dataDir);
+          return { acquired: false, heldBy: now.state === 'held' ? now.info : undefined };
+        }
+        throw retry;
+      }
+    }
+  };
+  return attempt();
+}
+
+export function releaseLock(dataDir: string, pid = process.pid): void {
+  const file = lockPath(dataDir);
+  const state = inspectLock(dataDir);
+  // Only the owner removes it: a second core that failed to acquire must not
+  // delete the winner's lock on its way out.
+  if (state.state === 'held' && state.info.pid !== pid) return;
+  if (state.state === 'absent') return;
+  rmSync(file, { force: true });
+}
+
+/** After a crash, one call clears the leftover lock so the next start is clean. */
+export function recoverStale(dataDir: string): { recovered: boolean; previous?: LockInfo } {
+  const state = inspectLock(dataDir);
+  if (state.state !== 'stale') return { recovered: false };
+  rmSync(lockPath(dataDir), { force: true });
+  return { recovered: true, previous: state.info };
+}
+
+/**
+ * Start the core detached, so it outlives this process and the terminal it ran in.
+ *
+ * The child is `unref`ed: whoever asked for a resident core should be able to exit
+ * without stopping it, which is the difference between a service and a foreground
+ * command.
+ */
+export function startDetached(coreEntry: string, dataDir: string, logFile: string) {
+  mkdirSync(join(logFile, '..'), { recursive: true });
+  const out = openSync(logFile, 'a');
+  const child = spawn(process.execPath, [coreEntry, 'serve', '--data-dir', dataDir], {
+    detached: true,
+    stdio: ['ignore', out, out],
+    windowsHide: true,
+  });
+  child.unref();
+  return { pid: child.pid };
+}
+
+/** Stop the core named by the lock, and only that process. */
+export function stopFromLock(dataDir: string): { stopped: boolean; pid?: number; detail?: string } {
+  const state = inspectLock(dataDir);
+  if (state.state === 'absent') return { stopped: false, detail: '没有找到锁文件，核心可能未在运行。' };
+  if (state.state === 'stale') {
+    rmSync(lockPath(dataDir), { force: true });
+    return { stopped: false, detail: '锁是陈旧的，已清理；没有正在运行的核心。' };
+  }
+  if (state.state === 'unreadable') return { stopped: false, detail: `锁文件无法解析：${state.detail}` };
+  try {
+    process.kill(state.info.pid, 'SIGTERM');
+    return { stopped: true, pid: state.info.pid };
+  } catch (error) {
+    return { stopped: false, pid: state.info.pid, detail: error instanceof Error ? error.message : 'unknown' };
+  }
+}
+
+/**
+ * A health probe that does not need the credential.
+ *
+ * `/health` is deliberately unauthenticated — it exists so liveness can be checked
+ * without handing a credential to whoever is asking. The probe therefore tells us
+ * the core is up, not that the knowledge is readable; those are different claims.
+ */
+export async function probeHealth(endpoint: string, timeoutMs = 1500): Promise<{ healthy: boolean; detail: string }> {
+  try {
+    const response = await fetch(`${endpoint.replace(/\/$/, '')}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) return { healthy: false, detail: `HTTP ${response.status}` };
+    const body = await response.json() as { protocolVersion?: number; status?: string };
+    if (body.protocolVersion !== 1) return { healthy: false, detail: `协议版本不符：${String(body.protocolVersion)}` };
+    return { healthy: true, detail: `协议 v${body.protocolVersion}，状态 ${String(body.status)}` };
+  } catch (error) {
+    return { healthy: false, detail: error instanceof Error ? error.message : 'unreachable' };
+  }
+}
+
+/**
+ * Login startup, as a per-user `Run` entry.
+ *
+ * A scheduled task was tried first and removed, because it does not work for the
+ * user this plugin is for. `schtasks /Create /SC ONLOGON` failed with access
+ * denied on a real machine: creating a logon-triggered task requires elevation,
+ * and the design says user-level — a plugin that needs administrator rights to
+ * install is not one a user can install.
+ *
+ * `HKCU\...\Run` is the mechanism that matches the requirement. It applies to the
+ * current user only, needs no elevation, is queryable, and is removed by deleting
+ * one value — which matters because the uninstaller is expected to undo it.
+ *
+ * The identifier is spelled out in the value name so a user browsing their own
+ * startup entries can tell what put it there.
+ */
+export const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+export const RUN_VALUE = 'AgentMemoryBackpackCore';
+
+export function loginStartupSupported(): boolean { return process.platform === 'win32'; }
+
+export function registerLoginStartup(coreEntry: string, dataDir: string): { ok: boolean; detail: string } {
+  if (!loginStartupSupported()) return { ok: false, detail: '登录启动目前只为 Windows 实现。' };
+  // Quoted so a path containing a space survives; the launcher passes this string
+  // to the shell at logon, which is why it is built rather than passed as argv.
+  const command = `"${process.execPath}" "${coreEntry}" serve --data-dir "${dataDir}"`;
+  const result = spawnSync('reg', ['add', RUN_KEY, '/v', RUN_VALUE, '/t', 'REG_SZ', '/d', command, '/f'], {
+    encoding: 'utf8', windowsHide: true,
+  });
+  if (result.status !== 0) {
+    // Reported verbatim: a startup entry that was not created is something the
+    // user would otherwise discover at the next logon, long after the moment they
+    // could have been told.
+    return { ok: false, detail: (result.stderr || result.stdout || 'reg add failed').trim() };
+  }
+  return { ok: true, detail: `已注册登录启动（当前用户 Run 键，无需管理员权限）。` };
+}
+
+export function unregisterLoginStartup(): { ok: boolean; detail: string } {
+  if (!loginStartupSupported()) return { ok: true, detail: '非 Windows，无需清理。' };
+  // Checked first rather than matched against the error text. `reg delete` fails
+  // when the value is absent, and its message is printed in the console code page —
+  // on a Chinese Windows the output is bytes this process cannot match against any
+  // English or Chinese pattern, so a text-based test reported a clean uninstall as
+  // a failure. Querying is deterministic and locale-independent.
+  if (!loginStartupStatus().registered) return { ok: true, detail: '登录启动本来就没有注册。' };
+  const result = spawnSync('reg', ['delete', RUN_KEY, '/v', RUN_VALUE, '/f'], { encoding: 'utf8', windowsHide: true });
+  if (result.status !== 0) return { ok: false, detail: (result.stderr || result.stdout || 'reg delete failed').trim() };
+  return { ok: true, detail: '已移除登录启动。' };
+}
+
+export function loginStartupStatus(): { registered: boolean; detail: string } {
+  if (!loginStartupSupported()) return { registered: false, detail: '非 Windows。' };
+  // Existence is taken from the exit code, not from parsing the output: `reg query`
+  // prints in the console code page, and a Chinese Windows would return bytes this
+  // process cannot match against an English pattern.
+  const result = spawnSync('reg', ['query', RUN_KEY, '/v', RUN_VALUE], { encoding: 'utf8', windowsHide: true });
+  if (result.status !== 0) return { registered: false, detail: '未注册登录启动。' };
+  const command = /REG_SZ\s+(.+)/.exec(result.stdout ?? '')?.[1]?.trim();
+  return { registered: true, detail: command ? `已注册登录启动：${command}` : '已注册登录启动。' };
+}
