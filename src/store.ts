@@ -16,6 +16,73 @@ function searchable(value: string): string {
     : [word]).join(' ');
 }
 
+/**
+ * Query tokens, most specific first.
+ *
+ * A CJK bigram is a fragment, not a word: `重启` is produced by both "重启" and
+ * "已重启", and it occurs inside unrelated prose often enough that matching on
+ * any fragment alone returns a page of noise. Longer tokens are therefore listed
+ * first so the caller can prefer the most specific match it can satisfy.
+ */
+function queryTokens(query: string): string[] {
+  return [...new Set(searchable(query).split(' ').filter(Boolean))]
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 40);
+}
+
+/**
+ * Ids matching a query, ranked by how much of the query they cover.
+ *
+ * Two wrong answers came before this one, and both are kept in the record because
+ * the same mistake is easy to make twice:
+ *
+ *   - Joining every token with OR accepted a single shared fragment. Measured on a
+ *     real library, "已重启" matched 22 entries and "导出数据" matched 48, most of
+ *     them unrelated, and those entries were then injected into the conversation.
+ *   - Requiring every token (AND) is worse, because CJK bigrams *overlap*:
+ *     "修复核心自动启动" yields 修复/复核/核心/心自/自动/动启/启动, and no document
+ *     contains all seven. Long queries matched nothing at all.
+ *
+ * Coverage is therefore measured, not required — and it is measured by asking
+ * FTS5, one query per fragment. Counting matches against the stored text directly
+ * does not work: the index holds the tokenizer's output, not the original string,
+ * so a check like `text.includes(fragment)` scores every row zero and silently
+ * empties the result set.
+ */
+function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
+  if (!tokens.length) return [];
+  const hitsFor = (token: string): Set<string> => {
+    try {
+      return new Set(db.prepare('SELECT id FROM workflow_search WHERE workflow_search MATCH ?')
+        .all(`"${token}"`).map(row => String((row as { id: string }).id)));
+    } catch { return new Set(); }
+  };
+
+  const perToken = tokens.map(hitsFor);
+  // Rows that match at least one fragment, in the order the widest query returned
+  // them. bm25 already orders that by relevance, which breaks coverage ties.
+  const ranked = db.prepare('SELECT id FROM workflow_search WHERE workflow_search MATCH ? ORDER BY bm25(workflow_search)')
+    .all(tokens.map(token => `"${token}"`).join(' OR ')).map(row => String((row as { id: string }).id));
+
+  // A single fragment carries no coverage signal: whether it appears is the only
+  // question, and bm25 has already ordered the answer.
+  if (tokens.length === 1) return ranked;
+
+  const covered = new Map<string, number>();
+  for (const id of ranked) {
+    let count = 0;
+    for (const hits of perToken) if (hits.has(id)) count += 1;
+    covered.set(id, count / tokens.length);
+  }
+  // Ordered by coverage first, then by the FTS ranking. The floor is relative to
+  // the best row so a query whose fragments are individually common still returns
+  // its closest matches instead of nothing.
+  const best = Math.max(...covered.values());
+  const threshold = Math.max(floor, best * 0.6);
+  return ranked.filter(id => (covered.get(id) ?? 0) >= threshold)
+    .sort((a, b) => (covered.get(b) ?? 0) - (covered.get(a) ?? 0));
+}
+
 /** Single SQLite authority for the P0 fixture; not a semantic auto-promotion engine. */
 export class Store {
   readonly db: DatabaseSync;
@@ -170,8 +237,13 @@ export class Store {
   }
   search(projectId: string, query: string, limit = 8) {
     const entries = this.current(); const all = new Map(entries.map(x => [x.id, x]));
-    const tokens = [...new Set(searchable(query).split(' ').filter(Boolean))].slice(0, 40);
-    const ids = tokens.length ? this.db.prepare(`SELECT id FROM workflow_search WHERE workflow_search MATCH ? ORDER BY bm25(workflow_search)`).all(tokens.map(t => `"${t}"`).join(' OR ')).map(r => String(r.id)) : entries.map(e => e.id);
+    const tokens = queryTokens(query);
+    // With no query this lists every workflow. That is what a browsing caller
+    // wants — the console's workflow panel shows the catalog before anything is
+    // typed. Injection is a different question, and `prepare()` decides it: an
+    // empty query there means there is no basis for selection, so nothing is
+    // injected rather than an arbitrary slice.
+    const ids = tokens.length ? matchIds(this.db, tokens) : entries.map(e => e.id);
     return ids.map(id => all.get(id)).filter((e): e is Entry => !!e && e.content.kind === 'workflow' && applicable(e.content.scope, projectId)).slice(0, limit).map(e => {
       const c = e.content as Workflow;
       let ready = true, unavailable: string | undefined;
@@ -216,16 +288,21 @@ export class Store {
   knowledge(projectId: string, query: string, limit = 5, excerptChars = 400) {
     const entries = this.current();
     const all = new Map(entries.map(x => [x.id, x]));
-    const tokens = [...new Set(searchable(query).split(' ').filter(Boolean))].slice(0, 40);
-    const candidates = tokens.length
-      ? this.db.prepare('SELECT id FROM workflow_search WHERE workflow_search MATCH ? ORDER BY bm25(workflow_search)')
-        .all(tokens.map(t => `"${t}"`).join(' OR ')).map(row => String(row.id))
+    const tokens = queryTokens(query);
+    // With no query, list the catalog in a stable order — a browsing caller (the
+    // console, or a user asking what is in the library) wants exactly that.
+    //
+    // Injection is decided elsewhere: `prepare()` skips this call entirely when
+    // the query is empty, because an arbitrary slice of the library appearing in
+    // every session is how an unrelated project opened with five media skills.
+    const ids = tokens.length
+      ? matchIds(this.db, tokens)
       : entries.map(entry => entry.id);
     const result: Array<{
       id: string; revision: number; kind: 'skill' | 'memory'; title: string;
       excerpt: string; chars: number; leafCount: number; needsStructure: boolean;
     }> = [];
-    for (const id of candidates) {
+    for (const id of ids) {
       const entry = all.get(id);
       if (!entry) continue;
       const content = entry.content;
@@ -281,8 +358,15 @@ export class Store {
     // duplicate instructions and could fight the host's own baseline semantics.
     const norms = all.filter(n => n.kind !== 'norm' || !n.hostProvided);
     const hostProvided = all.filter(n => n.kind === 'norm' && n.hostProvided);
-    const workflows = this.search(projectId, query);
-    const knowledge = this.knowledge(projectId, query);
+    // No query means no basis for selection, so nothing is injected. Both helpers
+    // fall back to listing the whole catalog, which is right for a caller that
+    // asked to browse and wrong here: an arbitrary slice appearing in every
+    // session is how a project unrelated to any of them opened with five media
+    // skills. Norms are unaffected — they are the standing rules and apply
+    // whether or not anything was asked.
+    const hasQuery = queryTokens(query).length > 0;
+    const workflows = hasQuery ? this.search(projectId, query) : [];
+    const knowledge = hasQuery ? this.knowledge(projectId, query) : [];
     const context = [
       `Agent Memory Backpack 当前知识版本 ${this.revision}。以下规范来自本地权威库；流程是经验，不授予额外操作权限。`,
       ...(hostProvided.length
