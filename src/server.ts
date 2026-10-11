@@ -5,6 +5,21 @@ import { Store } from './store.js';
 import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, DomainError } from './schema.js';
 import { coreSchema, type CoreConfig } from './config.js';
 import { exportArchive, importArchive, inspectArchive } from './archive.js';
+import { UI_CSS, UI_HTML, UI_JS } from './ui.js';
+
+/**
+ * Static responses the core serves for its own management interface.
+ *
+ * Keyed by exact path so no request can be turned into a file read: there is no
+ * filesystem lookup here at all, and a path that is not one of these three falls
+ * through to the API routes.
+ */
+const ASSETS: Record<string, { type: string; body: string }> = {
+  '/ui': { type: 'text/html; charset=utf-8', body: UI_HTML },
+  '/ui/': { type: 'text/html; charset=utf-8', body: UI_HTML },
+  '/ui/app.js': { type: 'text/javascript; charset=utf-8', body: UI_JS },
+  '/ui/app.css': { type: 'text/css; charset=utf-8', body: UI_CSS },
+};
 
 const MAX_BODY = 65536;
 function matches(a: string, b: string) { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
@@ -65,12 +80,41 @@ export function createCoreServer(store: Store, config: CoreConfig) {
     throw new Error('Adapter credentials must be distinct');
   const server = createServer(async (req, res) => {
     try {
-      if (req.headers.origin) throw new DomainError('origin_denied', 'Browser requests not enabled in P0', 403);
       const address = server.address();
       const port = address && typeof address === 'object' ? address.port : validated.port;
+      const selfOrigin = [`http://127.0.0.1:${port}`, `http://localhost:${port}`];
+      /**
+       * Browser-origin requests stay refused except from the page this core serves.
+       *
+       * The rule exists because the core is an app's backend, not a website: a page
+       * from anywhere else must not be able to drive it. Serving the management
+       * interface from here makes one origin legitimate — the page itself — and a
+       * browser sends `Origin` on its own POSTs even same-origin, so refusing all
+       * of them would refuse the interface too.
+       *
+       * Only that exact origin is admitted. A page on another site still fails, and
+       * the Host check below still refuses a non-loopback host, so a name that
+       * resolves to 127.0.0.1 is turned away for two independent reasons.
+       */
+      const origin = req.headers.origin;
+      if (origin && !selfOrigin.includes(origin))
+        throw new DomainError('origin_denied', 'Browser requests from another origin are refused', 403);
       if (![`127.0.0.1:${port}`, `localhost:${port}`].includes(req.headers.host ?? ''))
         throw new DomainError('host_denied', 'Invalid host', 403);
       if (req.method === 'GET' && req.url === '/health') return reply(res, 200, { protocolVersion: 1, status: 'ok', phase: 'P0' });
+      // The interface itself. Static assets carry no data, so they need no
+      // credential; every call that returns knowledge or changes it is a POST and
+      // still authenticated below. The page keeps the credential in memory only.
+      if (req.method === 'GET' && ASSETS[req.url ?? '']) {
+        const asset = ASSETS[req.url ?? '']!;
+        return void res.writeHead(200, {
+          'Content-Type': asset.type,
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          // No inline script or style, and nothing may be loaded from elsewhere.
+          'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
+        }).end(asset.body);
+      }
       if (req.method !== 'POST') throw new DomainError('method', 'POST required', 405);
       const header = req.headers.authorization ?? '';
       const principal = validated.clients.find(c => matches(header, `Bearer ${c.token}`));
@@ -111,7 +155,10 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         // prepare, gate and search while keeping the Entry shape callers expect.
         case '/v1/norms': { const p = z.object({ projectId: z.string() }).parse(body); return reply(res, 200, { norms: store.scopedEntries(p.projectId).filter(e => e.content.kind === 'norm'), knowledgeRevision: store.revision }); }
         case '/v1/knowledge/read': { const p = z.object({ projectId: z.string(), knowledgeId: z.string(), includeLeaves: z.boolean().optional() }).parse(body); return reply(res, 200, store.readKnowledge(p.projectId, p.knowledgeId, p.includeLeaves ?? false)); }
-        case '/v1/stats': { const p = z.object({ projectId: z.string() }).parse(body); return reply(res, 200, store.stats()); }
+        // The caller's own projectId is echoed back so a UI can label what it is
+        // showing. It is not a disclosure: the request already had to name it, and
+        // it is the credential's own project rather than anyone else's.
+        case '/v1/stats': { const p = z.object({ projectId: z.string() }).parse(body); return reply(res, 200, { projectId: p.projectId, ...store.stats() }); }
         // Rescan cadence: an adapter asks whether a scan is due instead of
         // rescanning on every session start.
         case '/v1/rescan/state': { const p = z.object({ projectId: z.string(), at: z.number().int().optional() }).parse(body); const state = store.rescanState(); return reply(res, 200, { ...state, due: store.rescanDue(p.at) }); }

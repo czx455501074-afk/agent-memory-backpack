@@ -4,7 +4,8 @@ import { randomBytes } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { Store } from './store.js';
 import { seedSchema, workflowSchema, type Knowledge } from './schema.js';
-import { coreSchema, defaultDataDir } from './config.js';
+import { coreSchema, clientSchema, defaultDataDir } from './config.js';
+import { spawn } from 'node:child_process';
 import { createCoreServer } from './server.js';
 import { defaultScanRoots, diff, discover, rescanDiff, summarize, summarizeRescan } from './discovery.js';
 // candidateToKnowledge lives with the rescan policy so the CLI and the running
@@ -34,6 +35,7 @@ const USAGE = [
   '  backup --file FILE [--yes] [--overwrite]  pack all data into one portable .ambpack file',
   '  restore --file FILE [--yes] [--json]     inspect, then merge an .ambpack archive',
   '  export --dir DIR [--yes] [--kinds a,b]   write plain SKILL.md files',
+  '  ui [--open]                              print the core-served management UI address',
   '  doctor [--offline] [--json]              self-check; never prints credentials',
   '  logs [--source plugin] [--all-sources] [--level LVL] [--event NAME] [--json]',
   '  init [--project ID] [--port N] [--project-root PATH]',
@@ -67,6 +69,7 @@ const parsed = (() => {
       all: { type: 'boolean', default: false }, 'dsh-runtime-version': { type: 'string' },
       dir: { type: 'string' }, kinds: { type: 'string' },
       file: { type: 'string' }, overwrite: { type: 'boolean', default: false },
+      open: { type: 'boolean', default: false },
       source: { type: 'string' }, 'all-sources': { type: 'boolean', default: false },
       'admin-dir': { type: 'string' },
     } } as const);
@@ -267,6 +270,36 @@ try {
           + ' The skill text is retained in history and the conversion is recorded in the supersession ledger.',
       }, null, 2));
     } finally { store.close(); }
+  } else if (command === 'ui') {
+    // Print the address of the core-served management interface.
+    //
+    // The interface is a page the core serves, not a separate application: the
+    // design asked for a local web page rather than a desktop shell, and a page
+    // needs no extra runtime and no window to keep alive. It is reachable
+    // whenever the core is, including from a browser surface inside the host.
+    //
+    // The credential goes in the URL fragment, which browsers do not transmit, so
+    // it stays out of the server's request log. Only the address is printed here;
+    // the token is in it, and the warning says so rather than pretending.
+    const configPath = join(dir, 'admin-client.json');
+    if (!existsSync(configPath)) throw new Error(`未找到管理凭据：${configPath}。先运行 init 或安装脚本。`);
+    const admin = clientSchema.parse(JSON.parse(readFileSync(configPath, 'utf8')));
+    const base = admin.endpoint.replace(/\/$/, '');
+    const url = `${base}/ui#${encodeURIComponent(admin.token)}`;
+    console.log(url);
+    console.log('');
+    console.log('说明：');
+    console.log(`  · 该地址含管理凭据（URL 片段，不会发送到服务端，也不进请求日志），请勿外发或贴到聊天里。`);
+    console.log(`  · 界面由核心自己提供，核心在跑就能访问，不需要额外安装任何桌面程序。`);
+    console.log(`  · 核心没在跑时先用插件或 serve 启动它。`);
+    if (values.open === true) {
+      // Best effort: a browser may not be installed on a server, and failing to
+      // open one must not look like failing to produce the address.
+      const opener = process.platform === 'win32' ? 'cmd' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+      const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+      try { spawn(opener, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref(); }
+      catch { console.error('（未能自动打开浏览器，请手动访问上面的地址。）'); }
+    }
   } else if (command === 'doctor') {
     // Self-check: answer "why is this not working" without a reproduction.
     // Never prints a credential and never throws on a failing check.
