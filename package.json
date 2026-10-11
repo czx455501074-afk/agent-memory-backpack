@@ -25,6 +25,7 @@
     "console": "electron console/main.cjs",
     "accept:desktop": "node scripts/desktop-accept.mjs",
     "pack:local": "node scripts/package.mjs",
+    "deploy:plugin": "node scripts/deploy-plugin.mjs",
     "install:local": "node scripts/amb-install.mjs",
     "uninstall:local": "node scripts/amb-uninstall.mjs"
   },
