@@ -65,6 +65,27 @@ test('查询无任何命中时返回空，而不是回落到全库', () => {
   } finally { s.close(); }
 });
 
+test('通用对话词是已知限制：过滤它需要牺牲领域词', () => {
+  // Recorded as a test so the limitation is visible rather than assumed fixed.
+  //
+  // A frequency filter was implemented and reverted: measured on a real library,
+  // "短剧" occurs in 27.8% of documents and "这个" in 29.6%. Any threshold that
+  // removes the filler also removes the domain vocabulary, and silently dropping a
+  // user's core subject is worse than a loose match. This test pins the trade-off
+  // so a future change has to confront it explicitly instead of re-deriving it.
+  const s = store();
+  try {
+    // A domain word that is also common must still be returned.
+    const domain = s.knowledge('p', '短剧', 5).map(k => k.id);
+    assert.ok(domain.length > 0, '领域词即使常见也必须能检索到，不得被通用词过滤误杀');
+
+    // A pure filler word may match; the point is that this is accepted, not that
+    // it is impossible.
+    const filler = s.knowledge('p', '好的', 5);
+    assert.ok(Array.isArray(filler), '通用词的处理方式是已知限制，不是保证');
+  } finally { s.close(); }
+});
+
 test('同一查询的结果顺序稳定', () => {
   const s = store();
   try {

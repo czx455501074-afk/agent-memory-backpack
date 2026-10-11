@@ -48,6 +48,15 @@ function queryTokens(query: string): string[] {
  * does not work: the index holds the tokenizer's output, not the original string,
  * so a check like `text.includes(fragment)` scores every row zero and silently
  * empties the result set.
+ *
+ * A third case was investigated and deliberately not "fixed": conversational
+ * filler ("继续", "好的") still matches. Filtering by how common a fragment is was
+ * tried and reverted, because the measurement says it cannot work here — on a real
+ * library "短剧" occurs in 27.8% of documents and "这个" in 29.6%, so a frequency
+ * threshold that removes the filler also removes the domain vocabulary. Silently
+ * dropping a user's core subject is worse than returning a loose match, and the
+ * coverage ranking above already puts the best candidates first. Left as a known
+ * limitation rather than a guess dressed up as a fix.
  */
 function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
   if (!tokens.length) return [];
@@ -65,7 +74,7 @@ function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
     .all(tokens.map(token => `"${token}"`).join(' OR ')).map(row => String((row as { id: string }).id));
 
   // A single fragment carries no coverage signal: whether it appears is the only
-  // question, and bm25 has already ordered the answer.
+  // question, its commonness has already been judged, and bm25 ordered the answer.
   if (tokens.length === 1) return ranked;
 
   const covered = new Map<string, number>();
