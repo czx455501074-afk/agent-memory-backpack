@@ -73,6 +73,7 @@ const ADMIN_ONLY = new Set([
   // content. Saving stays open — an agent recording what it read is one of the
   // three collection entry points the design names.
   '/v1/material/renew', '/v1/material/purge',
+  '/v1/knowledge/write', '/v1/knowledge/delete',
 ]);
 
 /**
@@ -249,6 +250,26 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           return reply(res, 200, store.structureSkill({ skillId: p.skillId, workflow: p.workflow, derivedBy: p.derivedBy, evidence: p.evidence, projectId: p.projectId }));
         }
         case '/v1/knowledge/unstructured': { const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body); return reply(res, 200, { skills: store.unstructuredSkills(p.limit) }); }
+        case '/v1/knowledge/search-universal': {
+          const p = z.object({ projectId: z.string(), query: z.string().optional().default(''), kind: z.string().optional(), limit: z.number().int().positive().max(200).optional() }).parse(body);
+          return reply(res, 200, { results: store.searchUniversal(p.projectId, p.query, p.kind, p.limit), knowledgeRevision: store.revision });
+        }
+        case '/v1/knowledge/get': {
+          const p = z.object({ projectId: z.string(), id: z.string().min(1) }).parse(body);
+          return reply(res, 200, store.getKnowledge(p.projectId, p.id));
+        }
+        case '/v1/knowledge/write': {
+          const p = z.object({ projectId: z.string(), entry: knowledgeSchema }).parse(body);
+          const rev = store.import([p.entry]);
+          return reply(res, 200, { success: true, id: p.entry.id, knowledgeRevision: rev, note: '条目已保存并生效。' });
+        }
+        case '/v1/knowledge/delete': {
+          const p = z.object({ projectId: z.string(), id: z.string().min(1), baseRevision: z.number().int().nonnegative().optional() }).parse(body);
+          const entry = store.getKnowledge(p.projectId, p.id);
+          const baseRev = p.baseRevision ?? entry.revision;
+          store.retire(p.id, baseRev);
+          return reply(res, 200, { success: true, id: p.id, knowledgeRevision: store.revision, note: '条目已退役删除，历史版本完整保留可追溯。' });
+        }
         /**
          * Temporary material.
          *

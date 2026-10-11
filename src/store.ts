@@ -450,6 +450,65 @@ export class Store {
     return result;
   }
   /**
+   * Universal search across all knowledge kinds: norm, preference, memory, skill, journal, workflow, material.
+   * Allows manual filtering by kind and full-text keyword retrieval.
+   */
+  searchUniversal(projectId: string, query = '', kindFilter?: string, limit = 100) {
+    const entries = this.current();
+    const tokens = queryTokens(query);
+    const matches = tokens.length ? matchAll(this.db, tokens, 0.3) : [];
+    const reasonFor = new Map(matches.map(m => [m.id, m]));
+    const matchedIds = new Set(matches.map(m => m.id));
+
+    let candidates = entries.filter(e => applicable(e.content.scope, projectId));
+    if (kindFilter && kindFilter !== 'all') {
+      candidates = candidates.filter(e => e.content.kind === kindFilter);
+    }
+
+    if (tokens.length) {
+      candidates = candidates.filter(e => {
+        if (matchedIds.has(e.id)) return true;
+        const text = `${e.id} ${e.content.title} ${'body' in e.content ? e.content.body : ''}`.toLowerCase();
+        return tokens.some(t => text.includes(t.toLowerCase()));
+      });
+      candidates.sort((a, b) => {
+        const scoreA = reasonFor.get(a.id)?.coverage ?? 0;
+        const scoreB = reasonFor.get(b.id)?.coverage ?? 0;
+        return scoreB - scoreA;
+      });
+    }
+
+    return candidates.slice(0, limit).map(entry => {
+      const c = entry.content as Record<string, unknown>;
+      const body = typeof c.body === 'string' ? c.body : (typeof c.overview === 'string' ? c.overview : (typeof c.did === 'string' ? c.did : (typeof c.summary === 'string' ? c.summary : '')));
+      return {
+        id: entry.id,
+        revision: entry.revision,
+        kind: entry.content.kind,
+        title: entry.content.title,
+        scope: entry.content.scope,
+        provenance: entry.content.provenance,
+        evidence: entry.content.evidence,
+        excerpt: body.length > 300 ? `${body.slice(0, 300)}…` : body,
+        chars: body.length,
+        rawContent: entry.content,
+        why: reasonFor.get(entry.id) ?? null,
+      };
+    });
+  }
+
+  /**
+   * Get single raw knowledge entry by ID regardless of kind.
+   */
+  getKnowledge(projectId: string, id: string) {
+    const entry = this.current().find(c => c.id === id);
+    if (!entry || !applicable(entry.content.scope, projectId)) {
+      throw new DomainError('not_found', 'Knowledge entry is unavailable', 404);
+    }
+    return entry;
+  }
+
+  /**
    * Expand one adopted knowledge entry by ID.
    *
    * This is the on-demand step the prepare summary points at. A skill returns

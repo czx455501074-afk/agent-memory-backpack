@@ -37,9 +37,9 @@ export const UI_HTML = `<!DOCTYPE html>
   </header>
   <nav class="tabs" id="tabs">
     <button class="tab tab--active" data-view="status">总览</button>
+    <button class="tab" data-view="manage">综合检索与管理</button>
     <button class="tab" data-view="norms">规范与偏好</button>
     <button class="tab" data-view="proposals">候选审阅</button>
-    <button class="tab" data-view="knowledge">技能与记忆</button>
     <button class="tab" data-view="tasks">任务与日记</button>
     <button class="tab" data-view="material">临时资料</button>
     <button class="tab" data-view="history">历史追溯</button>
@@ -116,9 +116,10 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 .notice--info { border-color: var(--muted); background: rgba(152,162,179,.08); }
 .empty { color: var(--muted); padding: 24px 0; text-align: center; }
 .toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
-input[type=search], input[type=text], select.select { background: var(--panel); color: var(--text);
+input[type=search], input[type=text], textarea, select.select { background: var(--panel); color: var(--text);
   border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; font-family: inherit; font-size: 13px; }
 input[type=search] { flex: 1; min-width: 200px; }
+textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 80px; }
 button.primary { background: #2f6feb; color: #fff; border: 1px solid #2f6feb;
   border-radius: 6px; padding: 6px 12px; cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 500; }
 button.primary:hover { background: #388bfd; }
@@ -133,6 +134,9 @@ button:disabled { opacity: .5; cursor: default; }
 .pre-box { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
   padding: 10px; font-family: ui-monospace, Consolas, monospace; font-size: 12px;
   white-space: pre-wrap; word-break: break-all; max-height: 360px; overflow-y: auto; margin: 8px 0; }
+.editor-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+.form-group { margin-bottom: 10px; }
+.form-group label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
 .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
 .statusbar { display: flex; justify-content: space-between; align-items: center; gap: 12px;
   flex-wrap: wrap; margin-top: 18px; padding-top: 12px;
@@ -214,6 +218,102 @@ function renderStatus() {
       '　扫描周期：' + esc(r.intervalMs ? Math.round(r.intervalMs / 3600000) + ' 小时' : '—') + '</p></div>' +
       notice('候选不会自动生效；推翻或补充经验必须附理由与证据，旧版本始终保留在历史中。临时资料具备 90 天到期控制。', true);
   });
+}
+
+function renderManage(searchQuery, kindFilter) {
+  var q = searchQuery !== undefined ? searchQuery : (document.getElementById('u-query') ? document.getElementById('u-query').value : '');
+  var k = kindFilter !== undefined ? kindFilter : (document.getElementById('u-kind-filter') ? document.getElementById('u-kind-filter').value : 'all');
+  return post('/v1/knowledge/search-universal', { query: q, kind: k, limit: 100 }).then(function (data) {
+    var items = data.results || [];
+    var kinds = [
+      ['all', '全部类型'],
+      ['norm', '规范 (norm)'],
+      ['preference', '偏好 (preference)'],
+      ['memory', '记忆 (memory)'],
+      ['skill', '技能 (skill)'],
+      ['journal', '日记 (journal)'],
+      ['workflow', '流程 (workflow)'],
+      ['material', '资料 (material)'],
+    ];
+
+    var toolbar = '<div class="toolbar">' +
+      '<input type="search" id="u-query" placeholder="综合检索规范、日记、知识、技能与经验…" value="' + esc(q) + '">' +
+      '<select id="u-kind-filter" class="select">' +
+      kinds.map(function (pair) {
+        return '<option value="' + esc(pair[0]) + '"' + (pair[0] === k ? ' selected' : '') + '>' + esc(pair[1]) + '</option>';
+      }).join('') +
+      '</select>' +
+      '<button class="primary" id="u-search-btn">检索</button>' +
+      '<button class="ghost" id="u-create-toggle">+ 手动新建条目</button>' +
+      '</div>' +
+      '<div id="u-editor-container"></div>';
+
+    var table = '';
+    if (!items.length) {
+      table = empty(q ? '没有匹配的条目。' : '当前类型下暂无条目。可点击上方按钮手动新建。');
+    } else {
+      table = '<table><thead><tr><th>ID / 标题</th><th>类型</th><th>版本</th><th>作用范围</th><th>摘要预览</th><th>操作</th></tr></thead><tbody>' +
+        items.map(function (item) {
+          var sc = item.scope ? (item.scope.kind === 'global' ? '全局' : ('项目: ' + (item.scope.projectId || '当前'))) : '—';
+          return '<tr><td><div><strong>' + esc(item.title) + '</strong></div><div class="card__path">' + esc(item.id) + '</div></td>' +
+            '<td><span class="pill pill--ok">' + esc(item.kind) + '</span></td>' +
+            '<td><code>v' + esc(item.revision) + '</code></td>' +
+            '<td>' + esc(sc) + '</td>' +
+            '<td>' + esc(item.excerpt) + (item.why && item.why.matched ? '<div class="card__path">命中: ' + esc(item.why.matched.join(',')) + '</div>' : '') + '</td>' +
+            '<td><div class="card__actions" style="margin:0;">' +
+            '<button class="ghost btn-sm u-edit-btn" data-id="' + esc(item.id) + '">编辑修改</button>' +
+            '<button class="ghost btn-sm btn-danger u-delete-btn" data-id="' + esc(item.id) + '" data-rev="' + esc(item.revision) + '">删除</button>' +
+            '</div></td></tr>';
+        }).join('') + '</tbody></table>';
+    }
+
+    panel.innerHTML = toolbar + table;
+  });
+}
+
+function showEditor(entryToEdit) {
+  var container = document.getElementById('u-editor-container');
+  if (!container) return;
+  var isEdit = Boolean(entryToEdit);
+  var raw = entryToEdit ? (entryToEdit.rawContent || {}) : {};
+  var id = entryToEdit ? entryToEdit.id : ('k-' + Date.now().toString(36));
+  var title = raw.title || '';
+  var kind = raw.kind || 'memory';
+  var body = raw.body !== undefined ? raw.body : (raw.overview !== undefined ? raw.overview : (raw.did !== undefined ? raw.did : ''));
+  var scopeKind = raw.scope && raw.scope.kind === 'global' ? 'global' : 'project';
+  var baseRevision = entryToEdit ? entryToEdit.revision : 0;
+
+  container.innerHTML = '<div class="editor-card">' +
+    '<div class="card__head" style="margin-bottom:12px;">' +
+    '<span class="card__title">' + (isEdit ? '编辑条目: ' + esc(id) : '手动添加新知识条目') + '</span>' +
+    '<button class="ghost btn-sm" id="u-editor-cancel">取消</button>' +
+    '</div>' +
+    '<div class="grid-2">' +
+    '<div class="form-group"><label>条目 ID (唯一标识)</label>' +
+    '<input type="text" id="ed-id" value="' + esc(id) + '"' + (isEdit ? ' readonly style="opacity:0.7;"' : '') + ' style="width:100%;"></div>' +
+    '<div class="form-group"><label>内容类型 (Kind)</label>' +
+    '<select id="ed-kind" class="select" style="width:100%;"' + (isEdit ? ' disabled' : '') + '>' +
+    '<option value="memory"' + (kind === 'memory' ? ' selected' : '') + '>记忆 (memory)</option>' +
+    '<option value="norm"' + (kind === 'norm' ? ' selected' : '') + '>规范 (norm)</option>' +
+    '<option value="preference"' + (kind === 'preference' ? ' selected' : '') + '>偏好 (preference)</option>' +
+    '<option value="skill"' + (kind === 'skill' ? ' selected' : '') + '>技能 (skill)</option>' +
+    '</select></div>' +
+    '</div>' +
+    '<div class="grid-2">' +
+    '<div class="form-group"><label>标题</label>' +
+    '<input type="text" id="ed-title" value="' + esc(title) + '" placeholder="简明清晰的标题" style="width:100%;"></div>' +
+    '<div class="form-group"><label>作用范围</label>' +
+    '<select id="ed-scope" class="select" style="width:100%;">' +
+    '<option value="project"' + (scopeKind === 'project' ? ' selected' : '') + '>当前项目专属</option>' +
+    '<option value="global"' + (scopeKind === 'global' ? ' selected' : '') + '>全局共享</option>' +
+    '</select></div>' +
+    '</div>' +
+    '<div class="form-group"><label>正文内容</label>' +
+    '<textarea id="ed-body" rows="6" placeholder="输入完整的知识或规则正文…">' + esc(body) + '</textarea></div>' +
+    '<div class="card__actions">' +
+    '<button class="primary" id="u-editor-save" data-edit="' + (isEdit ? '1' : '0') + '" data-baserev="' + esc(baseRevision) + '">保存生效</button>' +
+    '</div>' +
+    '</div>';
 }
 
 function renderNorms() {
@@ -326,36 +426,6 @@ function renderProposals(filterState) {
     }).join('');
 
     panel.innerHTML = filterBar + listHtml;
-  });
-}
-
-function renderKnowledge(query) {
-  var path = query ? '/v1/search' : '/v1/knowledge/unstructured';
-  var body = query ? { query: query } : { limit: 200 };
-  return post(path, body).then(function (data) {
-    var items = data.workflows || data.skills || [];
-    var head = '<div class="toolbar"><input type="search" id="k-query" placeholder="按关键词检索技能、流程与记忆…" value="' +
-      esc(query || '') + '"><button class="primary" id="k-go">检索</button></div>';
-    if (!items.length) {
-      panel.innerHTML = head + empty(query ? '没有匹配的条目。' : '知识库为空。先用 discover/adopt 同步本地已有知识。');
-    } else {
-      panel.innerHTML = head + '<table><thead><tr><th>标题</th><th>类型</th><th>证据等级</th><th>规模 / 命中依据</th><th>状态</th></tr></thead><tbody>' +
-        items.map(function (item) {
-          var kind = item.needsStructure === undefined && item.ready !== undefined ? '完整流程'
-            : (item.kind === 'memory' ? '记忆' : (item.kind === 'journal' ? '日记' : '技能'));
-          var state = item.ready === false ? '<span class="pill pill--fail">依赖缺失</span>'
-            : item.needsStructure ? '<span class="pill pill--warn">待结构化</span>'
-            : '<span class="pill pill--ok">可用</span>';
-          var evidence = item.evidence ? '<span class="pill pill--ok">' + esc(item.evidence) + '</span>' : '—';
-          var whyInfo = item.why && item.why.matched ? '命中: ' + item.why.matched.join(',') : '';
-          var size = item.leafCount !== undefined ? '参考 ' + item.leafCount + ' 份 / ' + item.chars + ' 字符'
-            : (item.overview ? String(item.overview).slice(0, 50) : (item.excerpt || '—'));
-          return '<tr><td><div>' + esc(item.title) + '</div><div class="card__path">' + esc(item.id) + '</div></td>' +
-            '<td>' + esc(kind) + '</td><td>' + evidence + '</td>' +
-            '<td><div>' + esc(size) + '</div>' + (whyInfo ? '<div class="card__path">' + esc(whyInfo) + '</div>' : '') + '</td>' +
-            '<td>' + state + '</td></tr>';
-        }).join('') + '</tbody></table>';
-    }
   });
 }
 
@@ -514,9 +584,9 @@ function reportError(error) {
 
 var RENDERERS = {
   status: renderStatus,
+  manage: function () { return renderManage('', 'all'); },
   norms: renderNorms,
   proposals: function () { return renderProposals('pending'); },
-  knowledge: function () { return renderKnowledge(''); },
   tasks: renderTasks,
   material: renderMaterial,
   history: renderHistory,
@@ -546,24 +616,98 @@ document.getElementById('refresh').addEventListener('click', function () {
 panel.addEventListener('click', function (event) {
   var target = event.target;
 
-  // Knowledge search
-  if (target.id === 'k-go') {
-    var input = document.getElementById('k-query');
-    renderKnowledge(input ? input.value : '').catch(reportError);
+  // Universal search & management
+  if (target.id === 'u-search-btn') {
+    renderManage().catch(reportError);
+    return;
+  }
+
+  if (target.id === 'u-create-toggle') {
+    showEditor(null);
+    return;
+  }
+
+  if (target.id === 'u-editor-cancel') {
+    var c = document.getElementById('u-editor-container');
+    if (c) c.innerHTML = '';
+    return;
+  }
+
+  if (target.id === 'u-editor-save') {
+    var id = (document.getElementById('ed-id') || {}).value;
+    var title = (document.getElementById('ed-title') || {}).value;
+    var kind = (document.getElementById('ed-kind') || {}).value;
+    var body = (document.getElementById('ed-body') || {}).value;
+    var scopeKind = (document.getElementById('ed-scope') || {}).value;
+    var baseRev = Number(target.dataset.baserev || 0);
+
+    if (!id || !title || !body) { alert('ID、标题与正文均为必填项！'); return; }
+
+    var scope = scopeKind === 'global' ? { kind: 'global' } : { kind: 'project', projectId: getProject() };
+    var entry = {
+      id: id.trim(),
+      kind: kind,
+      title: title.trim(),
+      scope: scope,
+      baseRevision: baseRev,
+      labels: [],
+      provenance: 'user',
+      evidence: 'verified',
+      platforms: [],
+    };
+    if (kind === 'norm') {
+      entry.body = body.trim();
+      entry.deniedTools = [];
+      entry.hostProvided = false;
+    } else if (kind === 'preference') {
+      entry.body = body.trim();
+      entry.stated = true;
+    } else if (kind === 'skill') {
+      entry.body = body.trim();
+      entry.leaves = [];
+      entry.needsStructure = true;
+    } else {
+      entry.body = body.trim();
+    }
+
+    post('/v1/knowledge/write', { entry: entry }).then(function (res) {
+      alert('保存成功！' + (res.note || ''));
+      renderManage();
+    }).catch(reportError);
+    return;
+  }
+
+  if (target.classList.contains('u-edit-btn')) {
+    var editId = target.dataset.id;
+    post('/v1/knowledge/get', { id: editId }).then(function (res) {
+      showEditor({ id: res.id, revision: res.revision, rawContent: res.content });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }).catch(reportError);
+    return;
+  }
+
+  if (target.classList.contains('u-delete-btn')) {
+    var delId = target.dataset.id;
+    var delRev = Number(target.dataset.rev || 0);
+    if (!confirm('确定退役删除条目 ' + delId + '？历史版本将完整保留可追溯。')) return;
+    post('/v1/knowledge/delete', { id: delId, baseRevision: delRev }).then(function () {
+      alert('条目已成功删除！');
+      renderManage();
+    }).catch(reportError);
     return;
   }
 
   // Proposals single actions
   if (target.classList.contains('action-approve')) {
-    var id = target.dataset.id;
-    var title = prompt('请输入批准后的条目标题：', '经验记录');
-    if (!title) return;
+    var pId = target.dataset.id;
+    var pTitle = prompt('请输入批准后的条目标题：', '经验记录');
+    if (!pTitle) return;
     post('/v1/proposals/approve', {
-      id: id,
+      id: pId,
       entry: {
-        id: id,
+        id: pId,
         kind: 'memory',
-        title: title,
+        title: pTitle,
         body: target.closest('.card').querySelector('.card__body').textContent,
         scope: { kind: 'project', projectId: getProject() },
         baseRevision: 0,
@@ -724,11 +868,14 @@ panel.addEventListener('change', function (event) {
   if (event.target.id === 'prop-filter') {
     renderProposals(event.target.value).catch(reportError);
   }
+  if (event.target.id === 'u-kind-filter') {
+    renderManage(undefined, event.target.value).catch(reportError);
+  }
 });
 
 panel.addEventListener('keydown', function (event) {
-  if (event.key === 'Enter' && event.target.id === 'k-query') {
-    renderKnowledge(event.target.value).catch(reportError);
+  if (event.key === 'Enter' && event.target.id === 'u-query') {
+    renderManage(event.target.value, undefined).catch(reportError);
   }
   if (event.key === 'Enter' && event.target.id === 'hist-id-input') {
     var btn = document.getElementById('hist-query-btn');

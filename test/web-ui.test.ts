@@ -136,3 +136,65 @@ test('界面支持偏好、平台能力清单与历史追溯端点', async () =>
     assert.ok(Array.isArray(histBody.history));
   } finally { await close(); }
 });
+
+test('界面支持综合检索、手动添加、修改与退役删除端点', async () => {
+  const { origin, close } = await core();
+  try {
+    // 1. 综合检索
+    const searchRes = await post(origin, '/v1/knowledge/search-universal', { query: '界面规范', kind: 'norm' });
+    assert.equal(searchRes.status, 200);
+    const searchBody = await searchRes.json() as { results: Array<{ id: string; title: string }> };
+    assert.ok(searchBody.results.length >= 1);
+    assert.equal(searchBody.results[0]!.id, 'ui-norm');
+
+    // 2. 手动添加新条目
+    const writeRes = await post(origin, '/v1/knowledge/write', {
+      entry: {
+        id: 'manual-note-1',
+        kind: 'memory',
+        title: '用户手动沉淀经验',
+        body: '这是手动录入的高价值操作结论。',
+        scope: { kind: 'project', projectId: 'p0' },
+        baseRevision: 0,
+        labels: ['manual'],
+        provenance: 'user',
+        evidence: 'verifiable',
+        platforms: [],
+      },
+    });
+    assert.equal(writeRes.status, 200);
+
+    // 3. 读取单条
+    const getRes = await post(origin, '/v1/knowledge/get', { id: 'manual-note-1' });
+    assert.equal(getRes.status, 200);
+    const getBody = await getRes.json() as { id: string; revision: number; content: { title: string } };
+    assert.equal(getBody.id, 'manual-note-1');
+    assert.equal(getBody.content.title, '用户手动沉淀经验');
+
+    // 4. 手动修改现有条目 (CAS 递增 revision)
+    const updateRes = await post(origin, '/v1/knowledge/write', {
+      entry: {
+        id: 'manual-note-1',
+        kind: 'memory',
+        title: '用户手动修改后标题',
+        body: '正文更新：增加了验证依据。',
+        scope: { kind: 'project', projectId: 'p0' },
+        baseRevision: getBody.revision,
+        labels: ['manual', 'updated'],
+        provenance: 'user',
+        evidence: 'verifiable',
+        platforms: [],
+      },
+    });
+    assert.equal(updateRes.status, 200);
+
+    // 5. 手动删除条目 (退役保留历史)
+    const delRes = await post(origin, '/v1/knowledge/delete', { id: 'manual-note-1' });
+    assert.equal(delRes.status, 200);
+
+    // 确认已不在活动库检索中
+    const checkRes = await post(origin, '/v1/knowledge/search-universal', { query: '用户手动修改后标题' });
+    const checkBody = await checkRes.json() as { results: Array<{ id: string }> };
+    assert.equal(checkBody.results.some(r => r.id === 'manual-note-1'), false, '已删除条目不得在活跃检索中出现');
+  } finally { await close(); }
+});
