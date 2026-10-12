@@ -157,13 +157,14 @@ const fixture = {
     idempotencyKey: 'no-workflow-1', projectId: PROJECT,
     workflowId: 'no-such-workflow', discovery: '库中还没有流程，但这条经验必须被留下来。',
   });
-  const listed = await post(origin, '/v1/proposals/list', { projectId: PROJECT });
+  const listed = await post(origin, '/v1/proposals/list', { projectId: PROJECT }, ADMIN_TOKEN);
   const proposals = listed.body?.proposals ?? [];
   const lines = [
     `submit(workflowId="no-such-workflow") -> ${submit.status} ${JSON.stringify(submit.body)}`,
-    `listProposals count = ${proposals.length}`,
+    `listProposals (admin) -> ${listed.status}, count = ${proposals.length}`,
     `attribution = ${JSON.stringify(proposals[0]?.attribution ?? null)}`,
     `state = ${JSON.stringify(proposals[0]?.state ?? null)}`,
+    `discovery preserved = ${JSON.stringify(proposals[0]?.payload?.discovery ?? null)}`,
   ];
   // Positive control: a stage of a real workflow still must be validated.
   store.import([{
@@ -186,7 +187,7 @@ const fixture = {
   lines.push(`real workflow + real stage -> ${goodStage.status}`);
   lines.push(`real workflow + ghost stage -> ${badStage.status} ${JSON.stringify(badStage.body)}`);
   lines.push(`stage without workflow       -> ${orphanStage.status} ${JSON.stringify(orphanStage.body)}`);
-  lines.push(`listProposals count after controls = ${(await post(origin, '/v1/proposals/list', { projectId: PROJECT })).body?.proposals?.length}`);
+  lines.push(`listProposals (admin) after controls = ${(await post(origin, '/v1/proposals/list', { projectId: PROJECT }, ADMIN_TOKEN)).body?.proposals?.length}`);
   record('BUG-M1', '未知 workflowId 的候选不得丢失，必须可被人工看到并处理', lines.join('\n'));
   stop();
   store.close();
@@ -204,7 +205,9 @@ function runNode(script, args, options = {}) {
 function initDataDir(label) {
   const dir = join(scratchRoot, label);
   const init = runNode(join(srcDir, 'cli.js'), ['init', '--data-dir', dir, '--project', 'p0', '--project-root', dir]);
-  if (init.code !== 0) throw new Error(`init failed: ${init.stderr}`);
+  // A non-zero init is a real finding, not a harness detail: the credential ACL
+  // step must succeed, and reporting it here keeps a silent downgrade visible.
+  if (init.code !== 0) throw new Error(`init exited ${init.code}:\n${init.stdout}\n${init.stderr}`);
   return dir;
 }
 
@@ -337,12 +340,26 @@ if (process.platform === 'win32') {
   const acl = spawnSync('icacls', [target], { encoding: 'utf8', windowsHide: true });
   const text = `${acl.stdout ?? ''}`;
   const broad = ['Authenticated Users', 'BUILTIN\\Users'].filter(name => text.includes(name));
+  // Read the ACL back as SDDL too: that view is language-independent, so the
+  // check does not depend on this process running on an English Windows.
+  const saved = join(used, 'acl-check.txt');
+  spawnSync('icacls', [target, '/save', saved], { encoding: 'utf8', windowsHide: true });
+  const sddl = existsSync(saved)
+    ? new TextDecoder('utf-16le').decode(readFileSync(saved)).split(/\r?\n/).map(l => l.trim()).filter(Boolean)[1] ?? '(none)'
+    : '(unreadable)';
+  // Broad SID tokens inside an ACE, by SID so the check does not depend on the
+  // display language. `(A;;` alone would match every ACE and report a false
+  // alarm, so only the SID suffixes count.
+  const sddlBroad = [';;;AU)', ';;;BU)', ';;;AC)', ';;;WD)', ';;;IU)', ';;;SU)'].filter(token => sddl.includes(token));
   record('BUG-W3', '凭据文件 ACL 不得含 Authenticated Users/Users 的宽权限授予',
     [
       `init exit=${init.code}`,
+      `init stdout=${init.stdout.trim().replace(/\n/g, ' | ')}`,
       `icacls ${target}:`,
       text.trim(),
       `broad grants still present = ${JSON.stringify(broad)}`,
+      `saved SDDL = ${sddl}`,
+      `SDDL broad tokens present = ${JSON.stringify(sddlBroad)}`,
     ].join('\n'));
 }
 

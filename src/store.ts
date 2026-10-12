@@ -1,9 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { DomainError, knowledgeSchema, workflowSchema, type Knowledge, type KnowledgeDraft, type WorkflowDraft, type Workflow, type Scope } from './schema.js';
+import { DomainError, knowledgeSchema, proposalSchema, workflowSchema, type Knowledge, type KnowledgeDraft, type WorkflowDraft, type Workflow, type Scope } from './schema.js';
 import { reviewDecision, type ReviewDecision } from './policy.js';
 import { classifyCandidate } from './semantic.js';
-import { MATERIAL_TTL_DAYS, isLive, materialEntry, renew, type MaterialInput } from './material.js';
+import { MATERIAL_TTL_DAYS, expiryFrom, isLive, materialEntry, renew, type MaterialInput } from './material.js';
 
 type Row = Record<string, unknown>;
 type Entry = { id: string; revision: number; status: string; content: Knowledge };
@@ -384,10 +384,77 @@ export class Store {
   }
   /** Admin-only offline import. Every update requires the observed per-item revision. */
   import(entries: KnowledgeDraft[]): number {
-    const validated = entries.map(entry => knowledgeSchema.parse(entry));
+    return this.importWithReport(entries).knowledgeRevision;
+  }
+  /**
+   * Import entries and report what became of each, rather than only that it worked.
+   *
+   * `import()` alone answered with a revision, which read as "everything arrived".
+   * For temporary material that can be false the moment it lands: the schema's own
+   * `expiresAt` default is 0, which means *already lapsed*, so an entry written by
+   * the offline seed path — which parses a document directly and never passes
+   * through `materialEntry` — was stored expired, purged by the next `cleanup()`,
+   * and still reported as an import success. The user was told a runbook had been
+   * imported and could never read it.
+   *
+   * Two things are therefore done at this boundary, which is the only place that
+   * can tell "the caller stated no lifetime" from "the caller asked for none":
+   *
+   *   - A material entry that states no `expiresAt` (or a non-positive one) gets the
+   *     design's own retention (§8: 90 days, `MATERIAL_TTL_DAYS`) computed from its
+   *     `savedAt`. This matches what `saveMaterial` already produces, so the two
+   *     write paths stop disagreeing about the same kind of entry.
+   *   - Any entry that is nonetheless not readable after the write — an explicit
+   *     past expiry, however it got there — is named in `result.unusable`. Only
+   *     material can be born expired, so it is the only kind checked.
+   *
+   * An explicit future expiry is left exactly as the caller wrote it: expiry is
+   * stored rather than computed so a later retention change cannot retroactively
+   * move an entry that was saved under an older policy.
+   */
+  importWithReport(entries: KnowledgeDraft[]): {
+    knowledgeRevision: number;
+    imported: number;
+    /**
+     * Entries written but not readable afterwards, each with the reason. Named
+     * rather than counted so the caller can act on the specific one — the seed
+     * path prints these, which is what makes "imported but already expired"
+     * visible instead of a silent success.
+     */
+    unusable: Array<{ id: string; kind: Knowledge['kind']; reason: string }>;
+  } {
+    const now = this.now();
+    const validated = entries.map(entry => this.withImportDefaults(entry, now));
     if (new Set(validated.map(x => x.id)).size !== validated.length)
       throw new DomainError('duplicate_id', 'Import contains duplicate IDs');
-    return this.transaction(() => this.importInsideTransaction(validated));
+    const knowledgeRevision = this.transaction(() => this.importInsideTransaction(validated));
+    const unusable = validated
+      .filter((entry): entry is Extract<Knowledge, { kind: 'material' }> =>
+        entry.kind === 'material' && !isLive(entry.expiresAt, now))
+      .map(entry => ({
+        id: entry.id, kind: entry.kind as Knowledge['kind'],
+        reason: entry.expiresAt <= 0
+          ? '未声明有效期，且有效期解析为 0（即已过期），导入后不可读'
+          : `已过期（expiresAt=${entry.expiresAt}，早于当前时间 ${now}），导入后不可读`,
+      }));
+    return { knowledgeRevision, imported: validated.length, unusable };
+  }
+  /**
+   * Apply the defaults an import boundary owes an entry, before validation.
+   *
+   * Kept separate from `materialEntry` because that helper *builds* a new entry
+   * while this one *repairs* a parsed document, and folding them together would
+   * force the build path to re-validate text it just composed.
+   */
+  private withImportDefaults(entry: KnowledgeDraft, now: number): Knowledge {
+    const parsed = knowledgeSchema.parse(entry) as Knowledge;
+    if (parsed.kind !== 'material') return parsed;
+    if (parsed.expiresAt > 0) return parsed;
+    // `savedAt` is 0 when the caller stated none, which would put the expiry in
+    // 1970 and leave the entry expired anyway; the write time is the honest basis
+    // for an entry whose own date is unknown.
+    const savedAt = parsed.savedAt > 0 ? parsed.savedAt : now;
+    return { ...parsed, savedAt, expiresAt: expiryFrom(savedAt) };
   }
   /** Caller must already hold a transaction; shared with proposal approval. */
   private importInsideTransaction(validated: Knowledge[]): number {
@@ -1299,7 +1366,18 @@ export class Store {
         id, state: 'pending', duplicate: false, review: decision,
         ...(workflowResolved ? {} : {
           attribution: { workflowId: payload.workflowId ?? null, stageId: null, resolved: false as const },
-          note: `workflow ${payload.workflowId} 不存在或不可见，候选已按未归属保存，请人工确认它应归属哪个流程/步骤。`,
+          /**
+           * Two different phenomena, two different sentences.
+           *
+           * A named-but-unresolved workflow and a submission that named none at all
+           * both end up unattributed, but they are not the same fact and must not
+           * share one sentence: saying "workflow undefined does not exist" invents a
+           * flow that was never claimed, and leaks an internal value into text a
+           * person reads.
+           */
+          note: payload.workflowId
+            ? `workflow ${payload.workflowId} 不存在或不可见，候选已按未归属保存，请人工确认它应归属哪个流程/步骤。`
+            : '本条候选未标注归属流程，已按未归属保存，请人工确认它应归属哪个流程/步骤。',
         }),
       };
     });

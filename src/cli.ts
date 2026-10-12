@@ -1,12 +1,13 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { parseArgs } from 'node:util';
+import { tmpdir } from 'node:os';
 import { Store } from './store.js';
 import { seedSchema, workflowSchema, type Knowledge } from './schema.js';
 import { coreSchema, clientSchema, defaultDataDir } from './config.js';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createCoreServer } from './server.js';
 import { defaultScanRoots, diff, discover, rescanDiff, summarize, summarizeRescan } from './discovery.js';
 // candidateToKnowledge lives with the rescan policy so the CLI and the running
@@ -140,6 +141,143 @@ function coreEntryHint(candidates: Array<{ path: string; source: string }>): str
   return '未找到核心入口。已检查：'
     + candidates.map(candidate => `${candidate.path}（${candidate.source}）`).join('、')
     + '。先运行 npm run build，或用 AMB_CORE_ENTRY 指向真实的 cli.js。';
+}
+/**
+ * Bounded outbound ACL entries, by SID so the answer does not depend on the
+ * display language.
+ *
+ * The core's own SIDs rather than the `Administrators`/`SYSTEM` names, because
+ * the same check must hold on a Chinese Windows where those names are localised.
+ * The granted set is left deliberately wider than one account: a machine being
+ * maintained by an administrator must not lock them out of the credentials they
+ * are responsible for.
+ */
+const BROAD_ACL_ENTRIES = ['AC', 'WD', 'AU', 'BU', 'IU', 'SU'];
+const SDDL_ACE_PATTERN = /\(([^)]*)\)/g;
+
+/** ACEs in an SDDL string, each as its field array, so flags can be inspected. */
+function sddlAces(sddl: string): string[][] {
+  return [...sddl.matchAll(SDDL_ACE_PATTERN)].map(match => match[1]!.split(';'));
+}
+
+/**
+ * An equivalence class for "the same SID got the same rights".
+ *
+ * Access masks are written in their symbolic form, so the comparison normalises
+ * only whitespace and case and must not be taught to understand every flag. What
+ * matters here is whether *anything* a bounded entry allows is also allowed to a
+ * broad SID; a mask it cannot parse compares unequal and is reported rather than
+ * silently treated as safe.
+ */
+function aceKey(ace: string[]): { sid: string; rights: string } {
+  return { sid: (ace[5] ?? '').toUpperCase(), rights: (ace[2] ?? '').replace(/\s+/g, '').toUpperCase() };
+}
+
+/**
+ * Read a file's ACL as SDDL, through `icacls /save`.
+ *
+ * Chosen over parsing `icacls <path>` output because that output is localised:
+ * on a Chinese Windows the success line and even the SID names are bytes this
+ * process cannot match against an English pattern — a trap this project has
+ * already been bitten by once, in `service.ts`'s startup query. `/save` writes
+ * SDDL (`D:PAI(A;;FA;;;SY)...`), which is ASCII and language-independent, and
+ * the file is read back as UTF-16LE, which is the encoding the tool writes.
+ *
+ * Returns the raw SDDL, or a reason it could not be read. Never throws: a
+ * verification step must not be able to abort the credential write it follows.
+ */
+function readAclSddl(target: string): { sddl?: string; error?: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'amb-acl-'));
+  try {
+    // `/save` requires a *file* path, and writes only the ACEs it was given a
+    // file for. Handing it the directory — the obvious-looking call — returns
+    // exit 87 ("Successfully processed 0 files") without writing anything, which
+    // is how this verification silently failed for every credential.
+    const aclFile = join(dir, 'acl.txt');
+    const result = spawnSync('icacls', [target, '/save', aclFile], { encoding: 'utf8', windowsHide: true });
+    if (result.error) return { error: result.error.message };
+    if (result.status !== 0) return { error: `icacls /save 退出 ${result.status}` };
+    if (!existsSync(aclFile)) return { error: 'icacls /save 未写出 ACL 文件' };
+    // UTF-16LE (with BOM): reading it as latin1 shows `c r e d . j s o n`, which
+    // is why the encoding is decoded explicitly rather than assumed.
+    const text = new TextDecoder('utf-16le').decode(readFileSync(aclFile));
+    // Line 1 is the saved file's name, line 2 the SDDL.
+    const sddl = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean)[1];
+    return sddl ? { sddl } : { error: 'ACL 文件不含 SDDL 行' };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : '读取 ACL 失败' };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Whether the credential file still hands any rights to classes wider than the user.
+ *
+ * `Authenticated Users`, `Users` and friends are the finding: a credential file
+ * under a directory that grants them inherits them, so any other account on the
+ * machine can read the token. The comparison is per (SID, rights) against the
+ * bounded entries this code just granted, so a *removed* broad discretionary ACE
+ * is required for the check to pass — merely having added the owner is not
+ * enough, which is what makes this a check rather than a formality.
+ */
+function broadAclEntries(sddl: string): string[] {
+  const bounded = new Set(sddlAces(sddl)
+    .filter(ace => (ace[5] ?? '').toUpperCase() === currentUserSid() || ace[5]!.toUpperCase() === 'S-1-5-18')
+    .map(ace => `${aceKey(ace).sid}:${aceKey(ace).rights}`));
+  return sddlAces(sddl)
+    .filter(ace => BROAD_ACL_ENTRIES.includes((ace[5] ?? '').toUpperCase()))
+    .filter(ace => !bounded.has(`${aceKey(ace).sid}:${aceKey(ace).rights}`))
+    .map(ace => `${ace[5]}:${ace[2]}`);
+}
+
+/** The current user's SID, or '' when it cannot be determined. */
+function currentUserSid(): string {
+  // `whoami /user` prints the SID beside the account name; the SID itself is the
+  // only token that is machine-readable on every locale.
+  const result = spawnSync('whoami', ['/user'], { encoding: 'utf8', windowsHide: true });
+  return /S-\d+(?:-\d+)+/.exec(result.stdout ?? '')?.[0] ?? '';
+}
+
+/**
+ * Restrict a credential file to the accounts that need it.
+ *
+ * Windows does not enforce a POSIX mode, so `writeFileSync(..., { mode: 0o600 })`
+ * does nothing there and the file simply inherits the directory's ACL. Under a
+ * data directory inside the user's profile that inheritance happens to be
+ * acceptable; under a directory that grants `Authenticated Users:(M)` and
+ * `Users:(RX)` — any drive root, or an explicitly chosen `--data-dir` — the
+ * credential was readable by every account on the machine.
+ *
+ * Two steps, and the order is what makes it a fix rather than a hope: remove
+ * inherited entries and grant only this user (plus the two system accounts), then
+ * *read the ACL back* and report whether any broad entry survived. A silent
+ * failure here is the worst outcome, because the file looks written and is
+ * readable; so the caller is given the finding and the CLI exits non-zero on it.
+ */
+function restrictCredentialAcl(target: string): { ok: boolean; detail: string } {
+  if (process.platform !== 'win32') {
+    // POSIX: the mode passed at creation is what applies, and it was already set
+    // to owner-only. Nothing to read back through this mechanism.
+    return { ok: true, detail: '非 Windows：凭据以 0600 创建，由文件模式约束。' };
+  }
+  const userSid = currentUserSid();
+  if (!userSid) return { ok: false, detail: `无法确定当前用户 SID，未收紧 ${target} 的 ACL。` };
+  const grants = [
+    `*${userSid}:(F)`,   // the owner who reads the credential
+    '*S-1-5-18:(F)',     // SYSTEM, whose access the design's baseline keeps
+    '*S-1-5-32-544:(F)', // Administrators, so a machine can still be maintained
+  ];
+  const applied = spawnSync('icacls', [target, '/inheritance:r', ...grants.flatMap(grant => ['/grant:r', grant])],
+    { encoding: 'utf8', windowsHide: true });
+  if (applied.error) return { ok: false, detail: `icacls 无法执行：${applied.error.message}` };
+  if (applied.status !== 0) return { ok: false, detail: `icacls 收紧失败（退出 ${applied.status}）` };
+  const acl = readAclSddl(target);
+  if (acl.error) return { ok: false, detail: `已执行收紧，但无法复核 ACL：${acl.error}` };
+  const broad = broadAclEntries(acl.sddl!);
+  return broad.length
+    ? { ok: false, detail: `已执行收紧，但 ACL 仍含宽权限条目：${broad.join(', ')}` }
+    : { ok: true, detail: `凭据 ACL 已收紧为仅当前用户（+SYSTEM/Administrators），继承已移除。` };
 }
 try {
   if (command === 'discover') {
@@ -618,12 +756,27 @@ try {
       written.push({ id: c.id, path, role: c.role });
       if (c.id === 'codex') writeFileSync(join(dir, 'client.json'), client, { flag: 'wx', mode: 0o600 });
     }
+    /**
+     * Tighten each credential file, then say what actually happened.
+     *
+     * The mode above is not enforced on Windows, so until this runs the file
+     * inherits whatever the directory grants — and a `--data-dir` on a drive root
+     * grants `Authenticated Users` and `Users`. The result of the attempt is
+     * printed rather than assumed, and a failure to tighten is a non-zero exit:
+     * this is a security property of a token, and reporting success while the
+     * token stays world-readable would be worse than not attempting it.
+     */
+    const aclResults = written
+      .filter(entry => existsSync(entry.path))
+      .map(entry => ({ id: entry.id, path: entry.path, ...restrictCredentialAcl(entry.path) }));
     console.log(`P0 configuration created at ${dir}. Credentials were not printed. Keep these files private.`);
     console.log('Adapter credentials (codex, dsh) may read knowledge and submit candidates; only the admin credential may review proposals.');
     // Say plainly what the file mode does and does not buy, rather than implying
     // the credential is protected when a same-user process can read it anyway.
     console.log(`Files written: ${written.map(w => `${w.id}(${w.role})`).join(', ')}.`);
-    console.log('Note: file permissions are set to owner-only, but on Windows that mode is not enforced — the directory ACL is what applies. Any process running as this user can read these files, so treat the whole directory as holding credentials.'
+    for (const acl of aclResults) console.log(`ACL ${acl.ok ? 'ok' : 'FAILED'} ${acl.id}: ${acl.detail}`);
+    if (aclResults.some(acl => !acl.ok)) process.exitCode = 1;
+    console.log('Note: file permissions are set to owner-only, but on Windows that mode is not enforced — the file ACL is what applies, and it has been restricted to this user (plus SYSTEM/Administrators). Any process running as this user can still read these files, so treat the whole directory as holding credentials.'
       + (adminDir === dir ? ' Pass --admin-dir to keep the admin credential in a separate directory from the adapters.' : ` The admin credential is in ${adminDir}.`));
   } else if (['serve', 'seed', 'retire', 'status'].includes(command ?? '')) {
     const config = coreSchema.parse(JSON.parse(readFileSync(join(dir, 'core.json'), 'utf8')));
@@ -736,7 +889,27 @@ try {
         if (command === 'seed') {
           if (!values.input) throw new Error('--input is required');
           const input = seedSchema.parse(JSON.parse(readFileSync(resolve(values.input), 'utf8')));
-          console.log(JSON.stringify({ knowledgeRevision: store.import(input.entries) }));
+          /**
+           * The report names what was written and what is not usable.
+           *
+           * A bare revision was the whole of this output before, and it read as
+           * "all imported" even when a temporary-material entry had been stored
+           * already expired — the schema's 0 default means *lapsed*, so those
+           * entries were purged by the next cleanup and could never be read. The
+           * fix gives an entry with no stated lifetime the design's 90 days, and
+           * this output is the other half: anything that is *still* unusable is
+           * named here, with the reason, instead of being counted as a success.
+           */
+          const result = store.importWithReport(input.entries);
+          console.log(JSON.stringify({
+            knowledgeRevision: result.knowledgeRevision,
+            imported: result.imported,
+            ...(result.unusable.length ? { unusable: result.unusable } : {}),
+            note: result.unusable.length
+              ? `${result.imported} 条已写入，但其中 ${result.unusable.length} 条导入后不可读（见 unusable，已列出 id 与原因）。`
+              : `${result.imported} 条已写入并生效。`,
+          }, null, 2));
+          if (result.unusable.length) process.exitCode = 1;
         } else if (command === 'retire') {
           if (!values.id || !values.revision || !Number.isInteger(Number(values.revision))) throw new Error('--id and integer --revision required');
           store.retire(values.id, Number(values.revision)); console.log('Knowledge retired; history preserved.');
