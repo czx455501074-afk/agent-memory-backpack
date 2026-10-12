@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { createClient, isRecordValue, isWithinProject, loadClientConfig } from './core-client.mjs'
+import { createClient, isExplicitClientRejection, isRecordValue, isWithinProject, loadClientConfig } from './core-client.mjs'
 import { createAdapterLogger } from './log.mjs'
 import { ensureCoreRunning } from './ensure-core.mjs'
 import { decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from './gate-cache.mjs'
@@ -97,7 +97,7 @@ function assertGateResponse(value) {
  * Any known state is accepted for a duplicate; a first-time submit must be
  * pending.
  */
-const PROPOSAL_STATES = ['pending', 'approved', 'rejected', 'expired']
+const PROPOSAL_STATES = ['pending', 'approved', 'rejected', 'expired', 'needs_evidence', 'archived']
 
 function assertReceipt(value, kind) {
   if (!isRecordValue(value) || typeof value.id !== 'string' || !value.id
@@ -197,6 +197,8 @@ export async function apply(ctx) {
   const checkedExecutions = new WeakMap()
   const injectedContextIds = new WeakMap()
   const warnedOutOfScope = new WeakSet()
+  const sessionTasks = new Map()
+  const replayedSessions = new Set()
   ctx.effect(() => () => client.dispose(), 'agent-memory-backpack: abort outstanding requests')
 
   const inProject = (owner) => isWithinProject(config.projectRoot, owner?.session?.header?.cwd)
@@ -237,6 +239,29 @@ export async function apply(ctx) {
     }
     if (decision.kind !== 'enter' || payload.messages.length === 0) return decision
 
+    const currentSessionId = payload?.agent?.id
+    if (currentSessionId && !replayedSessions.has(currentSessionId)) {
+      replayedSessions.add(currentSessionId)
+      try {
+        const replayRes = await client.post('/v1/outbox/replay', {
+          projectId: config.projectId,
+        }, { signal: payload.signal })
+        logger.info('outbox.replay', {
+          sessionId: currentSessionId,
+          attempted: replayRes?.attempted ?? 0,
+          delivered: Array.isArray(replayRes?.delivered) ? replayRes.delivered : [],
+          failed: Array.isArray(replayRes?.failed) ? replayRes.failed : [],
+          abandoned: Array.isArray(replayRes?.abandoned) ? replayRes.abandoned : [],
+        })
+      } catch (replayError) {
+        if (replayError?.name === 'AbortError') throw replayError
+        logger.warn('outbox.replay_failed', {
+          sessionId: currentSessionId,
+          message: replayError instanceof Error ? replayError.message : String(replayError),
+        })
+      }
+    }
+
     const contextIds = contextIdsFor(payload.agent)
     const userMessages = payload.messages.filter((message) => {
       if (contextIds.has(message.id)) {
@@ -248,15 +273,97 @@ export async function apply(ctx) {
     if (userMessages.length === 0) return decision
 
     const query = userMessages.map(textOfMessage).filter(Boolean).join('\n').slice(0, 4_000)
-    const prepared = assertPrepareResponse(await client.post('/v1/prepare', {
-      adapter: 'dsh',
-      projectId: config.projectId,
-      sessionId: payload.agent.id,
-      ...(query ? { query } : {}),
-    }, { signal: payload.signal }))
+    let rawTaskId = payload?.agent?.session?.header?.taskId
+      ?? payload?.agent?.session?.header?.task_id
+      ?? payload?.agent?.session?.taskId
+      ?? payload?.agent?.session?.task_id
+      ?? payload?.agent?.taskId
+      ?? payload?.taskId
+      ?? (payload?.agent?.id ? sessionTasks.get(payload.agent.id) : undefined)
+
+    const isContinuation = /继续|接续|恢复.*任务|继续.*工作|接上次|接着上次|resume.*task|continue.*task/i.test(query)
+    let handoffContext = ''
+    if (rawTaskId || isContinuation) {
+      try {
+        const listRes = await client.post('/v1/tasks/list', { projectId: config.projectId }, { signal: payload.signal })
+        const tasks = Array.isArray(listRes?.tasks) ? listRes.tasks : []
+        let targetTask = rawTaskId ? tasks.find(t => t.id === rawTaskId) : undefined
+        if (!targetTask && isContinuation) {
+          const candidates = tasks.filter(t => t.status === 'in_progress' || t.status === 'paused')
+          targetTask = candidates[0]
+        }
+        if (targetTask) {
+          rawTaskId = targetTask.id
+          if (payload?.agent?.id) sessionTasks.set(payload.agent.id, targetTask.id)
+          const handoff = await client.post('/v1/tasks/handoff', {
+            projectId: config.projectId, taskId: targetTask.id,
+          }, { signal: payload.signal })
+
+          const existingSessions = Array.isArray(targetTask.sessionIds) ? targetTask.sessionIds : []
+          if (payload?.agent?.id && !existingSessions.includes(payload.agent.id)) {
+            await client.post('/v1/tasks/record', {
+              projectId: config.projectId,
+              task: {
+                ...targetTask,
+                sessionIds: [...existingSessions, payload.agent.id],
+              },
+            }, { signal: payload.signal })
+          }
+
+          const unfinishedStr = Array.isArray(targetTask.unfinished) && targetTask.unfinished.length
+            ? targetTask.unfinished.join('；')
+            : '无'
+          const filesStr = Array.isArray(handoff?.files) && handoff.files.length
+            ? handoff.files.join('；')
+            : '未记录'
+          const relatedWfs = Array.isArray(handoff?.workflows) && handoff.workflows.length
+            ? handoff.workflows.map(w => w.id).join(', ')
+            : '无'
+
+          handoffContext = [
+            '[Task Handoff]',
+            `Task: ${targetTask.id} "${targetTask.title}"`,
+            `Status: ${targetTask.status}`,
+            `Knowledge: version ${handoff?.knowledgeRevision ?? 0}`,
+            `Related Workflows: ${relatedWfs}`,
+            `Important: ${unfinishedStr}`,
+            `Files: ${filesStr}`,
+            `Suggestion: ${handoff?.suggestion ?? ''}`,
+            `Caveat: ${handoff?.caveat || '接收端需重新确认文件与环境状态；本交接不迁移运行中的进程、凭据或工具权限。上面的 files 只是需要核对的清单，不代表已经核对过。'}`,
+          ].filter(Boolean).join('\n')
+
+          injectCurrentContext(payload.agent, handoffContext)
+        }
+      } catch (err) {
+        logger.warn('handoff.failed', { message: err instanceof Error ? err.message : 'failed to fetch handoff' })
+      }
+    }
+
+    if (payload?.agent?.id && rawTaskId) {
+      sessionTasks.set(payload.agent.id, String(rawTaskId))
+    }
+    let prepared
+    try {
+      prepared = assertPrepareResponse(await client.post('/v1/prepare', {
+        adapter: 'dsh',
+        projectId: config.projectId,
+        sessionId: payload.agent.id,
+        ...(rawTaskId ? { taskId: String(rawTaskId) } : {}),
+        ...(query ? { query } : {}),
+      }, { signal: payload.signal }))
+      warnedDegraded.delete(payload.agent)
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error
+      const identity = { projectId: config.projectId, endpoint: config.endpoint }
+      const snapshot = loadSnapshot(config.dataDir, identity)
+      const { mode } = operatingMode({ coreReachable: false, snapshot })
+      logger.warn('prepare.degraded', { mode, detail: snapshot?.detail ?? (error instanceof Error ? error.message : '核心不可达'), at: Date.now() })
+      warnDegradedOnce(payload.agent, mode, snapshot?.detail ?? (error instanceof Error ? error.message : '核心不可达'))
+      return decision
+    }
     revisions.set(payload.agent, prepared.knowledgeRevision)
 
-    const context = prepared.context.trim()
+    const context = [handoffContext, prepared.context.trim()].filter(Boolean).join('\n\n')
     if (!context) return decision
     const userIds = new Set(userMessages.map((message) => message.id))
     const index = decision.messages.findLastIndex((message) => userIds.has(message?.id))
@@ -280,7 +387,11 @@ export async function apply(ctx) {
         toolName: exec.name,
         ...(exec.agent && revisions.has(exec.agent) ? { knowledgeRevision: revisions.get(exec.agent) } : {}),
       }, { signal: exec.signal }))
-    } catch {
+    } catch (error) {
+      if (error?.message?.includes('protocol version mismatch') || error?.message?.includes('426')) {
+        checkedExecutions.set(exec, { decision: 'deny', reason: 'Agent Memory Backpack 协议版本不匹配（HTTP 426），已拒绝工具执行。' })
+        return { kind: 'deny', reason: 'Agent Memory Backpack 协议版本不匹配（HTTP 426），已拒绝工具执行。' }
+      }
       // The core is unreachable, which is NOT the same as "this call is denied".
       //
       // Denying here made the plugin a single point of failure: an optional
@@ -289,10 +400,11 @@ export async function apply(ctx) {
       // know was involved. The design requires degrading visibly instead, and names
       // the modes: enforce what a snapshot still knows, and otherwise step back and
       // say so rather than halting the agent.
-      const snapshot = loadSnapshot(config.dataDir)
+      const identity = { projectId: config.projectId, endpoint: config.endpoint }
+      const snapshot = loadSnapshot(config.dataDir, identity)
       const { mode } = operatingMode({ coreReachable: false, snapshot })
       if (mode === 'ReadOnlySnapshot') {
-        const decision = decideFromSnapshot(snapshot.record, exec.name)
+        const decision = decideFromSnapshot(snapshot.record, exec.name, identity)
         if (decision === 'deny') {
           checkedExecutions.set(exec, { decision: 'deny', reason: `${exec.name} 由最近一次规则快照禁止（核心当前不可达）。` })
           return { kind: 'deny', reason: `${exec.name} 由最近一次规则快照禁止（核心当前不可达）。` }
@@ -312,11 +424,14 @@ export async function apply(ctx) {
     // Recorded on every successful gate so a later outage still enforces the current
     // prohibitions. A write failure only costs the snapshot its freshness; it must
     // not fail the call that is succeeding.
+    const identity = { projectId: config.projectId, endpoint: config.endpoint }
     saveSnapshot(config.dataDir, {
+      projectId: config.projectId,
+      endpoint: config.endpoint,
       deniedTools: Array.isArray(gate.deniedTools) ? gate.deniedTools : [],
       revision: gate.knowledgeRevision,
       at: Date.now(),
-    })
+    }, identity)
     if (previousRevision !== gate.knowledgeRevision) injectCurrentContext(exec.agent, gate.context)
     checkedExecutions.set(exec, gate)
     if (gate.decision === 'deny') return { kind: 'deny', reason: gate.reason || 'Blocked by Agent Memory Backpack knowledge policy.' }
@@ -587,14 +702,53 @@ export async function apply(ctx) {
       }, required: ['idempotencyKey', 'discovery'],
     },
     async execute(args, exec) {
-      const receipt = await client.post('/v1/proposals', {
+      const proposalPayload = {
         idempotencyKey: requireString(args?.idempotencyKey, 'idempotencyKey'),
         projectId: config.projectId,
         ...(typeof args?.workflowId === 'string' ? { workflowId: args.workflowId } : {}),
         ...(Number.isSafeInteger(args?.baseRevision) && args.baseRevision >= 1 ? { baseRevision: args.baseRevision } : {}),
         discovery: requireString(args?.discovery, 'discovery'),
-      }, { signal: exec.signal })
-      return assertReceipt(receipt, 'pending')
+      }
+      try {
+        const receipt = await client.post('/v1/proposals', proposalPayload, { signal: exec.signal })
+        return assertReceipt(receipt, 'pending')
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error
+        // Deterministic 4xx rejections (400, 403, 409, 426) must not be queued
+        if (isExplicitClientRejection(error)) {
+          throw error
+        }
+        // Transport, timeout or 5xx failures: enqueue full payload into persistent outbox
+        try {
+          const enqueued = await client.post('/v1/outbox/enqueue', {
+            kind: 'candidate',
+            idempotencyKey: proposalPayload.idempotencyKey,
+            projectId: config.projectId,
+            payload: proposalPayload,
+            error: (error instanceof Error ? error.message : String(error)).slice(0, 2000),
+            attempts: 1,
+          }, { signal: exec.signal })
+          logger.info('outbox.enqueued', { kind: 'candidate', idempotencyKey: proposalPayload.idempotencyKey })
+          return assertReceipt({
+            id: enqueued?.id || proposalPayload.idempotencyKey,
+            state: 'pending',
+            duplicate: Boolean(enqueued?.duplicate),
+          }, 'pending')
+        } catch (enqueueErr) {
+          if (enqueueErr?.name === 'AbortError') throw enqueueErr
+          // When enqueue itself fails (e.g. core is completely down), do not break the host
+          logger.warn('outbox.enqueue_failed', {
+            kind: 'candidate',
+            idempotencyKey: proposalPayload.idempotencyKey,
+            message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
+          })
+          return {
+            id: proposalPayload.idempotencyKey,
+            state: 'pending',
+            duplicate: false,
+          }
+        }
+      }
     },
   }))
 
@@ -620,18 +774,57 @@ export async function apply(ctx) {
       : event.type
     if (!['turn/start', 'turn/end', 'step/start', 'step/end', 'tool/call', 'tool/result'].includes(event.type)) return
     const summary = kind === 'turn_stopped' ? 'DSH agent turn stopped.' : `DSH ${kind}`
-    void client.post('/v1/events', {
+    const rawTaskId = event?.taskId
+      ?? event?.task_id
+      ?? event?.data?.taskId
+      ?? event?.data?.task_id
+      ?? session?.header?.taskId
+      ?? session?.header?.task_id
+      ?? session?.taskId
+      ?? session?.task_id
+      ?? session?.header?.goalId
+      ?? session?.goalId
+      ?? (session?.id ? sessionTasks.get(session.id) : undefined)
+    const taskId = typeof rawTaskId === 'string' && rawTaskId.trim() ? rawTaskId.trim() : undefined
+    const eventPayload = {
       eventId: randomUUID(), adapter: 'dsh', projectId: config.projectId,
-      sessionId: session.id, kind, summary,
-    }).catch((error) => {
+      sessionId: session.id,
+      ...(taskId ? { taskId } : {}),
+      kind, summary,
+    }
+    void client.post('/v1/events', eventPayload).catch(async (error) => {
       // Event delivery must never break the turn, but a silent failure would
       // leave the diary incomplete with no way to find out why.
       if (client.isDisposed()) return
+      if (error?.name === 'AbortError') return
       logger.error('event.delivery_failed', {
         kind, sessionId: session.id,
         message: error instanceof Error ? error.message : 'unknown error',
       })
       client.warnEventFailure()
+
+      // 4xx semantic rejections should not be queued
+      if (isExplicitClientRejection(error)) return
+
+      // Transport, timeout or 5xx: enqueue full event into outbox
+      try {
+        await client.post('/v1/outbox/enqueue', {
+          kind: 'event',
+          idempotencyKey: eventPayload.eventId,
+          projectId: config.projectId,
+          payload: eventPayload,
+          error: (error instanceof Error ? error.message : String(error)).slice(0, 2000),
+          attempts: 1,
+        })
+        logger.info('outbox.enqueued', { kind: 'event', idempotencyKey: eventPayload.eventId })
+      } catch (enqueueErr) {
+        // Enqueue failure must not break the turn
+        logger.warn('outbox.enqueue_failed', {
+          kind: 'event',
+          idempotencyKey: eventPayload.eventId,
+          message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
+        })
+      }
     })
   })
 }

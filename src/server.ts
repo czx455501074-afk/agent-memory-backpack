@@ -3,7 +3,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import { Store } from './store.js';
-import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, DomainError } from './schema.js';
+import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, outboxEntrySchema, DomainError } from './schema.js';
 import { coreSchema, type CoreConfig } from './config.js';
 import { exportArchive, importArchive, inspectArchive } from './archive.js';
 import { capabilityManifest, operatingModeFromDisk } from './capabilities.js';
@@ -74,6 +74,13 @@ const ADMIN_ONLY = new Set([
   // three collection entry points the design names.
   '/v1/material/renew', '/v1/material/purge',
   '/v1/knowledge/write', '/v1/knowledge/delete',
+  // The offline queue's own management surface. Inspecting it exposes every
+  // undelivered candidate's text and every queued event's summary, and purging it
+  // destroys that text, so both belong to the human. *Enqueueing* and replaying do
+  // not: an adapter holds the item that failed, so recording it is not a
+  // management decision, and the replay only re-sends what the adapter already
+  // tried to send.
+  '/v1/outbox/list', '/v1/outbox/purge',
 ]);
 
 /**
@@ -134,7 +141,27 @@ export function createCoreServer(store: Store, config: CoreConfig) {
       if (req.headers['x-amb-protocol'] !== '1') throw new DomainError('protocol_mismatch', 'Unsupported or missing protocol version', 426);
       const role = principal.role;
       const body = await readBody(req);
-      const envelope = z.object({ projectId: z.string(), adapter: z.string().optional() }).passthrough().parse(body);
+      /**
+       * The management page's identity bootstrap.
+       *
+       * The page holds a credential but does not know which project that
+       * credential belongs to, and it must not be told by the URL or ask the user:
+       * either would let a caller name a project it has no credential for. Asking
+       * the core is the only sound way, so `/v1/stats` answers for the credential's
+       * own project when the envelope omits `projectId`.
+       *
+       * This is not a relaxation of the scope rule below. A request that *does*
+       * name a project is still checked against the credential exactly as before —
+       * naming someone else's project is still a 403. Only this one read-only
+       * endpoint may omit the envelope, and its answer is derived from the
+       * credential rather than from anything the caller supplied.
+       */
+      const bootstrapIdentity = req.url === '/v1/stats'
+        && (body === null || typeof body !== 'object' || !('projectId' in (body as Record<string, unknown>)));
+      const envelope = z.object({
+        projectId: bootstrapIdentity ? z.string().default(principal.projectId) : z.string(),
+        adapter: z.string().optional(),
+      }).passthrough().parse(body);
       if (envelope.projectId !== principal.projectId || (envelope.adapter && envelope.adapter !== principal.id))
         throw new DomainError('scope_denied', 'Credential cannot access that project or adapter identity', 403);
       // Role check before the handler runs, so a management endpoint cannot be
@@ -143,12 +170,75 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         throw new DomainError('forbidden', ADMIN_ONLY_HINT, 403);
       store.cleanup();
       switch (req.url) {
-        case '/v1/prepare': { const p = contextSchema.parse(body); return reply(res, 200, store.prepare(p.projectId, p.query, { sessionId: p.sessionId, taskId: p.taskId })); }
+        case '/v1/prepare': {
+          const p = contextSchema.parse(body);
+          return reply(res, 200, store.prepare(p.projectId, p.query, {
+            sessionId: p.sessionId, taskId: p.taskId, platform: p.adapter,
+          }));
+        }
         case '/v1/search': { const p = contextSchema.parse(body); return reply(res, 200, { workflows: store.search(p.projectId, p.query), knowledgeRevision: store.revision }); }
         case '/v1/expand': { const p = expandSchema.parse(body); return reply(res, 200, store.expand(p.projectId, p.workflowId, p.stageId)); }
-        case '/v1/gate': { const p = gateSchema.parse(body); return reply(res, 200, store.gate(p.projectId, p.toolName)); }
+        case '/v1/gate': {
+          const p = gateSchema.parse(body);
+          // The task id and the host identity travel with the check: "这一次用 Banana"
+          // is a rule for one task, and a host-specific rule must not reach the other
+          // host's session. Passing only the tool name made both dimensions inert.
+          return reply(res, 200, store.gate(p.projectId, p.toolName, {
+            taskId: p.taskId, platform: p.adapter, knownRevision: p.knowledgeRevision,
+          }));
+        }
         case '/v1/proposals': { const p = proposalSchema.parse(body); return reply(res, 200, store.submit(principal.id, p)); }
         case '/v1/events': { const p = eventSchema.parse(body); return reply(res, 200, store.event(principal.id, p)); }
+        /**
+         * The offline queue.
+         *
+         * A candidate or event that fails on the way to the core is recorded here
+         * by the adapter that produced it, and the same table lets the adapter try
+         * again later. The replay goes back through the ordinary submission path,
+         * so an item that actually arrived before the transport error is recognised
+         * by its idempotency key as a duplicate rather than stored twice.
+         *
+         * Replay is open to adapters because it can only deliver work the adapter
+         * itself already attempted; listing and purging are admin-only because they
+         * expose or destroy text that has not been delivered.
+         */
+        case '/v1/outbox/enqueue': {
+          // The body's own projectId is already part of the entry schema, and the
+          // envelope check above has confirmed it is the credential's project.
+          const p = outboxEntrySchema.parse(body);
+          const result = store.enqueue(principal.id, p);
+          return reply(res, 200, {
+            ...result,
+            note: result.duplicate
+              ? '该幂等键已在队列中，未重复入队。'
+              : '已写入持久队列；核心可达时可重放，重放走原幂等键，不会重复写入。',
+          });
+        }
+        case '/v1/outbox/replay': {
+          const p = z.object({
+            projectId: z.string(), limit: z.number().int().positive().max(200).optional(),
+            force: z.boolean().default(false),
+          }).parse(body);
+          const result = store.replayOutbox({ projectId: p.projectId, limit: p.limit, force: p.force });
+          return reply(res, 200, {
+            ...result,
+            note: '重放走原有幂等路径：已送达的条目会被识别为 duplicate，不产生第二条。',
+          });
+        }
+        case '/v1/outbox/list': {
+          const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(500).optional() }).parse(body);
+          return reply(res, 200, store.outboxStatus(p.projectId, p.limit));
+        }
+        case '/v1/outbox/purge': {
+          const p = z.object({ projectId: z.string(), includePending: z.boolean().default(false) }).parse(body);
+          const result = store.purgeOutbox({ projectId: p.projectId, includePending: p.includePending });
+          return reply(res, 200, {
+            ...result,
+            note: p.includePending
+              ? '已连同未送达条目一并清除；discarded 列出被丢弃的内容，这是明确决定而非静默删除。'
+              : '只清除了已送达或已放弃的条目；未送达条目仍在队列中。',
+          });
+        }
         case '/v1/proposals/list': { const p = z.object({ projectId: z.string(), state: z.string().optional() }).parse(body); return reply(res, 200, { proposals: store.listProposals(p.projectId, p.state) }); }
         // Approval carries the reviewer-supplied structured entry; the discovery text is never promoted as-is.
         // `allowGlobalScope` must be stated explicitly, because promoting a
@@ -158,9 +248,9 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             projectId: z.string(), id: z.string(), entry: knowledgeSchema,
             allowGlobalScope: z.boolean().default(false),
           }).parse(body);
-          return reply(res, 200, { knowledgeRevision: store.approveProposal(p.id, p.entry, { allowGlobalScope: p.allowGlobalScope }) });
+          return reply(res, 200, { knowledgeRevision: store.approveProposal(p.id, p.entry, { allowGlobalScope: p.allowGlobalScope, actor: principal.id, projectId: p.projectId }) });
         }
-        case '/v1/proposals/reject': { const p = z.object({ projectId: z.string(), id: z.string() }).parse(body); store.rejectProposal(p.id); return reply(res, 200, { state: 'rejected' }); }
+        case '/v1/proposals/reject': { const p = z.object({ projectId: z.string(), id: z.string(), reason: z.string().max(500).optional() }).parse(body); store.rejectProposal(p.id, { reason: p.reason, actor: principal.id, projectId: p.projectId }); return reply(res, 200, { state: 'rejected' }); }
         /**
          * The rest of the review lifecycle, admin-only like the endpoints above.
          *
@@ -171,7 +261,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
          */
         case '/v1/proposals/request-evidence': {
           const p = z.object({ projectId: z.string(), id: z.string(), reason: z.string().min(1).max(500) }).parse(body);
-          const result = store.requestEvidence(p.id, p.reason);
+          const result = store.requestEvidence(p.id, p.reason, { actor: principal.id, projectId: p.projectId });
           return reply(res, 200, {
             ...result,
             note: '该候选未判定真假：缺证据既不该批准，也不该当成假的丢掉。到期未补证会自动归档。',
@@ -179,7 +269,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         }
         case '/v1/proposals/archive': {
           const p = z.object({ projectId: z.string(), id: z.string() }).parse(body);
-          store.archiveProposal(p.id);
+          store.archiveProposal(p.id, { projectId: p.projectId });
           return reply(res, 200, { state: 'archived', note: '已移出待办队列，记录仍可查阅。' });
         }
         case '/v1/proposals/batch': {
@@ -216,13 +306,23 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         }
         case '/v1/history/recent': {
           const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body);
-          return reply(res, 200, { history: store.supersessions().slice(0, p.limit ?? 50) });
+          // Scoped to the caller's project: an unscoped ledger handed one project
+          // another project's entry titles plus the reason and evidence text of its
+          // replacements — precisely the material scope exists to protect.
+          return reply(res, 200, { history: store.supersessions(undefined, p.projectId).slice(0, p.limit ?? 50) });
         }
         case '/v1/knowledge/read': { const p = z.object({ projectId: z.string(), knowledgeId: z.string(), includeLeaves: z.boolean().optional() }).parse(body); return reply(res, 200, store.readKnowledge(p.projectId, p.knowledgeId, p.includeLeaves ?? false)); }
         // The caller's own projectId is echoed back so a UI can label what it is
         // showing. It is not a disclosure: the request already had to name it, and
-        // it is the credential's own project rather than anyone else's.
-        case '/v1/stats': { const p = z.object({ projectId: z.string() }).parse(body); return reply(res, 200, { projectId: p.projectId, ...store.stats() }); }
+        // it is the credential's own project rather than anyone else's. `role` is
+        // included for the same reason — the page must know whether this credential
+        // may review, and reading it from the credential is better than the page
+        // guessing and offering buttons that will be refused.
+        //
+        // The already-validated envelope is the source, not a re-parse of the raw
+        // body: on the bootstrap path the body carries no `projectId` at all, and
+        // parsing it again demanded the very field that was deliberately optional.
+        case '/v1/stats': { const p = z.object({ projectId: z.string().default(envelope.projectId) }).parse(body); return reply(res, 200, { projectId: p.projectId, role: principal.role, ...store.stats() }); }
         // Rescan cadence: an adapter asks whether a scan is due instead of
         // rescanning on every session start.
         case '/v1/rescan/state': { const p = z.object({ projectId: z.string(), at: z.number().int().optional() }).parse(body); const state = store.rescanState(); return reply(res, 200, { ...state, due: store.rescanDue(p.at) }); }
@@ -238,7 +338,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           }).parse(body);
           return reply(res, 200, store.supersede({ ...p, origin: 'agent', projectId: p.projectId }));
         }
-        case '/v1/knowledge/history': { const p = z.object({ projectId: z.string(), knowledgeId: z.string() }).parse(body); return reply(res, 200, store.history(p.knowledgeId)); }
+        case '/v1/knowledge/history': { const p = z.object({ projectId: z.string(), knowledgeId: z.string() }).parse(body); return reply(res, 200, store.history(p.knowledgeId, p.projectId)); }
         // Structuring: the caller supplies the authored workflow; nothing is
         // inferred from the adopted Markdown.
         case '/v1/knowledge/structure': {
@@ -249,7 +349,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           }).parse(body);
           return reply(res, 200, store.structureSkill({ skillId: p.skillId, workflow: p.workflow, derivedBy: p.derivedBy, evidence: p.evidence, projectId: p.projectId }));
         }
-        case '/v1/knowledge/unstructured': { const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body); return reply(res, 200, { skills: store.unstructuredSkills(p.limit) }); }
+        case '/v1/knowledge/unstructured': { const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body); return reply(res, 200, { skills: store.unstructuredSkills(p.projectId, p.limit) }); }
         case '/v1/knowledge/search-universal': {
           const p = z.object({ projectId: z.string(), query: z.string().optional().default(''), kind: z.string().optional(), limit: z.number().int().positive().max(200).optional() }).parse(body);
           return reply(res, 200, { results: store.searchUniversal(p.projectId, p.query, p.kind, p.limit), knowledgeRevision: store.revision });
@@ -260,6 +360,16 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         }
         case '/v1/knowledge/write': {
           const p = z.object({ projectId: z.string(), entry: knowledgeSchema }).parse(body);
+          // The envelope's projectId is checked against the credential above, but
+          // nothing inspected the *entry* being written. A credential for one
+          // project could therefore write an entry scoped to another, or widen one
+          // to global, which applies it everywhere — the escalation the plan
+          // reserves for an explicit user decision.
+          const scope = p.entry.scope;
+          if (scope.kind === 'global' && principal.role !== 'admin')
+            throw new DomainError('scope_denied', 'Only an explicit admin decision may write a global entry', 403);
+          if (scope.kind !== 'global' && scope.projectId !== p.projectId)
+            throw new DomainError('scope_denied', 'The entry is scoped to a different project', 403);
           const rev = store.import([p.entry]);
           return reply(res, 200, { success: true, id: p.entry.id, knowledgeRevision: rev, note: '条目已保存并生效。' });
         }
@@ -287,12 +397,36 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             taskId: z.string().min(1).max(120).optional(),
             provenance: z.enum(['user', 'external', 'agent']).optional(),
           }).parse(body);
-          const byAdapter = principal.role !== 'admin';
+          const isAdmin = principal.role === 'admin';
+          /**
+           * The linked task must belong to the recording project.
+           *
+           * The design (§8) lists 关联任务 as one of the fields a piece of material
+           * records, and attribution is exactly what F04 established for events:
+           * accepting another project's task id lets one project's credential point
+           * its data at a task it has no claim to, and that task's diary and export
+           * are the records which then go wrong.
+           *
+           * The lookup is scoped to the caller's own project, so a foreign or
+           * unknown id is refused with the same 404 — deliberately not
+           * distinguished. Answering "that id exists, but not for you" would let a
+           * credential probe another project's task ids, which is the disclosure
+           * the scope rule exists to prevent and the same reason `getKnowledge`
+           * answers 404 across projects.
+           */
+          if (p.taskId !== undefined && !store.getTask(p.taskId, p.projectId))
+            throw new DomainError('not_found', `Task ${p.taskId} is unavailable`, 404);
           const result = store.saveMaterial({
             ...p,
-            // An agent-recorded page is external material by definition: the design
-            // forbids page prose from acquiring the user's authority.
-            provenance: p.provenance ?? (byAdapter ? 'external' : 'user'),
+            // Scope and provenance are decided by the caller's *identity*, never by
+            // the request body. An adapter records material for its own project —
+            // a project's short-lived reference must not become readable by every
+            // other project — and a page it fetched is external prose by definition,
+            // so it can never claim the user's authority. Only the human's admin
+            // credential may record a global item or label it `user`.
+            scope: isAdmin ? { kind: 'global' } : { kind: 'project', projectId: p.projectId },
+            taskId: p.taskId,
+            provenance: isAdmin ? (p.provenance ?? 'user') : 'external',
             body: p.body ?? '',
           });
           return reply(res, 200, {
@@ -304,11 +438,13 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         }
         case '/v1/material/list': {
           const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body);
-          return reply(res, 200, { material: store.liveMaterial(p.limit), stats: store.materialStats() });
+          // Only the caller's own project's material is listed: a project's
+          // temporary references are not another project's business.
+          return reply(res, 200, { material: store.liveMaterial(p.projectId, p.limit), stats: store.materialStats() });
         }
         case '/v1/material/renew': {
           const p = z.object({ projectId: z.string(), id: z.string().min(1).max(120), reason: z.string().min(1).max(500) }).parse(body);
-          const result = store.renewMaterial(p.id, p.reason);
+          const result = store.renewMaterial(p.id, p.reason, p.projectId);
           return reply(res, 200, { ...result, note: '已按明确理由续期；普通读取不会延长资料期限。' });
         }
         case '/v1/material/purge': {
@@ -347,6 +483,28 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         case '/v1/tasks/record': { const p = z.object({ projectId: z.string(), task: taskSchema }).parse(body); return reply(res, 200, store.recordTask(p.projectId, p.task)); }
         case '/v1/tasks/list': { const p = z.object({ projectId: z.string(), status: taskStatus.optional() }).parse(body); return reply(res, 200, { tasks: store.tasks(p.projectId, p.status) }); }
         case '/v1/tasks/handoff': { const p = z.object({ projectId: z.string(), taskId: z.string() }).parse(body); return reply(res, 200, store.handoff(p.taskId, p.projectId)); }
+        /**
+         * Compare a checkout's file states against what a task recorded.
+         *
+         * Acceptance 16: continuing in a *different* checkout must show how the files
+         * differ rather than assume the other end's edits are present. The receiving
+         * end supplies what it observes; the core answers `same` / `different` /
+         * `unknown` per path and never infers "unchanged" from a matching name.
+         */
+        case '/v1/tasks/compare': {
+          const p = z.object({
+            projectId: z.string(), taskId: z.string().min(1).max(120),
+            observed: z.array(z.object({
+              path: z.string().min(1).max(1000),
+              digest: z.string().trim().min(1).max(128).optional(),
+              size: z.number().int().nonnegative().optional(),
+            }).strict()).max(200),
+          }).parse(body);
+          return reply(res, 200, {
+            ...store.compareFileStates(p.taskId, p.projectId, p.observed),
+            note: 'unknown 表示该文件在发送端或接收端缺状态记录，不能视为未变化；different 表示本地可能落后或已被改动。',
+          });
+        }
         /**
          * Migration: write every authority row into one portable file, read one
          * back, or merge one in.

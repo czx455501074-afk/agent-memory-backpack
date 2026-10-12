@@ -1,0 +1,242 @@
+{
+  "metadata": {
+    "measuredAt": "2026-10-11T12:23:35.416Z",
+    "nodeVersion": "v24.19.0",
+    "platform": "win32",
+    "architecture": "x64",
+    "environmentNote": "Isolated in-memory Store instance with fixed clock; hot Node process; synthetic fixture data."
+  },
+  "disclaimer": {
+    "notProductionSla": "These readings reflect isolated micro-benchmarks on an in-memory Store fixture, not an end-to-end production SLA over real network/host IPC.",
+    "noABNetBenefitProof": "This measurement quantifies isolated latency and context length bounds; it does NOT constitute an A/B benchmark against a no-plugin baseline, and does NOT prove net task efficiency gain."
+  },
+  "scales": [
+    {
+      "scale": 0,
+      "gate": {
+        "n": 40,
+        "medianMs": 0.016,
+        "p95Ms": 0.033,
+        "minMs": 0.013,
+        "maxMs": 0.035
+      },
+      "prepare": {
+        "n": 20,
+        "medianMs": 0.101,
+        "p95Ms": 0.162,
+        "minMs": 0.076,
+        "maxMs": 0.173
+      },
+      "searchUniversal": {
+        "n": 15,
+        "medianMs": 0.029,
+        "p95Ms": 0.054,
+        "minMs": 0.026,
+        "maxMs": 0.054
+      },
+      "contextChars": 97,
+      "knowledgeHitCount": 0,
+      "processRssBytes": 64851968,
+      "comparisonWithAudit": {
+        "gateMedian": {
+          "audit": 0.018,
+          "current": 0.016
+        },
+        "gateP95": {
+          "audit": 0.026,
+          "current": 0.033
+        },
+        "prepareMedian": {
+          "audit": 0.091,
+          "current": 0.101
+        },
+        "prepareP95": {
+          "audit": 0.143,
+          "current": 0.162
+        },
+        "universalP95": {
+          "audit": 0.084,
+          "current": 0.054
+        }
+      }
+    },
+    {
+      "scale": 100,
+      "gate": {
+        "n": 40,
+        "medianMs": 0.916,
+        "p95Ms": 1.23,
+        "minMs": 0.834,
+        "maxMs": 1.427
+      },
+      "prepare": {
+        "n": 20,
+        "medianMs": 3.193,
+        "p95Ms": 6.178,
+        "minMs": 2.812,
+        "maxMs": 6.78
+      },
+      "searchUniversal": {
+        "n": 15,
+        "medianMs": 1.035,
+        "p95Ms": 1.309,
+        "minMs": 0.974,
+        "maxMs": 1.309
+      },
+      "contextChars": 2490,
+      "knowledgeHitCount": 5,
+      "processRssBytes": 80101376,
+      "comparisonWithAudit": {
+        "gateMedian": {
+          "audit": 0.959,
+          "current": 0.916
+        },
+        "gateP95": {
+          "audit": 1.818,
+          "current": 1.23
+        },
+        "prepareMedian": {
+          "audit": 2.872,
+          "current": 3.193
+        },
+        "prepareP95": {
+          "audit": 3.595,
+          "current": 6.178
+        },
+        "universalP95": {
+          "audit": 1.638,
+          "current": 1.309
+        }
+      }
+    },
+    {
+      "scale": 1000,
+      "gate": {
+        "n": 40,
+        "medianMs": 8.381,
+        "p95Ms": 10.271,
+        "minMs": 8.013,
+        "maxMs": 10.739
+      },
+      "prepare": {
+        "n": 20,
+        "medianMs": 25.984,
+        "p95Ms": 26.376,
+        "minMs": 25.599,
+        "maxMs": 26.615
+      },
+      "searchUniversal": {
+        "n": 15,
+        "medianMs": 9.639,
+        "p95Ms": 10.379,
+        "minMs": 9.035,
+        "maxMs": 10.379
+      },
+      "contextChars": 2491,
+      "knowledgeHitCount": 5,
+      "processRssBytes": 209903616,
+      "comparisonWithAudit": {
+        "gateMedian": {
+          "audit": 8.796,
+          "current": 8.381
+        },
+        "gateP95": {
+          "audit": 10.747,
+          "current": 10.271
+        },
+        "prepareMedian": {
+          "audit": 26.324,
+          "current": 25.984
+        },
+        "prepareP95": {
+          "audit": 27.564,
+          "current": 26.376
+        },
+        "universalP95": {
+          "audit": 10.603,
+          "current": 10.379
+        }
+      }
+    },
+    {
+      "scale": 5000,
+      "gate": {
+        "n": 40,
+        "medianMs": 44.512,
+        "p95Ms": 45.918,
+        "minMs": 42.997,
+        "maxMs": 48.147
+      },
+      "prepare": {
+        "n": 20,
+        "medianMs": 137.299,
+        "p95Ms": 151.65,
+        "minMs": 133.309,
+        "maxMs": 151.722
+      },
+      "searchUniversal": {
+        "n": 15,
+        "medianMs": 51.877,
+        "p95Ms": 55.942,
+        "minMs": 49.016,
+        "maxMs": 55.942
+      },
+      "contextChars": 2491,
+      "knowledgeHitCount": 5,
+      "processRssBytes": 366071808,
+      "comparisonWithAudit": {
+        "gateMedian": {
+          "audit": 45.876,
+          "current": 44.512
+        },
+        "gateP95": {
+          "audit": 52.177,
+          "current": 45.918
+        },
+        "prepareMedian": {
+          "audit": 137.508,
+          "current": 137.299
+        },
+        "prepareP95": {
+          "audit": 145.503,
+          "current": 151.65
+        },
+        "universalP95": {
+          "audit": 64.159,
+          "current": 55.942
+        }
+      }
+    }
+  ],
+  "context": {
+    "fewNorms": {
+      "normCount": 2,
+      "prepareContextLength": 326,
+      "gateContextLength": 230,
+      "budget": {
+        "limitChars": 12000,
+        "usedChars": 351,
+        "omittedCount": 0,
+        "injectedCount": 2
+      }
+    },
+    "nearLimit40Norms": {
+      "normCount": 40,
+      "prepareContextLength": 12716,
+      "gateContextLength": 480909,
+      "budget": {
+        "limitChars": 12000,
+        "usedChars": 12080,
+        "omittedCount": 39,
+        "injectedCount": 1
+      },
+      "comparisonWithAudit": {
+        "auditPrepareChars": 480687,
+        "currentPrepareChars": 12716,
+        "auditGateChars": 480629,
+        "currentGateChars": 480909,
+        "reductionPercent": 97.35
+      }
+    }
+  }
+}

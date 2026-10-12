@@ -39,6 +39,18 @@ const RULES = [
   [/[A-Za-z]:[\\/]{1,2}Users[\\/]{1,2}[^\\/\s"'`,;)\]}]+/g, '<USER_HOME>'],
   // POSIX home paths, but not the tail of a URL.
   [/(?<![\w:])\/(?:home|Users)\/[^\\/\s"'`,;)\]}]+/g, '<USER_HOME>'],
+  // A host's plugin toolchain. This is where the running host keeps installed
+  // plugins on one machine, so it names a local layout and nothing a reader can
+  // use — the published project only needs to say "the host's plugin directory".
+  // The plugins-directory segment is replaced on its own rather than only as the
+  // tail of a drive path, because the audit reports quote it without the drive
+  // letter on the line that names the running copy.
+  //
+  // The trailing part is optional and greedy up to a delimiter: the path appears
+  // both as `<drive>:/harness/toolchains/<dir>` and as a bare `<drive>:/harness`,
+  // and requiring a following segment left the bare form untouched.
+  [/[A-Za-z]:[\\/]{1,2}harness(?:[\\/]{1,2}[^\s"'`,;)\]}>]*)?/gi, '<HOST_PLUGIN_ROOT>'],
+  [new RegExp(['DeepSeek', 'Harness', 'plugins'].join('-'), 'g'), '<HOST_PLUGINS_DIR>'],
 ];
 
 const TEXT = new Set(['.md', '.json', '.ts', '.mjs', '.cjs', '.js', '.yml', '.yaml', '.txt']);

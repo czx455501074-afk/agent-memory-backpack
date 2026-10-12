@@ -154,6 +154,10 @@ var tabs = document.getElementById('tabs');
 var token = decodeURIComponent((location.hash || '').replace(/^#/, ''));
 if (location.hash) history.replaceState(null, '', location.pathname);
 
+var currentProject = '';
+var currentRole = '';
+var currentEditingEntry = null;
+
 function esc(value) {
   return String(value == null ? '' : value)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -165,18 +169,33 @@ function notice(message, info) {
 function empty(message) { return '<div class="empty">' + esc(message) + '</div>'; }
 
 function getProject() {
-  return document.getElementById('t-project').textContent.trim() || 'p0';
+  return currentProject || '';
 }
 
 function post(path, body) {
-  var envelope = Object.assign({ projectId: getProject() }, body || {});
+  var envelope = Object.assign({}, body || {});
+  // Use the verified caller project identity when established.
+  if (currentProject && !envelope.projectId) {
+    envelope.projectId = currentProject;
+  }
   return fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token, 'x-amb-protocol': '1' },
     body: JSON.stringify(envelope),
   }).then(function (response) {
     return response.json().catch(function () { return {}; }).then(function (data) {
-      if (!response.ok) throw new Error(data.message || ('HTTP ' + response.status));
+      if (!response.ok) {
+        var err = new Error(data.message || ('HTTP ' + response.status));
+        err.status = response.status;
+        err.code = data.code;
+        // Scope and access control errors are surfaced explicitly rather than as generic noise
+        if (response.status === 403 && (data.code === 'scope_denied' || /scope|project|credential/i.test(data.message || ''))) {
+          err.friendlyMessage = '该条目属于其他项目，不可访问（权限拒绝）';
+        } else if (response.status === 404) {
+          err.friendlyMessage = '该条目不存在或属于其他项目，不可访问';
+        }
+        throw err;
+      }
       return data;
     });
   });
@@ -194,15 +213,37 @@ function metrics(pairs) {
   }).join('') + '</div>';
 }
 
+function ensureIdentity() {
+  if (currentProject) return Promise.resolve(currentProject);
+  return post('/v1/stats', {}).then(function (s) {
+    if (s.projectId) {
+      currentProject = s.projectId;
+      var pNode = document.getElementById('t-project');
+      if (pNode) pNode.textContent = currentProject;
+    }
+    if (s.role) currentRole = s.role;
+    return currentProject;
+  });
+}
+
 function renderStatus() {
-  return Promise.all([
-    post('/v1/stats'),
-    post('/v1/rescan/state'),
-    post('/v1/material/list', { limit: 1 }).catch(function () { return { material: [], stats: {} }; })
-  ]).then(function (out) {
+  return post('/v1/stats').then(function (s) {
+    if (s.projectId) {
+      currentProject = s.projectId;
+      var pNode = document.getElementById('t-project');
+      if (pNode) pNode.textContent = currentProject;
+    }
+    if (s.role) currentRole = s.role;
+    var revNode = document.getElementById('t-revision');
+    if (revNode) revNode.textContent = String(s.knowledgeRevision);
+
+    return Promise.all([
+      Promise.resolve(s),
+      post('/v1/rescan/state').catch(function () { return {}; }),
+      post('/v1/material/list', { limit: 1 }).catch(function () { return { material: [], stats: {} }; })
+    ]);
+  }).then(function (out) {
     var s = out[0], r = out[1], m = out[2];
-    document.getElementById('t-project').textContent = s.projectId || '—';
-    document.getElementById('t-revision').textContent = String(s.knowledgeRevision);
     var matStats = m.stats || {};
     panel.innerHTML = metrics([
       ['生效条目', s.entries],
@@ -255,10 +296,18 @@ function renderManage(searchQuery, kindFilter) {
       table = '<table><thead><tr><th>ID / 标题</th><th>类型</th><th>版本</th><th>作用范围</th><th>摘要预览</th><th>操作</th></tr></thead><tbody>' +
         items.map(function (item) {
           var sc = item.scope ? (item.scope.kind === 'global' ? '全局' : ('项目: ' + (item.scope.projectId || '当前'))) : '—';
+          var pills = '<span class="pill pill--ok">' + esc(item.kind) + '</span>';
+          if (item.kind === 'workflow' && item.isEntryPoint) {
+            pills += ' <span class="pill pill--ok">EntryPoint</span>';
+          }
+          var extraMeta = [];
+          if (item.platforms && item.platforms.length) {
+            extraMeta.push('平台: ' + item.platforms.join('/'));
+          }
           return '<tr><td><div><strong>' + esc(item.title) + '</strong></div><div class="card__path">' + esc(item.id) + '</div></td>' +
-            '<td><span class="pill pill--ok">' + esc(item.kind) + '</span></td>' +
+            '<td>' + pills + '</td>' +
             '<td><code>v' + esc(item.revision) + '</code></td>' +
-            '<td>' + esc(sc) + '</td>' +
+            '<td>' + esc(sc) + (extraMeta.length ? '<div class="card__meta">' + esc(extraMeta.join(' | ')) + '</div>' : '') + '</td>' +
             '<td>' + esc(item.excerpt) + (item.why && item.why.matched ? '<div class="card__path">命中: ' + esc(item.why.matched.join(',')) + '</div>' : '') + '</td>' +
             '<td><div class="card__actions" style="margin:0;">' +
             '<button class="ghost btn-sm u-edit-btn" data-id="' + esc(item.id) + '">编辑修改</button>' +
@@ -275,13 +324,24 @@ function showEditor(entryToEdit) {
   var container = document.getElementById('u-editor-container');
   if (!container) return;
   var isEdit = Boolean(entryToEdit);
-  var raw = entryToEdit ? (entryToEdit.rawContent || {}) : {};
+  currentEditingEntry = isEdit ? entryToEdit : null;
+  var raw = entryToEdit ? (entryToEdit.rawContent || entryToEdit.content || {}) : {};
   var id = entryToEdit ? entryToEdit.id : ('k-' + Date.now().toString(36));
   var title = raw.title || '';
   var kind = raw.kind || 'memory';
   var body = raw.body !== undefined ? raw.body : (raw.overview !== undefined ? raw.overview : (raw.did !== undefined ? raw.did : ''));
   var scopeKind = raw.scope && raw.scope.kind === 'global' ? 'global' : 'project';
-  var baseRevision = entryToEdit ? entryToEdit.revision : 0;
+  var baseRevision = entryToEdit ? (entryToEdit.revision || 0) : 0;
+
+  var allKinds = [
+    ['memory', '记忆 (memory)'],
+    ['norm', '规范 (norm)'],
+    ['preference', '偏好 (preference)'],
+    ['skill', '技能 (skill)'],
+    ['journal', '日记 (journal)'],
+    ['workflow', '流程 (workflow)'],
+    ['material', '临时资料 (material)'],
+  ];
 
   container.innerHTML = '<div class="editor-card">' +
     '<div class="card__head" style="margin-bottom:12px;">' +
@@ -293,10 +353,9 @@ function showEditor(entryToEdit) {
     '<input type="text" id="ed-id" value="' + esc(id) + '"' + (isEdit ? ' readonly style="opacity:0.7;"' : '') + ' style="width:100%;"></div>' +
     '<div class="form-group"><label>内容类型 (Kind)</label>' +
     '<select id="ed-kind" class="select" style="width:100%;"' + (isEdit ? ' disabled' : '') + '>' +
-    '<option value="memory"' + (kind === 'memory' ? ' selected' : '') + '>记忆 (memory)</option>' +
-    '<option value="norm"' + (kind === 'norm' ? ' selected' : '') + '>规范 (norm)</option>' +
-    '<option value="preference"' + (kind === 'preference' ? ' selected' : '') + '>偏好 (preference)</option>' +
-    '<option value="skill"' + (kind === 'skill' ? ' selected' : '') + '>技能 (skill)</option>' +
+    allKinds.map(function (k) {
+      return '<option value="' + esc(k[0]) + '"' + (kind === k[0] ? ' selected' : '') + '>' + esc(k[1]) + '</option>';
+    }).join('') +
     '</select></div>' +
     '</div>' +
     '<div class="grid-2">' +
@@ -308,7 +367,7 @@ function showEditor(entryToEdit) {
     '<option value="global"' + (scopeKind === 'global' ? ' selected' : '') + '>全局共享</option>' +
     '</select></div>' +
     '</div>' +
-    '<div class="form-group"><label>正文内容</label>' +
+    '<div class="form-group"><label>正文内容' + (isEdit && kind === 'workflow' ? ' (流程概述)' : (isEdit && kind === 'journal' ? ' (工作摘要)' : '')) + '</label>' +
     '<textarea id="ed-body" rows="6" placeholder="输入完整的知识或规则正文…">' + esc(body) + '</textarea></div>' +
     '<div class="card__actions">' +
     '<button class="primary" id="u-editor-save" data-edit="' + (isEdit ? '1' : '0') + '" data-baserev="' + esc(baseRevision) + '">保存生效</button>' +
@@ -462,9 +521,11 @@ function renderMaterial() {
   return post('/v1/material/list', { limit: 100 }).then(function (data) {
     var items = data.material || [];
     var stats = data.stats || {};
+    var totalChars = items.reduce(function (sum, m) { return sum + (m.body ? m.body.length : 0); }, 0);
     var head = metrics([
       ['生效中资料', items.length],
       ['已到期未清理', stats.expiredUnpurged || 0],
+      ['占用总大小', totalChars + ' 字符'],
       ['到期保留期', '90 天']
     ]) +
       '<div class="toolbar">' +
@@ -478,17 +539,20 @@ function renderMaterial() {
       return;
     }
 
-    var table = '<table><thead><tr><th>标题 / 来源</th><th>摘要</th><th>录入来源</th><th>到期日期</th><th>操作</th></tr></thead><tbody>' +
+    var table = '<table><thead><tr><th>标题 / 来源</th><th>摘要与大小</th><th>录入来源</th><th>到期与正文状态</th><th>操作</th></tr></thead><tbody>' +
       items.map(function (mat) {
         var daysLeft = Math.ceil((mat.expiresAt - Date.now()) / 86400000);
         var statePill = daysLeft > 0
           ? '<span class="pill pill--ok">生效中 (' + daysLeft + '天)</span>'
           : '<span class="pill pill--fail">已过期</span>';
+        var bodyStatus = (mat.body && mat.body.length > 0)
+          ? '<span class="pill pill--warn">正文保留 (' + mat.body.length + ' 字符)</span>'
+          : '<span class="pill pill--ok">正文已清空</span>';
         return '<tr><td><div><strong>' + esc(mat.title) + '</strong></div>' +
           '<div class="card__path">' + esc(mat.url) + '</div></td>' +
-          '<td>' + esc(mat.summary || '—') + '</td>' +
+          '<td>' + esc(mat.summary || '—') + '<div class="card__meta">正文大小: ' + (mat.body ? mat.body.length + ' 字符' : '0') + '</div></td>' +
           '<td><span class="pill pill--skip">' + esc(mat.provenance) + '</span></td>' +
-          '<td><div>' + esc(new Date(mat.expiresAt).toLocaleDateString()) + '</div>' + statePill + '</td>' +
+          '<td><div>' + esc(new Date(mat.expiresAt).toLocaleDateString()) + '</div>' + statePill + ' ' + bodyStatus + '</td>' +
           '<td><button class="ghost btn-sm material-renew" data-id="' + esc(mat.id) + '">延长90天</button></td></tr>';
       }).join('') + '</tbody></table>';
 
@@ -530,7 +594,10 @@ function renderHistory() {
 function renderDoctor() {
   return Promise.all([
     post('/v1/stats'),
-    post('/v1/capabilities').catch(function () { return { adapters: [], mode: 'Managed', detail: '核心运行中' }; })
+    post('/v1/capabilities').catch(function () {
+      // Capability check failure must never report Managed; fall back honestly to Ungoverned
+      return { adapters: [], mode: 'Ungoverned', detail: '核心能力接口不可达或调用失败，状态降级为未受规则约束' };
+    })
   ]).then(function (out) {
     var s = out[0], cap = out[1];
     var modePill = cap.mode === 'Managed' ? '<span class="pill pill--ok">Managed (受控管理)</span>'
@@ -546,7 +613,7 @@ function renderDoctor() {
       };
       return '<div class="card">' +
         '<div class="card__head"><span class="card__title">' + esc(ad.id.toUpperCase()) + ' 适配器</span>' +
-        (ad.installed ? '<span class="pill pill--ok">已安装 v' + esc(ad.version) + '</span>' : '<span class="pill pill--skip">未安装</span>') +
+        (ad.installed ? '<span class="pill pill--ok">已安装 v' + esc(ad.version) + '</span>' : '<span class="pill pill--warn">未安装或未找到清单</span>') +
         '</div>' +
         '<div class="card__meta">' + (ad.location ? '路径: <code>' + esc(ad.location) + '</code>' : '未检测到配置位置') + '</div>' +
         '<table style="margin-top:8px;"><tbody>' +
@@ -570,7 +637,8 @@ function renderDoctor() {
       ['事件记录', s.events]
     ]) +
       '<div class="card">' +
-      '<div class="card__head"><span class="card__title">当前核心运行模式</span>' + modePill + '</div>' +
+      '<div class="card__head"><span class="card__title">当前核心运行模式</span>' +
+      '<div>' + modePill + ' <button class="ghost btn-sm" id="doctor-reconnect">手动重新检测</button></div></div>' +
       '<p class="card__body">' + esc(cap.detail) + '</p>' +
       '</div>' +
       '<div class="section-title">平台适配器能力清单与边界</div>' +
@@ -580,7 +648,13 @@ function renderDoctor() {
 
 function reportError(error) {
   setConnection(false);
-  panel.innerHTML = notice(error && error.message ? error.message : '请求失败');
+  var msg = (error && (error.friendlyMessage || error.message)) ? (error.friendlyMessage || error.message) : '请求失败';
+  panel.innerHTML = notice(msg) +
+    '<div class="card" style="margin-top:14px;">' +
+    '<div class="card__head"><span class="card__title">核心状态：Ungoverned（未连接或无法读取）</span>' +
+    '<button class="primary btn-sm" id="err-retry-btn">重新连接</button></div>' +
+    '<p class="card__body">核心服务可能未启动或当前凭据已被撤销。若核心离线，所有工具防护降级为未受规则约束。<br>启动核心命令：<code>node dist/src/cli.js serve</code></p>' +
+    '</div>';
 }
 
 var RENDERERS = {
@@ -601,7 +675,9 @@ function show(name) {
   }
   panel.innerHTML = '<p class="muted">正在读取核心…</p>';
   var renderer = RENDERERS[name] || renderStatus;
-  renderer().then(function () { setConnection(true); }, reportError);
+  ensureIdentity()
+    .then(function () { return renderer(); })
+    .then(function () { setConnection(true); }, reportError);
 }
 
 tabs.addEventListener('click', function (event) {
@@ -617,6 +693,11 @@ document.getElementById('refresh').addEventListener('click', function () {
 panel.addEventListener('click', function (event) {
   var target = event.target;
 
+  if (target.id === 'err-retry-btn' || target.id === 'doctor-reconnect') {
+    show(tabs.querySelector('.tab--active') ? tabs.querySelector('.tab--active').dataset.view : 'status');
+    return;
+  }
+
   // Universal search & management
   if (target.id === 'u-search-btn') {
     renderManage().catch(reportError);
@@ -631,6 +712,7 @@ panel.addEventListener('click', function (event) {
   if (target.id === 'u-editor-cancel') {
     var c = document.getElementById('u-editor-container');
     if (c) c.innerHTML = '';
+    currentEditingEntry = null;
     return;
   }
 
@@ -640,39 +722,93 @@ panel.addEventListener('click', function (event) {
     var kind = (document.getElementById('ed-kind') || {}).value;
     var body = (document.getElementById('ed-body') || {}).value;
     var scopeKind = (document.getElementById('ed-scope') || {}).value;
-    var baseRev = Number(target.dataset.baserev || 0);
+    var isEdit = target.dataset.edit === '1' && currentEditingEntry !== null;
 
     if (!id || !title || !body) { alert('ID、标题与正文均为必填项！'); return; }
 
-    var scope = scopeKind === 'global' ? { kind: 'global' } : { kind: 'project', projectId: getProject() };
-    var entry = {
-      id: id.trim(),
-      kind: kind,
-      title: title.trim(),
-      scope: scope,
-      baseRevision: baseRev,
-      labels: [],
-      provenance: 'user',
-      evidence: 'verified',
-      platforms: [],
-    };
-    if (kind === 'norm') {
-      entry.body = body.trim();
-      entry.deniedTools = [];
-      entry.hostProvided = false;
-    } else if (kind === 'preference') {
-      entry.body = body.trim();
-      entry.stated = true;
-    } else if (kind === 'skill') {
-      entry.body = body.trim();
-      entry.leaves = [];
-      entry.needsStructure = true;
+    var entry;
+    if (isEdit && currentEditingEntry) {
+      // Preserve existing metadata to prevent erasure of labels, platforms, provenance or kind structures
+      var original = currentEditingEntry.rawContent || currentEditingEntry.content || {};
+      entry = Object.assign({}, original);
+      entry.id = currentEditingEntry.id;
+      entry.kind = original.kind || kind;
+      entry.title = title.trim();
+      entry.baseRevision = currentEditingEntry.revision;
+      entry.labels = Array.isArray(original.labels) ? original.labels : [];
+      entry.provenance = original.provenance || 'user';
+      entry.evidence = (original.evidence && original.evidence !== 'verified') ? original.evidence : 'verifiable';
+      entry.platforms = Array.isArray(original.platforms) ? original.platforms : [];
+      if (scopeKind === 'global') {
+        entry.scope = { kind: 'global' };
+      } else {
+        entry.scope = (original.scope && original.scope.kind === 'project')
+          ? original.scope
+          : { kind: 'project', projectId: getProject() };
+      }
+
+      if (entry.kind === 'norm') {
+        entry.body = body.trim();
+        entry.deniedTools = Array.isArray(original.deniedTools) ? original.deniedTools : [];
+        entry.hostProvided = Boolean(original.hostProvided);
+      } else if (entry.kind === 'preference') {
+        entry.body = body.trim();
+        entry.stated = original.stated !== undefined ? original.stated : true;
+      } else if (entry.kind === 'skill') {
+        entry.body = body.trim();
+        entry.leaves = Array.isArray(original.leaves) ? original.leaves : [];
+        entry.needsStructure = original.needsStructure !== undefined ? original.needsStructure : true;
+      } else if (entry.kind === 'journal') {
+        entry.did = body.trim();
+        entry.problems = original.problems || '';
+        entry.experienceLanded = Array.isArray(original.experienceLanded) ? original.experienceLanded : [];
+        entry.outcome = original.outcome || 'unverified';
+        entry.unfinished = Array.isArray(original.unfinished) ? original.unfinished : [];
+      } else if (entry.kind === 'workflow') {
+        entry.overview = body.trim();
+      } else if (entry.kind === 'material') {
+        entry.body = body.trim();
+      } else {
+        entry.body = body.trim();
+      }
     } else {
-      entry.body = body.trim();
+      var scope = scopeKind === 'global' ? { kind: 'global' } : { kind: 'project', projectId: getProject() };
+      entry = {
+        id: id.trim(),
+        kind: kind,
+        title: title.trim(),
+        scope: scope,
+        baseRevision: 0,
+        labels: [],
+        provenance: 'user',
+        evidence: 'verifiable',
+        platforms: [],
+      };
+      if (kind === 'norm') {
+        entry.body = body.trim();
+        entry.deniedTools = [];
+        entry.hostProvided = false;
+      } else if (kind === 'preference') {
+        entry.body = body.trim();
+        entry.stated = true;
+      } else if (kind === 'skill') {
+        entry.body = body.trim();
+        entry.leaves = [];
+        entry.needsStructure = true;
+      } else if (kind === 'journal') {
+        entry.did = body.trim();
+        entry.problems = '';
+        entry.experienceLanded = [];
+        entry.outcome = 'unverified';
+        entry.unfinished = [];
+      } else {
+        entry.body = body.trim();
+      }
     }
 
     post('/v1/knowledge/write', { entry: entry }).then(function (res) {
       alert('保存成功！' + (res.note || ''));
+      currentEditingEntry = null;
       renderManage();
     }).catch(reportError);
     return;
@@ -681,7 +817,8 @@ panel.addEventListener('click', function (event) {
   if (target.classList.contains('u-edit-btn')) {
     var editId = target.dataset.id;
     post('/v1/knowledge/get', { id: editId }).then(function (res) {
-      showEditor({ id: res.id, revision: res.revision, rawContent: res.content });
+      currentEditingEntry = { id: res.id, revision: res.revision, content: res.content };
+      showEditor(currentEditingEntry);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }).catch(reportError);
     return;
@@ -712,9 +849,9 @@ panel.addEventListener('click', function (event) {
         body: target.closest('.card').querySelector('.card__body').textContent,
         scope: { kind: 'project', projectId: getProject() },
         baseRevision: 0,
-        labels: [],
+        labels: ['approved'],
         provenance: 'user',
-        evidence: 'verified',
+        evidence: 'verifiable',
         platforms: []
       }
     }).then(function () {
@@ -765,11 +902,50 @@ panel.addEventListener('click', function (event) {
     return Array.prototype.map.call(checked, function (cb) { return cb.dataset.id; });
   };
 
+  if (target.id === 'batch-approve') {
+    var approveIds = getCheckedIds();
+    if (!approveIds.length) { alert('请先勾选要批量批准的候选！'); return; }
+    if (!confirm('确定批量批准选中的 ' + approveIds.length + ' 条候选？')) return;
+    var entriesMap = {};
+    approveIds.forEach(function (id) {
+      entriesMap[id] = {
+        id: id,
+        kind: 'memory',
+        title: '批量批准候选: ' + id,
+        body: '批量批准经验记录。',
+        scope: { kind: 'project', projectId: getProject() },
+        baseRevision: 0,
+        labels: ['approved'],
+        provenance: 'user',
+        evidence: 'verifiable',
+        platforms: []
+      };
+    });
+    post('/v1/proposals/batch', {
+      action: 'approve',
+      ids: approveIds,
+      entries: entriesMap
+    }).then(function (res) {
+      if (res.failed && res.failed.length) {
+        alert('部分候选批准未完成（' + res.failed.length + ' 条）：\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n'));
+      } else {
+        alert('选中的 ' + approveIds.length + ' 条候选已全部批准入库！');
+      }
+      renderProposals('pending');
+    }).catch(reportError);
+    return;
+  }
+
   if (target.id === 'batch-reject') {
     var rejectIds = getCheckedIds();
     if (!rejectIds.length) { alert('请先勾选要批量拒收的候选！'); return; }
     if (!confirm('确定批量拒收选中的 ' + rejectIds.length + ' 条候选？')) return;
-    post('/v1/proposals/batch', { action: 'reject', ids: rejectIds }).then(function () {
+    post('/v1/proposals/batch', { action: 'reject', ids: rejectIds }).then(function (res) {
+      if (res.failed && res.failed.length) {
+        alert('部分候选拒收未完成（' + res.failed.length + ' 条）：\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n'));
+      }
       renderProposals('pending');
     }).catch(reportError);
     return;
@@ -778,7 +954,11 @@ panel.addEventListener('click', function (event) {
   if (target.id === 'batch-archive') {
     var arcIds = getCheckedIds();
     if (!arcIds.length) { alert('请先勾选要批量归档的候选！'); return; }
-    post('/v1/proposals/batch', { action: 'archive', ids: arcIds }).then(function () {
+    post('/v1/proposals/batch', { action: 'archive', ids: arcIds }).then(function (res) {
+      if (res.failed && res.failed.length) {
+        alert('部分候选归档未完成（' + res.failed.length + ' 条）：\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n'));
+      }
       renderProposals('pending');
     }).catch(reportError);
     return;
@@ -789,7 +969,11 @@ panel.addEventListener('click', function (event) {
     if (!evIds.length) { alert('请先勾选要要求补证的候选！'); return; }
     var evReason = prompt('请输入统一补证要求：', '需补充验证输出，30天未补证将自动归档');
     if (!evReason) return;
-    post('/v1/proposals/batch', { action: 'request-evidence', ids: evIds, reason: evReason }).then(function () {
+    post('/v1/proposals/batch', { action: 'request-evidence', ids: evIds, reason: evReason }).then(function (res) {
+      if (res.failed && res.failed.length) {
+        alert('部分候选要求补证未完成（' + res.failed.length + ' 条）：\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n'));
+      }
       renderProposals('pending');
     }).catch(reportError);
     return;
@@ -859,7 +1043,14 @@ panel.addEventListener('click', function (event) {
   if (target.id === 'material-purge') {
     if (!confirm('确定清理所有已到期的临时资料？此操作将物理删除已过期的正文与索引。')) return;
     post('/v1/material/purge').then(function (res) {
-      alert('清理完成！清理数量：' + (res.purged ? res.purged.length : 0));
+      var purgedCount = res.purged ? res.purged.length : 0;
+      var failedCount = res.failed ? res.failed.length : 0;
+      var msg = '清理完成！已清理 ' + purgedCount + ' 条资料。';
+      if (failedCount > 0) {
+        msg += '\n警告：' + failedCount + ' 条资料清理失败：\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n');
+      }
+      alert(msg);
       renderMaterial();
     }).catch(reportError);
     return;

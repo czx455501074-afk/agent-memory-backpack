@@ -31,7 +31,29 @@ export const coreSchema = z.object({
     token: z.string().min(32).max(256), projectId: identifier,
     role: roleSchema.default('adapter'),
   }).strict()).min(1),
-}).strict();
+}).strict().superRefine((val, ctx) => {
+  const ids = new Set<string>();
+  const tokens = new Set<string>();
+  for (let i = 0; i < val.clients.length; i++) {
+    const client = val.clients[i]!;
+    if (ids.has(client.id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Duplicate client id: ${client.id}. Each client must have a unique id.`,
+        path: ['clients', i, 'id'],
+      });
+    }
+    ids.add(client.id);
+    if (tokens.has(client.token)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Duplicate client token. Each client must have a distinct token.',
+        path: ['clients', i, 'token'],
+      });
+    }
+    tokens.add(client.token);
+  }
+});
 export type ClientConfig = z.infer<typeof clientSchema>;
 export type CoreConfig = z.infer<typeof coreSchema>;
 export type Role = z.infer<typeof roleSchema>;
@@ -54,20 +76,27 @@ export type Role = z.infer<typeof roleSchema>;
  */
 export interface ResolvedConfigPath { path: string; warning: string | null }
 
+function explicitCandidates(adapterId: 'dsh' | 'codex', env: NodeJS.ProcessEnv): Array<{ name: string; value: string }> {
+  const candidates: Array<{ name: string; value: string }> = [];
+  if (adapterId === 'dsh' && typeof env.AMB_DSH_CONFIG === 'string' && env.AMB_DSH_CONFIG.trim()) {
+    candidates.push({ name: 'AMB_DSH_CONFIG', value: env.AMB_DSH_CONFIG.trim() });
+  }
+  if (typeof env.AMB_CONFIG === 'string' && env.AMB_CONFIG.trim()) {
+    candidates.push({ name: 'AMB_CONFIG', value: env.AMB_CONFIG.trim() });
+  }
+  return candidates;
+}
+
 export function resolveConfigPath(adapterId: 'dsh' | 'codex', env: NodeJS.ProcessEnv = process.env): ResolvedConfigPath {
   const dir = defaultDataDir();
   const own = join(dir, adapterId + '-client.json');
   // Older installs wrote the Codex credential to a bare client.json.
   const legacy = join(dir, 'client.json');
-  const fromDsh = adapterId === 'dsh' ? env.AMB_DSH_CONFIG : undefined;
-  const explicit = (fromDsh ?? env.AMB_CONFIG ?? '').trim();
-  if (explicit) {
-    const named = resolve(explicit);
+  for (const candidate of explicitCandidates(adapterId, env)) {
+    const named = resolve(candidate.value);
     if (existsSync(named)) return { path: named, warning: null };
     const fallback = existsSync(own) ? own : legacy;
-    const variable = adapterId === 'dsh' ? 'AMB_DSH_CONFIG/AMB_CONFIG' : 'AMB_CONFIG';
-    const warning = variable + ' points at ' + named + ', which does not exist; using '
-      + fallback + ' instead.';
+    const warning = `${candidate.name} points at ${named}, which does not exist; using ${fallback} instead.`;
     return { path: fallback, warning };
   }
   if (existsSync(own)) return { path: own, warning: null };

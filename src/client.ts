@@ -1,4 +1,18 @@
+import { realpathSync } from 'node:fs';
+import { isAbsolute, relative, sep } from 'node:path';
 import { clientSchema, type ClientConfig } from './config.js';
+
+export function isWithinProject(projectRoot: string, cwd: string): boolean {
+  if (typeof cwd !== 'string' || !isAbsolute(cwd)) return false;
+  try {
+    const root = realpathSync(projectRoot);
+    const current = realpathSync(cwd);
+    const rel = relative(root, current);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Core paths this client may call.
@@ -30,14 +44,37 @@ export class CoreClient {
   get tokenShape() { return `${this.config.token.length} characters; value not printed`; }
   async post(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!CORE_PATH.test(path)) throw new Error('Unsupported core path');
+    /**
+     * No `cwd ⊆ projectRoot` check here, and the absence is deliberate.
+     *
+     * The Codex MCP server is launched by the host from the plugin directory —
+     * `.mcp.json` declares `"cwd": "."` — so gating requests on the process working
+     * directory refused every legitimate call and made the packaged smoke test fail
+     * with "Connection closed". Measured with that gate removed, the core's own
+     * enforcement is complete on its own: a credential for one project reads its own
+     * entries (200) and cannot reach another's by naming its id (404), by claiming
+     * its project in the envelope (403), through its norm list, through search, or by
+     * submitting into it (403). The project is pinned by the credential and checked
+     * server-side on every request, so cwd adds no protection to this path while
+     * creating a false refusal.
+     *
+     * The Codex *hook* keeps its own cwd check (`projectScope` in `hook.mjs`): there
+     * the working directory comes from the tool-invocation payload and is meaningful.
+     * DSH likewise checks its session cwd. Those are not affected by this change.
+     */
     let response: Response;
     try {
       response = await fetch(`${this.config.endpoint.replace(/\/$/, '')}${path}`, {
         method: 'POST', redirect: 'error', signal: AbortSignal.timeout(4500),
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.config.token}`, 'x-amb-protocol': '1' },
-        body: JSON.stringify({ ...body, projectId: this.config.projectId }),
+        body: JSON.stringify({
+          ...body,
+          projectId: this.config.projectId,
+        }),
       });
-    } catch { throw new Error('Agent Memory Backpack core unavailable. Governance could not be checked.'); }
+    } catch {
+      throw new Error('Agent Memory Backpack core unavailable. Governance could not be checked.');
+    }
     let result: Record<string, unknown>;
     try { result = await response.json() as Record<string, unknown>; } catch { throw new Error('Agent Memory Backpack core returned an invalid response'); }
     if (!response.ok) {

@@ -215,15 +215,49 @@ export type SkillEntry = z.infer<typeof skillSchema>;
 export type Scope = z.infer<typeof scopeSchema>;
 export type Provenance = z.infer<typeof provenanceSchema>;
 export type EvidenceLevel = z.infer<typeof evidenceLevelSchema>;
+/**
+ * A candidate experience an agent proposes.
+ *
+ * `stageId` says which step of `workflowId` the experience belongs to. The
+ * workflow-integrity requirement is that a new experience is located *inside* a
+ * complete workflow rather than becoming a floating fragment, and a workflow id
+ * alone cannot express that: "this belongs to the upgrade process" and "this
+ * belongs to the backup step of the upgrade process" are different claims, and
+ * only the second one can be reviewed against the step it will change. Nothing
+ * here infers the stage from the text — that needs a model service — so the field
+ * records what the submitter asserts and is validated for existence (see
+ * `Store.submit`), not for semantic fit.
+ */
 export const proposalSchema = z.object({
   idempotencyKey: identifier, projectId: identifier, taskId: identifier.optional(),
-  workflowId: identifier.optional(), baseRevision: z.number().int().positive().optional(),
+  workflowId: identifier.optional(), stageId: identifier.optional(),
+  baseRevision: z.number().int().positive().optional(),
   discovery: z.string().trim().min(1).max(12000),
 }).strict();
 export const eventSchema = z.object({
   eventId: identifier, adapter: z.enum(['codex', 'dsh']), projectId: identifier,
   taskId: identifier.optional(), sessionId: z.string().min(1).max(256).optional(), kind: z.string().min(1).max(100),
   summary: z.string().max(2000),
+}).strict();
+/**
+ * One queued outbound item: a candidate submission or an event capture that could
+ * not be delivered when it was produced.
+ *
+ * Persistent rather than in-process because the design (§6.4) says background work
+ * must be recoverable: a candidate an agent produced while the core was down has
+ * to survive a desktop restart. The whole request body is kept verbatim, and the
+ * replay goes through the same idempotent path as the original attempt, so an item
+ * that actually landed before the failure is recognised as a duplicate instead of
+ * being written a second time.
+ */
+export const outboxEntrySchema = z.object({
+  kind: z.enum(['candidate', 'event']),
+  idempotencyKey: identifier,
+  projectId: identifier,
+  payload: z.record(z.string(), z.unknown()),
+  /** Why the last attempt failed, so the queue is answerable rather than opaque. */
+  error: z.string().max(2000).optional(),
+  attempts: z.number().int().nonnegative().optional(),
 }).strict();
 export const contextSchema = z.object({
   adapter: z.enum(['codex', 'dsh']).optional(), projectId: identifier,
@@ -259,8 +293,42 @@ export const taskSchema = z.object({
   relatedProposals: z.array(identifier).max(100).default([]),
   /** Files the next session should check before continuing. */
   files: z.array(shortText).max(100).default([]),
+  /**
+   * The observed state of each file when the task last recorded it.
+   *
+   * Acceptance 16 requires that continuing in a *different checkout* shows how the
+   * files differ rather than assuming the other end's edits are already present. A
+   * bare path cannot do that — `files` only says "look at this", which is why the
+   * handoff could not previously answer the question the design asks. Recording a
+   * digest (and size) per path makes the comparison possible on the receiving end
+   * without reading the sender's filesystem: the receiving end hashes its own copy
+   * and compares.
+   *
+   * Deliberately not a boolean "changed" flag computed here: the core never sees the
+   * receiving end's disk, so only a *recorded* state plus a receiving-side
+   * comparison is honest. Nothing infers that a file is unchanged just because a
+   * path matches.
+   */
+  fileStates: z.array(z.object({
+    path: z.string().trim().min(1).max(1000),
+    /** Content digest when known; absent means "state not recorded". */
+    digest: z.string().trim().min(1).max(128).optional(),
+    size: z.number().int().nonnegative().optional(),
+    /** When this state was observed, so staleness is visible. */
+    observedAt: z.number().int().nonnegative().optional(),
+  }).strict()).max(200).default([]),
   /** What was verified, and how. Kept separate from `summary`, which is prose. */
   verified: z.string().trim().max(2000).default(''),
+  /**
+   * How well `verified` is actually supported.
+   *
+   * `verified` is free text the caller supplies, so on its own it cannot be
+   * evidence — an agent writing "tests passed" is a self-report, not an
+   * observation. This field is what lets the diary distinguish the two, and it
+   * defaults to the weakest level so an adapter that says nothing never upgrades a
+   * claim. Only `observed` or `verifiable` may carry a task to `success`.
+   */
+  evidence: evidenceLevelSchema.default('self-reported'),
   startedAt: z.number().int().nonnegative().optional(),
 }).strict();
 

@@ -87,8 +87,16 @@ export function createClient(config, fetchImpl = fetch) {
       throw new Error('Agent Memory Backpack core is unavailable.')
     }
 
-    if (response.status === 426) throw new Error('Agent Memory Backpack protocol version mismatch.')
-    if (!response.ok) throw new Error(`Agent Memory Backpack core returned HTTP ${response.status}.`)
+    if (response.status === 426) {
+      const err = new Error('Agent Memory Backpack protocol version mismatch.')
+      err.status = 426
+      throw err
+    }
+    if (!response.ok) {
+      const err = new Error(`Agent Memory Backpack core returned HTTP ${response.status}.`)
+      err.status = response.status
+      throw err
+    }
     try {
       return await response.json()
     } catch {
@@ -116,6 +124,19 @@ export function isWithinProject(projectRoot, cwd) {
   } catch {
     return false
   }
+}
+
+export function isExplicitClientRejection(error) {
+  if (!error) return false
+  const status = error.status ?? error.statusCode
+  if (typeof status === 'number' && status >= 400 && status < 500) {
+    return true
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  if (/\b(?:HTTP\s*4\d\d|426)\b/i.test(message) || message.includes('protocol version mismatch')) {
+    return true
+  }
+  return false
 }
 
 export const isRecordValue = isRecord

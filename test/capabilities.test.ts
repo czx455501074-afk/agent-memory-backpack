@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -115,4 +115,74 @@ test('核心侧与适配器侧对快照文件名的约定一致', () => {
   const name = /'gate-snapshot\.json'/;
   assert.match(adapterSource, name, '适配器侧应使用该文件名');
   assert.match(coreSource, name, '核心侧应使用同一文件名');
+});
+
+/**
+ * Installation detection must describe the profile that would actually load the
+ * plugin, and must not be fooled by a leftover link.
+ *
+ * Found on a real machine rather than in the audit: the user uninstalled the plugin
+ * from the `desktop` profile, which removed the dependency and the bundle entry but
+ * left the `node_modules` junction in place. The candidate list was hardcoded to
+ * `profiles/desktop/node_modules/dsh-agent-memory-backpack`, so the report answered
+ * "installed" from that stale link — while the profiles that did declare and load
+ * the plugin (`headless`, `web`) were never examined.
+ *
+ * Both halves are checked here: a declared profile is found, and a bare link is
+ * reported as a leftover rather than as an installation.
+ */
+test('安装判定以会加载插件的 profile 为准，且残留链接如实报出', () => {
+  const home = tempDir();
+  const profiles = join(home, '.dsh', 'profiles');
+
+  /** A profile directory that links the package; `declares` controls the manifest. */
+  const makeProfile = (name: string, declares: boolean) => {
+    const dir = join(profiles, name);
+    mkdirSync(join(dir, 'node_modules', 'dsh-agent-memory-backpack'), { recursive: true });
+    writeFileSync(
+      join(dir, 'node_modules', 'dsh-agent-memory-backpack', 'package.json'),
+      JSON.stringify({ name: 'dsh-agent-memory-backpack', version: '9.9.9' }),
+      'utf8',
+    );
+    writeFileSync(
+      join(dir, 'package.json'),
+      JSON.stringify(declares
+        ? { name: `profile-${name}`, dependencies: { 'dsh-agent-memory-backpack': 'link:../x' }, dsh: { profile: { bundles: ['dsh-agent-memory-backpack'] } } }
+        : { name: `profile-${name}`, dependencies: {}, dsh: { profile: { bundles: [] } } }),
+      'utf8',
+    );
+    return dir;
+  };
+
+  // The order mirrors the real machine: the leftover sorts before the real one, so a
+  // scan that stops at the first hit would report the placeholder profile.
+  makeProfile('aaa-leftover', false);
+  makeProfile('zzz-active', true);
+
+  const dsh = capabilityManifest(home).find(m => m.id === 'dsh')!;
+  assert.equal(dsh.installed, true, '有 profile 声明时才算已安装');
+  assert.match(String(dsh.location), /zzz-active/, '必须指向真正声明了插件的 profile，而不是残留目录');
+  assert.equal(dsh.version, '9.9.9');
+
+  const leftoverNotes = dsh.notes.filter(note => note.includes('残留'));
+  assert.equal(leftoverNotes.length, 1, '残留链接必须单独报出，不能静默');
+  assert.match(leftoverNotes[0]!, /aaa-leftover/, '残留说明必须点名具体位置，用户才能清理');
+
+  // Only a leftover, with nothing declaring the package: not an installation.
+  const onlyLeftover = tempDir();
+  mkdirSync(join(onlyLeftover, '.dsh', 'profiles', 'desktop', 'node_modules', 'dsh-agent-memory-backpack'), { recursive: true });
+  writeFileSync(
+    join(onlyLeftover, '.dsh', 'profiles', 'desktop', 'node_modules', 'dsh-agent-memory-backpack', 'package.json'),
+    JSON.stringify({ name: 'dsh-agent-memory-backpack', version: '1.0.0' }),
+    'utf8',
+  );
+  writeFileSync(
+    join(onlyLeftover, '.dsh', 'profiles', 'desktop', 'package.json'),
+    JSON.stringify({ name: 'p', dependencies: {}, dsh: { profile: { bundles: [] } } }),
+    'utf8',
+  );
+  const bare = capabilityManifest(onlyLeftover).find(m => m.id === 'dsh')!;
+  assert.equal(bare.installed, false, '只有残留链接、没有声明时不得报告为已安装');
+  assert.equal(bare.location, null);
+  assert.ok(bare.notes.some(note => note.includes('残留')), '仍须告知用户该残留的存在');
 });

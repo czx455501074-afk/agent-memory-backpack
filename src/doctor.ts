@@ -44,6 +44,7 @@ export interface DoctorOptions {
   offline?: boolean;
   fetchImpl?: typeof fetch;
   runtimeVersions?: Record<string, string>;
+  home?: string;
 }
 
 const pass = (id: string, title: string, detail: string): Check => ({ id, title, status: 'pass', detail });
@@ -228,7 +229,7 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   // capability manifest rather than hand-written here, so the page and the CLI
   // cannot drift apart.
   {
-    const manifest = capabilityManifest();
+    const manifest = capabilityManifest(options.home);
     for (const adapter of manifest) {
       const unmet = Object.entries(adapter.capabilities)
         .filter(([, state]) => state !== 'yes')
@@ -236,12 +237,12 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
       const installedNote = adapter.installed
         ? `已安装${adapter.version ? ` ${adapter.version}` : ''}`
         : '未在该机器的已知位置找到已安装的包';
+      // Missing adapter installation or any capability shortfall must be reported as warn/fail, never pass.
+      const status: CheckStatus = (!adapter.installed || unmet.length > 0) ? 'warn' : 'pass';
       checks.push({
         id: `capability-${adapter.id}`,
         title: `${adapter.id} 能力清单`,
-        // Not a pass when something is missing: a capability gap is a fact about
-        // the product, and marking it green would hide the one thing this list is for.
-        status: unmet.length ? 'warn' : 'pass',
+        status,
         detail: `${installedNote}；` + (unmet.length
           ? `不支持：${unmet.join('、')}`
           : '设计能力齐备'),

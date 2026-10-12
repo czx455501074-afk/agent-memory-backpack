@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { randomUUID } from "node:crypto";
-import { readFileSync, existsSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -222,7 +222,16 @@ async function post(config, route, payload) {
       redirect: "error",
       signal: controller.signal,
     });
-    if (!response.ok) throw new Error(`Agent Memory Backpack service returned HTTP ${response.status}`);
+    if (response.status === 426) {
+      const err = new Error("Agent Memory Backpack protocol version mismatch (HTTP 426)");
+      err.status = 426;
+      throw err;
+    }
+    if (!response.ok) {
+      const err = new Error(`Agent Memory Backpack service returned HTTP ${response.status}`);
+      err.status = response.status;
+      throw err;
+    }
 
     let value;
     try {
@@ -239,10 +248,70 @@ async function post(config, route, payload) {
   }
 }
 
-function sessionFields(input) {
-  return typeof input.session_id === "string" && input.session_id.trim()
-    ? { sessionId: input.session_id }
-    : {};
+function isExplicitClientRejection(error) {
+  if (!error) return false;
+  const status = error.status ?? error.statusCode;
+  if (typeof status === 'number' && status >= 400 && status < 500) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (/\b(?:HTTP\s*4\d\d|426)\b/i.test(message) || message.includes('protocol version mismatch')) {
+    return true;
+  }
+  return false;
+}
+
+function sessionStatePath(dataDir, sessionId) {
+  const hash = createHash("sha256").update(String(sessionId ?? ""), "utf8").digest("hex").slice(0, 16);
+  return join(dataDir, `codex-session-${hash}.json`);
+}
+
+function loadSessionState(dataDir, sessionId) {
+  if (!sessionId) return undefined;
+  try {
+    const file = sessionStatePath(dataDir, sessionId);
+    if (!existsSync(file)) return undefined;
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function saveSessionState(dataDir, sessionId, updates) {
+  if (!sessionId) return;
+  try {
+    const file = sessionStatePath(dataDir, sessionId);
+    const existing = loadSessionState(dataDir, sessionId) || {};
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(file, JSON.stringify({ ...existing, ...updates, at: Date.now() }), "utf8");
+  } catch {}
+}
+
+function sessionFields(input, config) {
+  const fields = {};
+  const sessionId = typeof input.session_id === "string" && input.session_id.trim()
+    ? input.session_id.trim()
+    : undefined;
+  if (sessionId) fields.sessionId = sessionId;
+
+  let rawTask = input.task_id ?? input.taskId;
+  if (typeof rawTask === "string" && rawTask.trim()) {
+    fields.taskId = rawTask.trim();
+  } else if (sessionId && config?.dataDir) {
+    const state = loadSessionState(config.dataDir, sessionId);
+    if (typeof state?.taskId === "string" && state.taskId.trim()) {
+      fields.taskId = state.taskId.trim();
+    }
+  }
+  if (!fields.taskId && process.env.AMB_TASK_ID?.trim()) {
+    fields.taskId = process.env.AMB_TASK_ID.trim();
+  }
+
+  if (sessionId && fields.taskId && config?.dataDir) {
+    saveSessionState(config.dataDir, sessionId, { taskId: fields.taskId });
+  }
+
+  return fields;
 }
 
 function emit(value) {
@@ -260,10 +329,11 @@ function deny(reason) {
 }
 
 async function prepare(input, config) {
+  const sessionInfo = sessionFields(input, config);
   const payload = {
     adapter: "codex",
     projectId: config.projectId,
-    ...sessionFields(input),
+    ...sessionInfo,
     ...(typeof input.prompt === "string" && input.prompt.trim()
       ? { query: input.prompt.slice(0, 4000) }
       : {}),
@@ -286,6 +356,46 @@ async function prepare(input, config) {
     throw new Error("Agent Memory Backpack prepare response does not match protocol v1");
   }
 
+  let handoffBlock = "";
+  if (sessionInfo.taskId && sessionInfo.sessionId) {
+    try {
+      const handoff = await post(config, "/v1/tasks/handoff", {
+        projectId: config.projectId,
+        taskId: sessionInfo.taskId,
+      });
+      if (handoff?.task) {
+        const existingSessions = Array.isArray(handoff.task.sessionIds) ? handoff.task.sessionIds : [];
+        if (!existingSessions.includes(sessionInfo.sessionId)) {
+          await post(config, "/v1/tasks/record", {
+            projectId: config.projectId,
+            task: {
+              ...handoff.task,
+              sessionIds: [...existingSessions, sessionInfo.sessionId],
+            },
+          });
+        }
+        const task = handoff.task;
+        const unfinishedStr = Array.isArray(task.unfinished) && task.unfinished.length ? task.unfinished.join('；') : '无';
+        const filesStr = Array.isArray(handoff.files) && handoff.files.length ? handoff.files.join('；') : '未记录';
+        const relatedWfs = Array.isArray(handoff.workflows) && handoff.workflows.length ? handoff.workflows.map(w => w.id).join(', ') : '无';
+        handoffBlock = [
+          '[Task Handoff]',
+          `Task: ${task.id} "${task.title}"`,
+          `Status: ${task.status}`,
+          `Knowledge: version ${handoff.knowledgeRevision ?? 0}`,
+          `Related Workflows: ${relatedWfs}`,
+          `Important: ${unfinishedStr}`,
+          `Files: ${filesStr}`,
+          `Suggestion: ${handoff.suggestion ?? ''}`,
+          `Caveat: ${handoff.caveat || '接收端需重新确认文件与环境状态；本交接不迁移运行中的进程、凭据或工具权限。上面的 files 只是需要核对的清单，不代表已经核对过。'}`,
+        ].filter(Boolean).join('\n');
+      }
+    } catch (err) {
+      logger.warn("handoff.failed", { message: err instanceof Error ? err.message : "failed to fetch handoff" });
+    }
+  }
+
+  const finalContext = [handoffBlock, redact(result.context, config.token)].filter(Boolean).join("\n\n");
   emit({
     hookSpecificOutput: {
       hookEventName: input.hook_event_name,
@@ -293,7 +403,7 @@ async function prepare(input, config) {
       // (`developer`), so a reader cannot tell from the transcript alone which
       // source produced it. The marker makes the origin identifiable in the
       // recorded evidence, matching the DSH adapter's structured source field.
-      additionalContext: `${SOURCE_MARKER}\n${redact(result.context, config.token)}`,
+      additionalContext: `${SOURCE_MARKER}\n${finalContext}`,
     },
   });
 }
@@ -304,10 +414,11 @@ async function gate(input, config) {
     return;
   }
 
+  const sessionInfo = sessionFields(input, config);
   const result = await post(config, "/v1/gate", {
     adapter: "codex",
     projectId: config.projectId,
-    ...sessionFields(input),
+    ...sessionInfo,
     toolName: input.tool_name,
   });
   if (
@@ -318,48 +429,121 @@ async function gate(input, config) {
   ) {
     throw new Error("Agent Memory Backpack gate response does not match protocol v1");
   }
-  // Recorded on every successful gate so a later outage still enforces the current
-  // prohibitions. A write failure costs freshness only; it must not fail this call.
+  const identity = { projectId: config.projectId, endpoint: config.endpoint };
   saveSnapshot(config.dataDir, {
+    projectId: config.projectId,
+    endpoint: config.endpoint,
     deniedTools: Array.isArray(result.deniedTools) ? result.deniedTools : [],
     revision: result.knowledgeRevision,
     at: Date.now(),
-  });
+  }, identity);
   if (result.decision === "deny") {
     deny(safeReason(result.reason, config.token));
   } else if (result.context.trim()) {
-    emit({
-      hookSpecificOutput: {
-        hookEventName: PRE_TOOL_USE,
-        additionalContext: redact(result.context, config.token),
-      },
-    });
+    const sessionId = sessionInfo.sessionId;
+    const lastRev = loadSessionState(config.dataDir, sessionId)?.revision;
+    if (lastRev !== result.knowledgeRevision) {
+      saveSessionState(config.dataDir, sessionId, { revision: result.knowledgeRevision });
+      emit({
+        hookSpecificOutput: {
+          hookEventName: PRE_TOOL_USE,
+          additionalContext: redact(result.context, config.token),
+        },
+      });
+    }
   }
   // An allow from project policy is not a Codex approval. Empty stdout preserves
   // Codex's normal permission and approval flow.
 }
 
+async function replayOutboxIfNeeded(input, config) {
+  const sessionInfo = sessionFields(input, config);
+  const sessionId = sessionInfo.sessionId;
+  if (sessionId && config?.dataDir) {
+    const state = loadSessionState(config.dataDir, sessionId);
+    if (state?.outboxReplayed) return;
+  }
+  try {
+    const replayRes = await post(config, "/v1/outbox/replay", {
+      projectId: config.projectId,
+    });
+    logger.info("outbox.replay", {
+      sessionId: sessionId || "unknown",
+      attempted: replayRes?.attempted ?? 0,
+      delivered: Array.isArray(replayRes?.delivered) ? replayRes.delivered : [],
+      failed: Array.isArray(replayRes?.failed) ? replayRes.failed : [],
+      abandoned: Array.isArray(replayRes?.abandoned) ? replayRes.abandoned : [],
+    });
+    if (sessionId && config?.dataDir) {
+      saveSessionState(config.dataDir, sessionId, { outboxReplayed: true });
+    }
+  } catch (error) {
+    // Best-effort: failures to replay must never block session startup or prepare
+    logger.warn("outbox.replay_failed", {
+      sessionId: sessionId || "unknown",
+      message: error instanceof Error ? error.message : "unknown",
+    });
+  }
+}
+
 async function recordEvent(input, config) {
   const stopped = input.hook_event_name === "Stop";
-  const result = await post(config, "/v1/events", {
+  const sessionInfo = sessionFields(input, config);
+  const eventPayload = {
     eventId: randomUUID(),
     adapter: "codex",
     projectId: config.projectId,
-    ...sessionFields(input),
+    ...sessionInfo,
     kind: stopped ? "turn_stopped" : "tool_completed",
     summary: stopped
       ? "Codex turn stopped."
       : "A supported Codex local tool call finished.",
-  });
-  if (
-    typeof result.id !== "string" ||
-    result.stored !== true ||
-    typeof result.duplicate !== "boolean"
-  ) {
-    throw new Error("Agent Memory Backpack event response does not match protocol v1");
-  }
+  };
+  try {
+    const result = await post(config, "/v1/events", eventPayload);
+    if (
+      typeof result.id !== "string" ||
+      result.stored !== true ||
+      typeof result.duplicate !== "boolean"
+    ) {
+      throw new Error("Agent Memory Backpack event response does not match protocol v1");
+    }
+    if (stopped) emit({ continue: true });
+  } catch (error) {
+    // Deterministic 4xx rejection: do not queue, throw immediately
+    if (isExplicitClientRejection(error)) {
+      throw error;
+    }
+    // Network / timeout / 5xx: enqueue full payload into persistent outbox
+    let enqueued = false;
+    try {
+      await post(config, "/v1/outbox/enqueue", {
+        kind: "event",
+        idempotencyKey: eventPayload.eventId,
+        projectId: config.projectId,
+        payload: eventPayload,
+        error: (error instanceof Error ? error.message : String(error)).slice(0, 2000),
+        attempts: 1,
+      });
+      logger.info("outbox.enqueued", { kind: "event", idempotencyKey: eventPayload.eventId });
+      enqueued = true;
+    } catch (enqueueErr) {
+      logger.warn("outbox.enqueue_failed", {
+        kind: "event",
+        idempotencyKey: eventPayload.eventId,
+        message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
+      });
+    }
 
-  if (stopped) emit({ continue: true });
+    if (stopped) {
+      if (enqueued) {
+        emit({ continue: true });
+      } else {
+        // If neither direct delivery nor enqueue succeeded, keep the failure observable
+        throw error;
+      }
+    }
+  }
 }
 
 async function main() {
@@ -423,7 +607,10 @@ async function main() {
     // process per event, so firing a spawn on every prompt or tool call would
     // race many attempts at one port; a new session is once, and early enough
     // that the first tool call already finds a warm core.
-    if (event === "SessionStart") await startCoreIfNeeded(config, logger);
+    if (event === "SessionStart") {
+      await startCoreIfNeeded(config, logger);
+      await replayOutboxIfNeeded(input, config);
+    }
     if (event === "SessionStart" || event === "UserPromptSubmit") {
       await prepare(input, config);
     } else if (event === PRE_TOOL_USE) {
@@ -437,6 +624,14 @@ async function main() {
     // Recorded before the host is told: the log is what makes a later report
     // actionable, and it is the only place the real cause is kept.
     logger.error("hook.failed", { event, ms: Date.now() - started, message });
+    if (message.includes("426") || message.includes("protocol version mismatch") || message.includes("HTTP 426")) {
+      if (event === PRE_TOOL_USE) {
+        deny("Agent Memory Backpack protocol version mismatch (HTTP 426); tool execution blocked.");
+        return;
+      }
+      fail(message);
+      return;
+    }
     if (event === PRE_TOOL_USE) {
       // The service being unreachable is not the same as "this call is denied".
       //
@@ -444,10 +639,11 @@ async function main() {
       // optional knowledge service a single point of failure for the whole agent.
       // The design requires degrading visibly: enforce what a snapshot still knows,
       // and otherwise step back and say so.
-      const snapshot = loadSnapshot(config.dataDir);
+      const identity = { projectId: config.projectId, endpoint: config.endpoint };
+      const snapshot = loadSnapshot(config.dataDir, identity);
       const { mode } = operatingMode({ coreReachable: false, snapshot });
       if (mode === "ReadOnlySnapshot") {
-        if (decideFromSnapshot(snapshot.record, input.tool_name) === "deny") {
+        if (decideFromSnapshot(snapshot.record, input.tool_name, identity) === "deny") {
           deny(`${input.tool_name} is prohibited by the last policy snapshot; the core is currently unreachable.`);
           return;
         }

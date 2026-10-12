@@ -151,7 +151,14 @@ for (const profile of candidates) {
   // Verified by reading through the link, not by trusting the calls above.
   const wired = existsSync(join(link, SENTINEL));
   if (!wired) failures += 1;
-  console.log(`  ${profile.padEnd(10)} active=${activated || Array.isArray(bundles)} linked=${wired ? 'yes' : 'NO'}`);
+  // `activated` is the real answer and is reported alone. It previously read
+  // `activated || Array.isArray(bundles)`, which is true for any profile that
+  // merely *has* a bundles list — so a deploy that failed to add this package
+  // still printed active=true and could exit 0. A user reading that line would
+  // believe the plugin was enabled when it was not, which is the same
+  // false-positive class as the capability report this project already fixed.
+  if (Array.isArray(bundles) && !activated) failures += 1;
+  console.log(`  ${profile.padEnd(10)} active=${activated} linked=${wired ? 'yes' : 'NO'}`);
 }
 
 console.log(`\nRestart DSH for the host to load the deployed package.`);

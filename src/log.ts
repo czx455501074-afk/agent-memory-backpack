@@ -50,12 +50,38 @@ export interface LoggerOptions {
  * -text field such as `message` or `note` was written verbatim, and a log is
  * exactly where a leaked token survives longest. The value is scanned as well as
  * the key.
+ *
+ * A URL's query string is the same hazard in a shape the patterns above miss: a
+ * key travels as `?api_key=...` or `&access_token=...`, where the secret is the
+ * *value* of a parameter rather than something with a recognisable prefix. A
+ * probe confirmed that such a URL was written verbatim. The parameter names that
+ * carry credentials are therefore matched explicitly, and a bare `key` is
+ * included because services that accept it usually mean exactly this.
  */
 const SECRET_VALUE = /(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}|((?:sk|ghp|gho|xox[baprs])-[A-Za-z0-9-]{8,})/gi;
 
+/**
+ * Query parameters whose value is a credential.
+ *
+ * Deliberately a name list rather than "redact every query value": dropping the
+ * whole query would destroy the diagnostic value of the URL, and a log record
+ * that cannot say which page was fetched is not worth writing. Only the values
+ * that are secrets get removed.
+ */
+const SECRET_QUERY_PARAM = /([?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|token|key|secret|password|passwd|pwd|sig|signature|credential)=)[^&#\s"']+/gi;
+
+function redactString(value: string): string {
+  return value
+    // The query parameter rule runs first: it needs the parameter name, which the
+    // generic rule would otherwise not consume but could mask by rewriting the
+    // value's prefix in a longer token.
+    .replace(SECRET_QUERY_PARAM, '$1[redacted]')
+    .replace(SECRET_VALUE, (_all, bearer?: string) => bearer ? `${bearer}[redacted]` : '[redacted]');
+}
+
 function redact(value: unknown, depth = 0): unknown {
   if (depth > 4) return '[depth]';
-  if (typeof value === 'string') return value.replace(SECRET_VALUE, (_all, bearer?: string) => bearer ? `${bearer}[redacted]` : '[redacted]');
+  if (typeof value === 'string') return redactString(value);
   if (value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.slice(0, 50).map(item => redact(item, depth + 1));
   const out: Record<string, unknown> = {};

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -85,26 +85,146 @@ const NOTES: Record<'dsh' | 'codex', string[]> = {
   ],
 };
 
-/** Find an installed adapter package in the known profile locations. */
-function locate(kind: 'dsh' | 'codex', home: string) {
-  const candidates = kind === 'dsh'
-    ? ['.dsh', '.codex', '.agents'].flatMap(dir => [
-        join(home, dir, 'plugins', 'agent-memory-backpack'),
-        join(home, dir, 'profiles', 'desktop', 'node_modules', 'dsh-agent-memory-backpack'),
-      ])
-    : [join(home, '.codex', 'plugins', 'cache')];
-  for (const candidate of candidates) {
-    if (!existsSync(candidate)) continue;
-    // The version is read from the package manifest rather than assumed, so an
-    // upgraded install cannot be reported as the old version.
-    const manifest = kind === 'dsh' ? join(candidate, 'package.json') : null;
-    if (manifest && existsSync(manifest)) {
-      try { return { location: candidate, version: String(JSON.parse(readFileSync(manifest, 'utf8')).version ?? 'unknown') }; }
-      catch { return { location: candidate, version: 'unknown' }; }
+/**
+ * Validate that a directory is genuinely an installation of this package with a readable manifest.
+ * Merely existing as a cache or directory placeholder must never be counted as installed.
+ */
+function checkManifest(dir: string): string | null {
+  const manifestCandidates = ['package.json', 'plugin.json', join('.codex-plugin', 'plugin.json')];
+  for (const rel of manifestCandidates) {
+    const file = join(dir, rel);
+    if (!existsSync(file)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8')) as { name?: string; id?: string; version?: string };
+      const name = String(parsed.name ?? parsed.id ?? '');
+      const version = String(parsed.version ?? '');
+      if (name.includes('agent-memory-backpack') && version && version !== 'unknown') {
+        return version;
+      }
+    } catch {
+      // Unparseable manifest means the directory is broken or not this package.
     }
-    return { location: candidate, version: 'unknown' };
   }
-  return { location: null, version: null };
+  return null;
+}
+
+/** Find an installed adapter package in the known profile locations. */
+function locate(kind: 'dsh' | 'codex', home: string): { location: string | null; version: string | null; leftovers: string[] } {
+  if (!home) return { location: null, version: null, leftovers: [] };
+
+  if (kind === 'dsh') {
+    const leftovers: string[] = [];
+    /**
+     * Every profile is scanned, not just `desktop`.
+     *
+     * The candidate list used to name `profiles/desktop/node_modules/...` by hand,
+     * which had two consequences on a real machine: an install living in any other
+     * profile (`headless`, `web`, …) was invisible, and a *stale junction* left in
+     * `desktop` after an uninstall was reported as an active installation because
+     * the directory still resolved to a readable manifest. Both are the same
+     * mistake — answering "is the package installed" from a path's existence
+     * instead of from the profile that would load it.
+     *
+     * A profile counts as an installation only when it both links the package and
+     * declares it (a dependency or a bundle entry). A link without a declaration is
+     * a leftover from an uninstall: real, worth telling the user about so they can
+     * remove it, but not an installation.
+     */
+    // Every candidate is examined rather than stopping at the first hit. An early
+    // return would report the installation and silently drop the leftovers that
+    // come later in the scan order — which is precisely how the stale `desktop`
+    // link stayed invisible while the report claimed a clean install.
+    let installed: { location: string; version: string } | null = null;
+    for (const dir of ['.dsh', '.codex', '.agents']) {
+      const profilesDir = join(home, dir, 'profiles');
+      let profileNames: string[] = [];
+      try {
+        profileNames = readdirSync(profilesDir).sort();
+      } catch {
+        profileNames = [];
+      }
+      for (const profile of profileNames) {
+        for (const packageName of ['dsh-agent-memory-backpack', 'agent-memory-backpack']) {
+          const candidate = join(profilesDir, profile, 'node_modules', packageName);
+          if (!existsSync(candidate)) continue;
+          const version = checkManifest(candidate);
+          if (!version) continue;
+          if (declaresPackage(join(profilesDir, profile, 'package.json'), packageName)) {
+            // Keep the first declaring profile as the installation, but keep
+            // scanning so nothing else on disk goes unreported.
+            installed ??= { location: candidate, version };
+          } else {
+            leftovers.push(candidate);
+          }
+        }
+      }
+      // A plugin dropped directly into the host's plugin directory, outside any
+      // profile, is still an installation if it carries a valid manifest.
+      const direct = join(home, dir, 'plugins', 'agent-memory-backpack');
+      if (existsSync(direct)) {
+        const version = checkManifest(direct);
+        if (version) installed ??= { location: direct, version };
+      }
+    }
+    return { location: installed?.location ?? null, version: installed?.version ?? null, leftovers };
+  }
+  {
+    // Codex: direct plugin directory or nested in cache/<marketplace>/agent-memory-backpack/<version>
+    const direct = join(home, '.codex', 'plugins', 'agent-memory-backpack');
+    if (existsSync(direct)) {
+      const version = checkManifest(direct);
+      if (version) return { location: direct, version, leftovers: [] };
+    }
+
+    const cacheRoot = join(home, '.codex', 'plugins', 'cache');
+    if (existsSync(cacheRoot)) {
+      try {
+        const entries = readdirSync(cacheRoot, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          const mpDir = join(cacheRoot, entry.name);
+          const ambDir = join(mpDir, 'agent-memory-backpack');
+          if (existsSync(ambDir)) {
+            const vEntries = readdirSync(ambDir, { withFileTypes: true });
+            for (const vEntry of vEntries) {
+              if (!vEntry.isDirectory()) continue;
+              const target = join(ambDir, vEntry.name);
+              const version = checkManifest(target);
+              if (version) return { location: target, version, leftovers: [] };
+            }
+          }
+        }
+      } catch {
+        // Directory walk failure drops to not found.
+      }
+    }
+  }
+
+  return { location: null, version: null, leftovers: [] };
+}
+
+/**
+ * Whether a profile manifest actually declares the package.
+ *
+ * Presence in `dependencies` or in `dsh.profile.bundles` is what makes the host
+ * load it. A linked directory alone does not: that is exactly the state an
+ * uninstall leaves behind, which is why checking for it here is the difference
+ * between reporting an installation and reporting a leftover.
+ */
+function declaresPackage(manifestPath: string, packageName: string): boolean {
+  if (!existsSync(manifestPath)) return false;
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+      dependencies?: Record<string, unknown>;
+      dsh?: { profile?: { bundles?: unknown } };
+    };
+    if (manifest.dependencies && packageName in manifest.dependencies) return true;
+    const bundles = manifest.dsh?.profile?.bundles;
+    return Array.isArray(bundles) && bundles.includes(packageName);
+  } catch {
+    // An unreadable manifest cannot be shown to declare anything.
+    return false;
+  }
 }
 
 /**
@@ -118,13 +238,27 @@ function locate(kind: 'dsh' | 'codex', home: string) {
 export function capabilityManifest(home = process.env.USERPROFILE ?? process.env.HOME ?? ''): AdapterCapability[] {
   return (['dsh', 'codex'] as const).map(kind => {
     const found = locate(kind, home);
+    const notes = [...NOTES[kind]];
+    if (!found.location) {
+      notes.push(`未在宿主已知位置检测到有效的 ${kind} 适配器安装清单。`);
+    }
+    // A leftover is reported separately rather than folded into `installed`. It is
+    // a real thing on disk the user may want to clean up, and saying nothing about
+    // it is how a stale link stays behind for months; calling it an installation
+    // would be the overstatement this module exists to prevent.
+    if (found.leftovers.length) {
+      notes.push(
+        `发现 ${found.leftovers.length} 处残留的插件链接（已无 profile 声明，不会被加载）：`
+        + `${found.leftovers.join('、')}。可在确认后删除。`,
+      );
+    }
     return {
       id: kind,
       installed: found.location !== null,
       location: found.location,
       version: found.version,
       capabilities: DESIGNED[kind],
-      notes: NOTES[kind],
+      notes,
     };
   });
 }
@@ -148,11 +282,15 @@ export function operatingModeFromDisk(dataDir: string, coreReachable: boolean) {
   }
   try {
     const record = JSON.parse(readFileSync(file, 'utf8')) as { deniedTools?: unknown; at?: unknown };
-    const at = typeof record.at === 'number' ? record.at : null;
-    const count = Array.isArray(record.deniedTools) ? record.deniedTools.length : 0;
+    // Shape mismatch must not be accepted as a valid snapshot; mirrors loadSnapshot shape checks.
+    if (!record || typeof record !== 'object' || !Array.isArray(record.deniedTools) || typeof record.at !== 'number') {
+      return { mode: 'Ungoverned' as const, detail: '核心不可达，且快照格式错误：本会话不受规则约束', snapshotAt: null };
+    }
+    const at = record.at;
+    const count = record.deniedTools.length;
     // The 30-day window matches the adapter's; a snapshot older than that is
     // reported rather than enforced, because the prohibition may no longer be current.
-    if (at === null || Date.now() - at > 30 * 86_400_000) {
+    if (Date.now() - at > 30 * 86_400_000) {
       return { mode: 'Ungoverned' as const, detail: '核心不可达，且快照已过期或损坏：本会话不受规则约束', snapshotAt: at };
     }
     return {

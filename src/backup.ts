@@ -196,6 +196,15 @@ export function importAll(store: Store, options: { directory: string; dryRun?: b
   };
   if (options.dryRun) return apply();
   store.db.exec('BEGIN IMMEDIATE');
-  try { const result = apply(); store.db.exec('COMMIT'); return result; }
-  catch (error) { store.db.exec('ROLLBACK'); if (error instanceof DomainError) throw error; throw new DomainError('invalid_backup', `Backup import failed: ${(error as Error).message}`); }
+  const result = (() => {
+    try { const applied = apply(); store.db.exec('COMMIT'); return applied; }
+    catch (error) { store.db.exec('ROLLBACK'); if (error instanceof DomainError) throw error; throw new DomainError('invalid_backup', `Backup import failed: ${(error as Error).message}`); }
+  })();
+  // The design (§8) requires the expiry check to run on restore, so a lapsed page
+  // cannot be brought back to life by importing an old archive. It runs after the
+  // rows have landed — checking before would inspect a database that does not yet
+  // hold the material it is judging — and after that transaction commits, because
+  // the purge opens its own transaction and SQLite will not nest one inside another.
+  store.purgeExpiredMaterial();
+  return result;
 }

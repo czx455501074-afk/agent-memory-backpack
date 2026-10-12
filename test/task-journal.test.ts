@@ -71,9 +71,35 @@ test('日记由任务事实生成；完成但无验证依据记为未验证，�
       '完成但没有验证依据时必须记为未验证，这是设计要求区分的三态之一');
     assert.match(unverified.title, /任务一/, '日记标题应指向任务');
 
-    // The same task with a stated verification basis is a success.
+    /**
+     * A free-text claim is still not evidence.
+     *
+     * `verified` is prose the caller wrote — an agent saying it ran the tests. The
+     * design (acceptance 4) forbids recording that as verified, so this now stays
+     * `unverified` even though the task reads as finished. The claim is kept and
+     * labelled as a self-report; it simply cannot be the basis of a success.
+     */
     s.recordTask('p', { id: 't1', title: '任务一', status: 'completed', summary: '完成了迁移', verified: '迁移后 165 条可检索' });
-    assert.equal(s.generateJournal('t1', 'p').outcome, 'success');
+    assert.equal(s.generateJournal('t1', 'p').outcome, 'unverified',
+      '自述文本不构成验证证据，不得冒充成功');
+    assert.equal(s.generateJournal('t1', 'p').evidence, 'self-reported',
+      '日记的证据等级必须如实标为自述');
+
+    // A deliberate, checkable basis does carry it to success — and each of the two
+    // forms the design names works on its own.
+    s.recordTask('p', { id: 't1', title: '任务一', status: 'completed', summary: '完成了迁移', evidence: 'verifiable' });
+    assert.equal(s.generateJournal('t1', 'p').outcome, 'success',
+      '声明了可核验依据的完成应记为成功');
+
+    s.recordTask('p', { id: 't3', title: '任务三', status: 'completed', summary: '观察到的完成', evidence: 'observed' });
+    assert.equal(s.generateJournal('t3', 'p').outcome, 'success',
+      '插件自身观测到的完成应记为成功');
+
+    // A plugin-recorded verified event also counts, on its own.
+    s.recordTask('p', { id: 't4', title: '任务四', status: 'completed', summary: '事件核对' });
+    s.event('dsh', { eventId: 'verify-1', adapter: 'dsh', projectId: 'p', taskId: 't4', kind: 'verified', evidence: 'observed', summary: '核对了产物' });
+    assert.equal(s.generateJournal('t4', 'p').outcome, 'success',
+      '插件自己记录的 verified 事件足以支撑成功');
 
     // A failed task is a failure regardless of any verification text.
     s.recordTask('p', { id: 't2', title: '任务二', status: 'failed' });
@@ -84,7 +110,7 @@ test('日记由任务事实生成；完成但无验证依据记为未验证，�
 test('日记作为知识落库，可重复生成而只保留一条', () => {
   const s = open();
   try {
-    s.recordTask('p', { id: 't1', title: '任务一', status: 'completed', summary: '做完了', verified: '已核对' });
+    s.recordTask('p', { id: 't1', title: '任务一', status: 'completed', summary: '做完了', verified: '已核对', evidence: 'verifiable' });
     const first = s.writeJournal('t1', 'p');
     assert.equal(first.replaced, false);
     const second = s.writeJournal('t1', 'p');
@@ -121,6 +147,9 @@ test('任务导出 Markdown 可读且包含关键信息，JSON 保留完整记�
       id: 't1', title: '导出任务', status: 'completed', summary: '做了 A 与 B',
       notes: '用户补充的观察', unfinished: ['后续优化 Y'], files: ['a.ts'],
       relatedExperiences: ['exp-9'], verified: '测试通过',
+      // A stated verifiable basis, which is what makes this a checked completion.
+      // The `verified` text alone is a self-report and would read as unverified.
+      evidence: 'verifiable',
     });
     s.event('codex', { eventId: 'e1', adapter: 'codex', projectId: 'p', taskId: 't1', kind: 'tool_used', summary: '运行了测试' });
 
@@ -135,6 +164,22 @@ test('任务导出 Markdown 可读且包含关键信息，JSON 保留完整记�
     assert.equal((json.task as { id: string }).id, 't1');
     assert.equal(json.events.length, 1, 'JSON 应带上事件');
     assert.equal(typeof json.exportedAt, 'number');
+  } finally { s.close(); }
+});
+
+test('只有自述文本的完成，导出中明确标为未验证', () => {
+  const s = open();
+  try {
+    // Same shape as above but without a stated basis: the prose claim must not be
+    // enough, or the export would read as a checked success on an agent's word.
+    s.recordTask('p', {
+      id: 't2', title: '自述完成', status: 'completed', summary: '声称都通过了',
+      verified: '测试通过',
+    });
+    const md = s.exportTask('t2', 'p').markdown;
+    assert.match(md, /未验证/, '仅有自述的完成必须标为未验证');
+    assert.match(md, /self-reported/, '应点名证据等级为自述');
+    assert.equal(/完成（有验证依据）/.test(md), false, '不得读作有依据的成功');
   } finally { s.close(); }
 });
 

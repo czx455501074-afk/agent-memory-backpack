@@ -1,8 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join, resolve } from 'node:path';
-import type { Knowledge } from './schema.js';
+import { dirname, join, resolve } from 'node:path';
+import type { Knowledge, Workflow } from './schema.js';
 import type { Store } from './store.js';
+
+type StoreEntry = ReturnType<Store['allEntries']>[number];
 
 /**
  * Export knowledge back to the host as ordinary skill files.
@@ -93,7 +95,10 @@ export function renderSkill(entry: Knowledge): string | undefined {
     lines.push(entry.body, '');
     if (entry.leaves.length) {
       lines.push('## 参考文档', '');
-      for (const leaf of entry.leaves) lines.push(`- ${leaf.path.split(/[\\/]/).slice(-2).join('/')}`);
+      for (const leaf of entry.leaves) {
+        const baseName = leaf.path.split(/[\\/]/).pop() || 'reference.md';
+        lines.push(`- references/${baseName}`);
+      }
       lines.push('');
     }
   } else if (entry.kind === 'norm') {
@@ -104,6 +109,26 @@ export function renderSkill(entry: Knowledge): string | undefined {
     return undefined;
   }
   return lines.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function checkWorkflowReady(workflow: Workflow, allMap: Map<string, StoreEntry>, ancestors = new Set<string>()): { ready: boolean; reason?: string } {
+  if (ancestors.has(workflow.id)) return { ready: false, reason: `cycle detected at ${workflow.id}` };
+  const nextAncestors = new Set(ancestors).add(workflow.id);
+  for (const stage of workflow.stages) {
+    for (const dep of stage.dependencies) {
+      if (dep.relationship === 'reference') continue;
+      const child = allMap.get(dep.workflowId);
+      if (!child || child.status !== 'active' || child.revision !== dep.revision) {
+        return { ready: false, reason: `required dependency ${dep.workflowId}@${dep.revision} is not active or missing` };
+      }
+      if (child.content.kind !== 'workflow') {
+        return { ready: false, reason: `dependency ${dep.workflowId} is not a workflow` };
+      }
+      const childCheck = checkWorkflowReady(child.content as Workflow, allMap, nextAncestors);
+      if (!childCheck.ready) return childCheck;
+    }
+  }
+  return { ready: true };
 }
 
 /**
@@ -136,21 +161,62 @@ export function exportSkills(store: Store, options: {
     }
   }
 
-  const records: Array<{ id: string; title: string; folder: string; markdown: string }> = [];
+  const allEntries = store.allEntries();
+  const allMap = new Map<string, StoreEntry>(allEntries.map(e => [e.id, e]));
+  const records: Array<{ id: string; title: string; folder: string; markdown: string; leaves: Array<{ relPath: string; body: string }> }> = [];
   const usedFolders = new Set<string>();
-  for (const entry of store.allEntries()) {
+  for (const entry of allEntries) {
     if (!kinds.includes(entry.content.kind)) { skipped.push({ id: entry.id, reason: `kind ${entry.content.kind} is not exported as a skill` }); continue; }
+    if (entry.content.kind === 'workflow') {
+      const readyCheck = checkWorkflowReady(entry.content, allMap);
+      if (!readyCheck.ready) {
+        skipped.push({ id: entry.id, reason: `workflow dependency not ready: ${readyCheck.reason}` });
+        continue;
+      }
+    }
     const markdown = renderSkill(entry.content);
     if (!markdown) { skipped.push({ id: entry.id, reason: 'not representable as a skill document' }); continue; }
     let folder = slug(entry.id, entry.content.title);
     // Two entries can share a title, and a readable name must still be unique.
     while (usedFolders.has(folder)) folder = `${folder}-${digest(folder + entry.id).slice(0, 4)}`;
     usedFolders.add(folder);
-    records.push({ id: entry.id, title: entry.content.title, folder, markdown });
+
+    const leaves: Array<{ relPath: string; body: string }> = [];
+    if (entry.content.kind === 'skill' && Array.isArray(entry.content.leaves)) {
+      for (const leaf of entry.content.leaves) {
+        const baseName = leaf.path.split(/[\\/]/).pop() || 'reference.md';
+        leaves.push({ relPath: join('references', baseName), body: leaf.body || '' });
+      }
+    }
+    records.push({ id: entry.id, title: entry.content.title, folder, markdown, leaves });
   }
 
   if (options.dryRun) {
-    return { directory, written: records.map(record => join(directory, record.folder, 'SKILL.md')), unchanged, skipped };
+    const planned: string[] = [];
+    for (const record of records) {
+      planned.push(join(directory, record.folder, 'SKILL.md'));
+      for (const leaf of record.leaves) {
+        planned.push(join(directory, record.folder, leaf.relPath));
+      }
+    }
+    return { directory, written: planned, unchanged, skipped };
+  }
+
+  // Clean up retired entries that were previously exported into this directory
+  if (existsSync(markerPath)) {
+    try {
+      const oldMarker = JSON.parse(readFileSync(markerPath, 'utf8'));
+      if (oldMarker && typeof oldMarker.skills === 'object' && oldMarker.skills) {
+        for (const oldFolder of Object.keys(oldMarker.skills)) {
+          if (!usedFolders.has(oldFolder)) {
+            const oldDirPath = join(directory, oldFolder);
+            if (existsSync(oldDirPath)) {
+              rmSync(oldDirPath, { recursive: true, force: true });
+            }
+          }
+        }
+      }
+    } catch {}
   }
 
   mkdirSync(directory, { recursive: true });
@@ -160,10 +226,24 @@ export function exportSkills(store: Store, options: {
     const file = join(folder, 'SKILL.md');
     const hash = digest(record.markdown);
     inventory[record.folder] = { hash, title: record.title, id: record.id };
-    if (existsSync(file) && digest(readFileSync(file, 'utf8')) === hash) { unchanged.push(file); continue; }
-    mkdirSync(folder, { recursive: true });
-    writeFileSync(file, record.markdown, 'utf8');
-    written.push(file);
+    if (existsSync(file) && digest(readFileSync(file, 'utf8')) === hash) { unchanged.push(file); }
+    else {
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(file, record.markdown, 'utf8');
+      written.push(file);
+    }
+
+    for (const leaf of record.leaves) {
+      const leafFile = join(folder, leaf.relPath);
+      const leafHash = digest(leaf.body);
+      if (existsSync(leafFile) && digest(readFileSync(leafFile, 'utf8')) === leafHash) {
+        unchanged.push(leafFile);
+      } else {
+        mkdirSync(dirname(leafFile), { recursive: true });
+        writeFileSync(leafFile, leaf.body, 'utf8');
+        written.push(leafFile);
+      }
+    }
   }
 
   writeFileSync(markerPath, JSON.stringify({

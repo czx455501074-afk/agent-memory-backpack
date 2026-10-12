@@ -169,13 +169,32 @@ export function stopFromLock(dataDir: string): { stopped: boolean; pid?: number;
  * `/health` is deliberately unauthenticated — it exists so liveness can be checked
  * without handing a credential to whoever is asking. The probe therefore tells us
  * the core is up, not that the knowledge is readable; those are different claims.
+ *
+ * "Is the core up" is narrower than "something answered 200". A redirect or an
+ * unrelated local service returning a JSON body was previously taken as a live
+ * core, so a mistyped or hijacked endpoint could report healthy while no
+ * knowledge plugin was listening at all. The two properties that actually
+ * identify the protocol are therefore required together: the version field and
+ * the plugin's own status marker, and redirects are refused rather than followed
+ * — a redirect means this origin is not the core, so following it would be
+ * testing a different machine than the one configured.
  */
 export async function probeHealth(endpoint: string, timeoutMs = 1500): Promise<{ healthy: boolean; detail: string }> {
   try {
-    const response = await fetch(`${endpoint.replace(/\/$/, '')}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const response = await fetch(`${endpoint.replace(/\/$/, '')}/health`, {
+      signal: AbortSignal.timeout(timeoutMs),
+      // Refused, not followed: the configured endpoint is the core, and a
+      // redirect proves it is not.
+      redirect: 'error',
+    });
     if (!response.ok) return { healthy: false, detail: `HTTP ${response.status}` };
-    const body = await response.json() as { protocolVersion?: number; status?: string };
+    let body: { protocolVersion?: number; status?: string };
+    try { body = await response.json() as { protocolVersion?: number; status?: string }; }
+    catch { return { healthy: false, detail: '响应不是 JSON，不是本插件核心' }; }
     if (body.protocolVersion !== 1) return { healthy: false, detail: `协议版本不符：${String(body.protocolVersion)}` };
+    // The core's own marker. Without it, any local service that answers with a
+    // numeric `protocolVersion` would be reported as this core.
+    if (body.status !== 'ok') return { healthy: false, detail: `状态标识不符：${String(body.status)}` };
     return { healthy: true, detail: `协议 v${body.protocolVersion}，状态 ${String(body.status)}` };
   } catch (error) {
     return { healthy: false, detail: error instanceof Error ? error.message : 'unreachable' };
@@ -201,6 +220,21 @@ export async function probeHealth(endpoint: string, timeoutMs = 1500): Promise<{
 export const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 export const RUN_VALUE = 'AgentMemoryBackpackCore';
 
+/**
+ * The key the startup entry is written under.
+ *
+ * Normally the per-user `Run` key. `AMB_RUN_KEY` overrides it so a test can
+ * register, query and remove against a scratch key instead of the user's live
+ * startup list — which matters because the entry is a real registry write, and
+ * the only honest alternative to a scratch key is an exact save-and-restore of
+ * whatever the user already had there. Targeting another key deliberately is
+ * also what an operator packaging a non-standard install would need.
+ */
+function runKey(): string {
+  const override = (process.env.AMB_RUN_KEY ?? '').trim();
+  return override || RUN_KEY;
+}
+
 export function loginStartupSupported(): boolean { return process.platform === 'win32'; }
 
 export function registerLoginStartup(coreEntry: string, dataDir: string): { ok: boolean; detail: string } {
@@ -208,7 +242,7 @@ export function registerLoginStartup(coreEntry: string, dataDir: string): { ok: 
   // Quoted so a path containing a space survives; the launcher passes this string
   // to the shell at logon, which is why it is built rather than passed as argv.
   const command = `"${process.execPath}" "${coreEntry}" serve --data-dir "${dataDir}"`;
-  const result = spawnSync('reg', ['add', RUN_KEY, '/v', RUN_VALUE, '/t', 'REG_SZ', '/d', command, '/f'], {
+  const result = spawnSync('reg', ['add', runKey(), '/v', RUN_VALUE, '/t', 'REG_SZ', '/d', command, '/f'], {
     encoding: 'utf8', windowsHide: true,
   });
   if (result.status !== 0) {
@@ -228,7 +262,7 @@ export function unregisterLoginStartup(): { ok: boolean; detail: string } {
   // English or Chinese pattern, so a text-based test reported a clean uninstall as
   // a failure. Querying is deterministic and locale-independent.
   if (!loginStartupStatus().registered) return { ok: true, detail: '登录启动本来就没有注册。' };
-  const result = spawnSync('reg', ['delete', RUN_KEY, '/v', RUN_VALUE, '/f'], { encoding: 'utf8', windowsHide: true });
+  const result = spawnSync('reg', ['delete', runKey(), '/v', RUN_VALUE, '/f'], { encoding: 'utf8', windowsHide: true });
   if (result.status !== 0) return { ok: false, detail: (result.stderr || result.stdout || 'reg delete failed').trim() };
   return { ok: true, detail: '已移除登录启动。' };
 }
@@ -238,7 +272,7 @@ export function loginStartupStatus(): { registered: boolean; detail: string } {
   // Existence is taken from the exit code, not from parsing the output: `reg query`
   // prints in the console code page, and a Chinese Windows would return bytes this
   // process cannot match against an English pattern.
-  const result = spawnSync('reg', ['query', RUN_KEY, '/v', RUN_VALUE], { encoding: 'utf8', windowsHide: true });
+  const result = spawnSync('reg', ['query', runKey(), '/v', RUN_VALUE], { encoding: 'utf8', windowsHide: true });
   if (result.status !== 0) return { registered: false, detail: '未注册登录启动。' };
   const command = /REG_SZ\s+(.+)/.exec(result.stdout ?? '')?.[1]?.trim();
   return { registered: true, detail: command ? `已注册登录启动：${command}` : '已注册登录启动。' };

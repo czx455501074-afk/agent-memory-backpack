@@ -6,6 +6,12 @@ dist/
 artifacts/
 .local/
 
+# Verification run output. The scripts and their JSON results are kept (they are
+# reproducible evidence), but the raw console logs record absolute paths from the
+# machine that ran them and the harness writes them fresh on every run.
+verification/**/evidence/
+verification/**/*.log
+
 # Runtime state and credentials: never commit these
 *.sqlite
 *.sqlite-shm

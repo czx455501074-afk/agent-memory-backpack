@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireLock, inspectLock, lockPath, loginStartupStatus, processAlive, recoverStale, registerLoginStartup, releaseLock, stopFromLock, unregisterLoginStartup, loginStartupSupported } from '../src/service.js';
@@ -108,17 +109,26 @@ test('存活判定把"无法发信号"当作存活，而不是当作已死', () 
 });
 
 /**
- * Login startup needs the user's own registry hive, so this writes to the real
- * `HKCU\...\Run` key — and removes what it wrote.
+ * Login startup writes a real registry value, so the test aims it at a scratch
+ * key instead of the user's live `Run` list.
  *
- * The value name is specific to this project, and the test restores whatever was
- * there before, so running the suite on a developer machine neither leaves an
- * entry behind nor clobbers one a user had configured.
+ * An earlier version registered the plugin's actual startup value and "restored"
+ * the machine by unregistering it and, if something had been there, writing back
+ * a hard-coded `C:/path/cli.js` — a command no user has. On a machine where the
+ * real entry existed, running the suite therefore replaced the user's own
+ * configured command with a fictional one, and left it. Redirecting the key
+ * removes the whole class of problem: the test never touches the entry it would
+ * otherwise have to restore, so there is nothing to get wrong on the way out.
  */
 test('登录启动可注册、可查询、可移除，且重复注销不算失败', (t) => {
   if (!loginStartupSupported()) { t.skip('登录启动只为 Windows 实现'); return; }
-  const before = loginStartupStatus();
+  const scratchKey = `HKCU\\Software\\AgentMemoryBackpack\\Tests\\Run-${process.pid}`;
+  process.env.AMB_RUN_KEY = scratchKey;
   try {
+    // The user's real startup list must be untouched by any of this.
+    const before = loginStartupStatus();
+    assert.equal(before.registered, false, '临时键起始应为空');
+
     const added = registerLoginStartup('C:/path/cli.js', 'C:/data');
     assert.equal(added.ok, true, `注册应成功：${added.detail}`);
     const status = loginStartupStatus();
@@ -133,8 +143,10 @@ test('登录启动可注册、可查询、可移除，且重复注销不算失�
     const again = unregisterLoginStartup();
     assert.equal(again.ok, true, '重复注销必须成功，这是卸载路径要用的性质');
   } finally {
-    // Restore the machine: leave the entry as it was found.
     unregisterLoginStartup();
-    if (before.registered) registerLoginStartup('C:/path/cli.js', 'C:/data');
+    delete process.env.AMB_RUN_KEY;
+    // The scratch key lives under this project's own Software tree; drop it so a
+    // test run leaves no residue at all.
+    spawnSync('reg', ['delete', `HKCU\\Software\\AgentMemoryBackpack`, '/f'], { windowsHide: true });
   }
 });

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { Scope } from './schema.js';
 
 /**
  * Temporary material and its two-layer expiry.
@@ -78,6 +79,13 @@ export interface MaterialInput {
   body?: string;
   taskId?: string;
   provenance?: 'user' | 'external' | 'agent';
+  /**
+   * Where the material applies, decided by the *caller's identity* rather than by
+   * the request body: an adapter may only record material for the project its
+   * credential is bound to, and a global scope is a deliberate admin decision.
+   * Defaults to global for callers that supply nothing (seed and backup replay).
+   */
+  scope?: Scope;
   /** Overrides the default retention; used when replaying a stored record. */
   savedAt?: number;
   expiresAt?: number;
@@ -97,7 +105,9 @@ export function materialEntry(input: MaterialInput, now = Date.now()) {
     id: input.id,
     kind: 'material' as const,
     title: input.title,
-    scope: { kind: 'global' as const },
+    // The scope is the caller's, not a constant: a project's short-lived reference
+    // must not become readable by every other project just because it is temporary.
+    scope: input.scope ?? { kind: 'global' as const },
     baseRevision: 0,
     labels: [] as string[],
     provenance: input.provenance ?? 'external',

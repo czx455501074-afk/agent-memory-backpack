@@ -129,6 +129,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // from the shared data directory by default. An explicit AMB_CONFIG still wins,
   // but only when it names a file that exists — a stale pointer used to disable
   // the plugin silently.
-  try { await createMcp(new CoreClient(readClientConfig(undefined, 'codex'))).connect(new StdioServerTransport()); }
+  //
+  // There is deliberately no `cwd ⊆ projectRoot` check here. The host launches this
+  // server from the plugin directory (`.mcp.json` declares `"cwd": "."`), so such a
+  // check refused every legitimate session; and measurement shows the core's own
+  // per-request scope enforcement is complete without it. See `CoreClient.post`.
+  try {
+    await createMcp(new CoreClient(readClientConfig(undefined, 'codex'))).connect(new StdioServerTransport());
+  }
   catch (error) { console.error((error as Error).message); process.exitCode = 1; }
 }
