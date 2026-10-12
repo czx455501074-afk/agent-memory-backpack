@@ -129,8 +129,11 @@ for (const profile of candidates) {
   const before = JSON.stringify(manifest);
   manifest.dependencies[PACKAGE] = `link:${target.replace(/\\/g, '/')}`;
   const bundles = manifest.dsh?.profile?.bundles;
-  const activated = Array.isArray(bundles) && bundles.includes(PACKAGE);
-  if (Array.isArray(bundles) && !activated) bundles.push(PACKAGE);
+  // Whether this profile already listed the package, which decides only whether the
+  // list needs the entry added. The name says "pre-write" on purpose: judging the
+  // outcome from this value is the mistake the re-read below corrects.
+  const alreadyListed = Array.isArray(bundles) && bundles.includes(PACKAGE);
+  if (Array.isArray(bundles) && !alreadyListed) bundles.push(PACKAGE);
   if (JSON.stringify(manifest) !== before) {
     writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
   }
@@ -151,14 +154,35 @@ for (const profile of candidates) {
   // Verified by reading through the link, not by trusting the calls above.
   const wired = existsSync(join(link, SENTINEL));
   if (!wired) failures += 1;
-  // `activated` is the real answer and is reported alone. It previously read
-  // `activated || Array.isArray(bundles)`, which is true for any profile that
-  // merely *has* a bundles list — so a deploy that failed to add this package
-  // still printed active=true and could exit 0. A user reading that line would
-  // believe the plugin was enabled when it was not, which is the same
-  // false-positive class as the capability report this project already fixed.
-  if (Array.isArray(bundles) && !activated) failures += 1;
-  console.log(`  ${profile.padEnd(10)} active=${activated} linked=${wired ? 'yes' : 'NO'}`);
+  /**
+   * Activation is judged from what is on disk *after* the write, not from the value
+   * computed before it.
+   *
+   * The earlier form read `activated`, which was captured before `bundles` was
+   * updated. On a first deploy the package was pushed into the list, written, and then
+   * reported `active=false` with a non-zero exit — while a second run found the entry
+   * already present and exited 0. So the command that did the work was the one that
+   * reported failure, which teaches a user to ignore its exit code; and the exit code
+   * is the only signal an unattended install has.
+   *
+   * The intent of the original change still holds and is what the re-read preserves: a
+   * profile must not be reported active merely because it *has* a bundles list. Only a
+   * list that actually contains this package counts. A profile with no bundles list at
+   * all is reported as not applicable rather than as a failure, because there is
+   * nothing to activate.
+   */
+  const activated = (() => {
+    if (!Array.isArray(bundles)) return null;
+    try {
+      const reread = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      const list = reread.dsh?.profile?.bundles;
+      return Array.isArray(list) && list.includes(PACKAGE);
+    } catch {
+      return false;
+    }
+  })();
+  if (activated === false) failures += 1;
+  console.log(`  ${profile.padEnd(10)} active=${activated === null ? 'n/a' : activated} linked=${wired ? 'yes' : 'NO'}`);
 }
 
 console.log(`\nRestart DSH for the host to load the deployed package.`);
