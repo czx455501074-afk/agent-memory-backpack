@@ -6,6 +6,7 @@ import { createClient, isExplicitClientRejection, isRecordValue, isWithinProject
 import { createAdapterLogger } from './log.mjs'
 import { ensureCoreRunning } from './ensure-core.mjs'
 import { checkShellWriteBypass, decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from './gate-cache.mjs'
+import { spoolEnqueue, spoolReplay } from './spool.mjs'
 
 /** The packaged core entry point, resolved beside this adapter. */
 const ADAPTER_DIR = dirname(fileURLToPath(import.meta.url))
@@ -295,6 +296,17 @@ export async function apply(ctx) {
         logger.warn('outbox.replay_failed', {
           sessionId: currentSessionId,
           message: replayError instanceof Error ? replayError.message : String(replayError),
+        })
+      }
+      try {
+        const spoolOutcome = await spoolReplay(config.dataDir, client, logger)
+        if (spoolOutcome.replayed > 0) {
+          logger.info('spool.replay', { sessionId: currentSessionId, replayed: spoolOutcome.replayed, remaining: spoolOutcome.remaining })
+        }
+      } catch (spoolError) {
+        logger.warn('spool.replay_failed', {
+          sessionId: currentSessionId,
+          message: spoolError instanceof Error ? spoolError.message : String(spoolError),
         })
       }
     }
@@ -815,6 +827,26 @@ export async function apply(ctx) {
             idempotencyKey: proposalPayload.idempotencyKey,
             message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
           })
+          try {
+            const outcome = spoolEnqueue(config.dataDir, {
+              kind: 'candidate',
+              idempotencyKey: proposalPayload.idempotencyKey,
+              projectId: config.projectId,
+              payload: proposalPayload,
+              error: (enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)).slice(0, 2000),
+            })
+            if (outcome.enqueued) {
+              logger.info('spool.enqueued', { kind: 'candidate', idempotencyKey: proposalPayload.idempotencyKey })
+            } else {
+              logger.warn('spool.enqueue_refused', { kind: 'candidate', idempotencyKey: proposalPayload.idempotencyKey, reason: outcome.reason })
+            }
+          } catch (spoolErr) {
+            logger.warn('spool.enqueue_failed', {
+              kind: 'candidate',
+              idempotencyKey: proposalPayload.idempotencyKey,
+              message: spoolErr instanceof Error ? spoolErr.message : String(spoolErr),
+            })
+          }
           return {
             id: proposalPayload.idempotencyKey,
             state: 'pending',
@@ -897,6 +929,26 @@ export async function apply(ctx) {
           idempotencyKey: eventPayload.eventId,
           message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
         })
+        try {
+          const outcome = spoolEnqueue(config.dataDir, {
+            kind: 'event',
+            idempotencyKey: eventPayload.eventId,
+            projectId: config.projectId,
+            payload: eventPayload,
+            error: (enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)).slice(0, 2000),
+          })
+          if (outcome.enqueued) {
+            logger.info('spool.enqueued', { kind: 'event', idempotencyKey: eventPayload.eventId })
+          } else {
+            logger.warn('spool.enqueue_refused', { kind: 'event', idempotencyKey: eventPayload.eventId, reason: outcome.reason })
+          }
+        } catch (spoolErr) {
+          logger.warn('spool.enqueue_failed', {
+            kind: 'event',
+            idempotencyKey: eventPayload.eventId,
+            message: spoolErr instanceof Error ? spoolErr.message : String(spoolErr),
+          })
+        }
       }
     })
   })

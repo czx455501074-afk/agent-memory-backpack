@@ -10,6 +10,7 @@ import { resolveClientConfig } from "./resolve-config.mjs";
 import { ensureCoreRunning } from "./ensure-core.mjs";
 import { checkShellWriteBypass, decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from "./gate-cache.mjs";
 import { checkNodeVersion } from "./node-version.mjs";
+import { spoolEnqueue, spoolReplay } from "./spool.mjs";
 
 const MAX_STDIN_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 4500;
@@ -522,6 +523,17 @@ async function replayOutboxIfNeeded(input, config) {
       message: error instanceof Error ? error.message : "unknown",
     });
   }
+  try {
+    const clientAdapter = {
+      post: (path, body) => post(config, path, body),
+    };
+    await spoolReplay(config.dataDir, clientAdapter, logger);
+  } catch (spoolError) {
+    logger.warn("spool.replay_failed", {
+      sessionId: sessionId || "unknown",
+      message: spoolError instanceof Error ? spoolError.message : String(spoolError),
+    });
+  }
 }
 
 async function recordEvent(input, config) {
@@ -553,7 +565,19 @@ async function recordEvent(input, config) {
       throw error;
     }
     // Network / timeout / 5xx: enqueue full payload into persistent outbox
-    let enqueued = false;
+    /**
+     * Whether the core has this event — either it accepted the delivery, or its own
+     * outbox did. That is what decides whether the hook may report success, because the
+     * host reads the exit code as "the turn was recorded".
+     *
+     * The local spool is deliberately a different thing and does not set this. Writing the
+     * event to disk means it will be delivered *later*, not that it was delivered now;
+     * treating the two as equivalent made a failed delivery look like a successful one,
+     * with the hook exiting 0 and saying nothing about the core being unreachable. The
+     * stop-event contract forbids exactly that, so the flag is named for what it means
+     * rather than for the step that happened to set it.
+     */
+    let deliveredToCore = false;
     try {
       await post(config, "/v1/outbox/enqueue", {
         kind: "event",
@@ -564,20 +588,45 @@ async function recordEvent(input, config) {
         attempts: 1,
       });
       logger.info("outbox.enqueued", { kind: "event", idempotencyKey: eventPayload.eventId });
-      enqueued = true;
+      deliveredToCore = true;
     } catch (enqueueErr) {
       logger.warn("outbox.enqueue_failed", {
         kind: "event",
         idempotencyKey: eventPayload.eventId,
         message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
       });
+      try {
+        const outcome = spoolEnqueue(config.dataDir, {
+          kind: "event",
+          idempotencyKey: eventPayload.eventId,
+          projectId: config.projectId,
+          payload: eventPayload,
+          error: (enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)).slice(0, 2000),
+        });
+        if (outcome.enqueued) {
+          // Saved for replay on the next session. Note that `deliveredToCore` stays false:
+          // the event is preserved, the turn is still unrecorded, and the two must not be
+          // conflated.
+          logger.info("spool.enqueued", { kind: "event", idempotencyKey: eventPayload.eventId });
+        } else {
+          logger.warn("spool.enqueue_refused", { kind: "event", idempotencyKey: eventPayload.eventId, reason: outcome.reason });
+        }
+      } catch (spoolErr) {
+        logger.warn("spool.enqueue_failed", {
+          kind: "event",
+          idempotencyKey: eventPayload.eventId,
+          message: spoolErr instanceof Error ? spoolErr.message : String(spoolErr),
+        });
+      }
     }
 
     if (stopped) {
-      if (enqueued) {
+      if (deliveredToCore) {
         emit({ continue: true });
       } else {
-        // If neither direct delivery nor enqueue succeeded, keep the failure observable
+        // Neither direct delivery nor the core's own outbox took it. The event is safe on
+        // disk and will be replayed, but this turn is not recorded, and the host has to be
+        // able to see that: an exit of 0 here would be an apparent stop success.
         throw error;
       }
     }

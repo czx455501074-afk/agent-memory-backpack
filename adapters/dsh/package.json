@@ -24,7 +24,8 @@
     "dsh-plugin.naming.json",
     "resolve-config.mjs",
     "ensure-core.mjs",
-    "gate-cache.mjs"
+    "gate-cache.mjs",
+    "spool.mjs"
   ],
   "engines": {
     "node": ">=24.13.0 <25"
