@@ -410,7 +410,12 @@ test("the default config path is ~/.agent-memory-backpack/client.json", async ()
   const result = await runHook(
     { hook_event_name: "PreToolUse", tool_name: "Bash", cwd: dir },
     undefined,
-    { USERPROFILE: dir },
+    // Both variables, because `homedir()` reads USERPROFILE on Windows and HOME
+    // elsewhere. Setting only USERPROFILE left the real HOME in place on Linux and
+    // macOS — `runHook` spreads the process environment — so the hook resolved the
+    // operator's own data directory instead of this fixture and the assertion below
+    // tested the wrong home. `adapter-config.test.ts` already sets both.
+    { USERPROFILE: dir, HOME: dir },
   );
 
   // The subject is "was the default path found and used", asserted through the

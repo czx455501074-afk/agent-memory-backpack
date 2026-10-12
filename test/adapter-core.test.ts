@@ -17,6 +17,31 @@ const cliEntry = join(repoRoot, 'dist/src/cli.js');
 
 const sha = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 
+/**
+ * Whether nothing is listening on a loopback port.
+ *
+ * Binding is the test: a successful bind proves the port was released, which an
+ * exit status cannot. Used to confirm a detached core was really reaped.
+ */
+async function portIsFree(port: number): Promise<boolean> {
+  return await new Promise<boolean>(done => {
+    const probe = createServer();
+    probe.once('error', () => done(false));
+    probe.once('listening', () => probe.close(() => done(true)));
+    probe.listen(port, '127.0.0.1');
+  });
+}
+
+/** Wait for a released port, since the OS may take a moment to let go of it. */
+async function waitForPortFree(port: number, timeoutMs = 3_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await portIsFree(port)) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise(done => setTimeout(done, 100));
+  }
+}
+
 /** A free loopback port, so a run never collides with a service already up. */
 async function freePort(): Promise<number> {
   return await new Promise((done, fail) => {
@@ -41,8 +66,30 @@ async function freePort(): Promise<number> {
  */
 async function killListener(port: number): Promise<void> {
   if (process.platform !== 'win32') {
-    // Best effort elsewhere; the CI target for this project is Windows.
-    spawn('sh', ['-c', `lsof -ti tcp:${port} | xargs -r kill`], { stdio: 'ignore' });
+    /**
+     * Await each attempt, and try more than one tool.
+     *
+     * This used to be a single fire-and-forget `spawn('sh', ['-c', 'lsof … | xargs
+     * -r kill'])`. Two things were wrong with that. It did not await, so the kill
+     * raced the process exit; and `lsof` is not installed everywhere while `-r` is a
+     * GNU extension, so on a host without it the command failed silently and left the
+     * detached core behind — which is exactly the leaked process an external Linux run
+     * reported. Port availability is used as the completion condition rather than the
+     * exit status, because a tool exiting 0 does not by itself mean the port is free.
+     */
+    const attempts = [
+      `lsof -ti tcp:${port} | xargs -r kill`,
+      `fuser -k ${port}/tcp`,
+      `ss -lptn "sport = :${port}" | grep -oP 'pid=\\K[0-9]+' | xargs -r kill`,
+    ];
+    for (const command of attempts) {
+      if (await portIsFree(port)) return;
+      await new Promise<void>(done => {
+        const child = spawn('sh', ['-c', command], { stdio: 'ignore' });
+        child.once('close', () => done());
+        child.once('error', () => done());
+      });
+    }
     return;
   }
   const find = spawn('powershell', ['-NoProfile', '-Command',
@@ -155,12 +202,16 @@ test('从零真实拉起一个核心并使其健康', async () => {
     writeFileSync(file, JSON.stringify(client, null, 2), 'utf8');
   }
 
+  // `started` records that a detached core was actually launched, so the check in
+  // `finally` only speaks when there was something to reap.
+  let started = false;
   try {
     const outcome = await ensureCoreRunning({
       endpoint: `http://127.0.0.1:${port}`, dataDir, coreEntry: cliEntry,
     });
     assert.equal(outcome.reason, 'started', `应成功拉起核心，实际 ${JSON.stringify(outcome)}`);
     assert.equal(outcome.started, true);
+    started = true;
 
     // Prove it is a real core: ask for something only it can answer.
     const health = await fetch(`http://127.0.0.1:${port}/health`);
@@ -177,6 +228,12 @@ test('从零真实拉起一个核心并使其健康', async () => {
     // The core is started detached, so it must be reaped by port rather than by
     // a child handle the test never held.
     await killListener(port);
+    // Reaping is asserted, not assumed. A kill that silently did nothing used to
+    // leave a core listening — invisible here, and then poisoning whichever test
+    // next picked this port. Failing loudly is the only way that stays fixed.
+    if (started) {
+      assert.equal(await waitForPortFree(port), true, '拉起的核心必须被回收，端口必须释放');
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });
