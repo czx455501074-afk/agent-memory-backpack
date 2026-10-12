@@ -27,6 +27,30 @@ function tempDir(): string {
 }
 process.on('exit', () => { for (const dir of dirs) rmSync(dir, { recursive: true, force: true }); });
 
+/**
+ * Run `body` with the host-location overrides cleared.
+ *
+ * Detection consults `DSH_HOME`, `CODEX_HOME` and `AMB_PLUGIN_DIR`, because the
+ * scripts that deploy the package honour them (`deploy-plugin.mjs`,
+ * `amb-install.mjs`) and detection disagreeing with them was its own defect.
+ *
+ * A test that builds a *synthetic* home must therefore clear these: otherwise the
+ * ambient environment decides the answer, and the test stops testing what its name
+ * says. That is not hypothetical — on the machine where this suite runs, `DSH_HOME`
+ * points at a real home with the plugin genuinely installed, so a synthetic home
+ * would otherwise be reported as "installed" from someone else's directory.
+ */
+function withHostEnvCleared<T>(body: () => T): T {
+  const keys = ['DSH_HOME', 'CODEX_HOME', 'AMB_PLUGIN_DIR'] as const;
+  const saved = keys.map(key => [key, process.env[key]] as const);
+  for (const key of keys) delete process.env[key];
+  try { return body(); } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+}
+
 test('两端分别列出，且已知的能力缺口如实标为不支持', () => {
   const manifest = capabilityManifest(tempDir());
   assert.equal(manifest.length, 2, '必须两端分别标记，不能合并成一份');
@@ -130,8 +154,11 @@ test('核心侧与适配器侧对快照文件名的约定一致', () => {
  *
  * Both halves are checked here: a declared profile is found, and a bare link is
  * reported as a leftover rather than as an installation.
+ *
+ * The synthetic home is isolated from the host-location overrides so the assertions
+ * below describe the fixture and not whatever machine happens to run them.
  */
-test('安装判定以会加载插件的 profile 为准，且残留链接如实报出', () => {
+test('安装判定以会加载插件的 profile 为准，且残留链接如实报出', () => withHostEnvCleared(() => {
   const home = tempDir();
   const profiles = join(home, '.dsh', 'profiles');
 
@@ -185,4 +212,70 @@ test('安装判定以会加载插件的 profile 为准，且残留链接如实�
   assert.equal(bare.installed, false, '只有残留链接、没有声明时不得报告为已安装');
   assert.equal(bare.location, null);
   assert.ok(bare.notes.some(note => note.includes('残留')), '仍须告知用户该残留的存在');
-});
+}));
+
+/**
+ * A home relocated through the same variable the deploy step honours must be found.
+ *
+ * The external report found the mismatch: `scripts/deploy-plugin.mjs` resolves the
+ * DSH home from `DSH_HOME` (and `scripts/amb-install.mjs` resolves Codex's from
+ * `CODEX_HOME`), while detection derived every path from the user's home directory.
+ * So a plugin deployed through either variable loaded and worked, and the capability
+ * list still answered `installed: false` — a report contradicting an install the
+ * user had just performed, which is the same class of overstatement as claiming an
+ * installation that is not there.
+ */
+test('DSH_HOME / CODEX_HOME / AMB_PLUGIN_DIR 指定的位置必须被识别', () => withHostEnvCleared(() => {
+  const manifestAt = (dir: string, name: string, version: string) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version }), 'utf8');
+    return dir;
+  };
+
+  // An empty home, so anything found must come from the variable.
+  const emptyHome = tempDir();
+
+    // DSH_HOME with a declaring profile.
+    const dshHome = tempDir();
+    const profile = join(dshHome, 'profiles', 'desktop');
+    manifestAt(join(profile, 'node_modules', 'dsh-agent-memory-backpack'), 'dsh-agent-memory-backpack', '9.9.9');
+    writeFileSync(join(profile, 'package.json'), JSON.stringify({
+      name: 'p', dependencies: { 'dsh-agent-memory-backpack': 'link:../x' },
+      dsh: { profile: { bundles: ['dsh-agent-memory-backpack'] } },
+    }), 'utf8');
+    process.env.DSH_HOME = dshHome;
+    const viaDshHome = capabilityManifest(emptyHome).find(m => m.id === 'dsh')!;
+    assert.equal(viaDshHome.installed, true, 'DSH_HOME 下的安装必须被识别');
+    assert.match(String(viaDshHome.location), /desktop/, '必须指向该 home 下的 profile');
+
+    // The default deploy target: <DSH_HOME>/plugins/agent-memory-backpack.
+    const pluginHome = tempDir();
+    manifestAt(join(pluginHome, 'plugins', 'agent-memory-backpack'), 'dsh-agent-memory-backpack', '8.8.8');
+    process.env.DSH_HOME = pluginHome;
+    const viaPlugins = capabilityManifest(emptyHome).find(m => m.id === 'dsh')!;
+    assert.equal(viaPlugins.installed, true, 'DSH_HOME/plugins 下的安装必须被识别（默认部署目标）');
+    assert.equal(viaPlugins.version, '8.8.8');
+
+    // CODEX_HOME, which amb-install.mjs honours.
+    const codexHome = tempDir();
+    manifestAt(join(codexHome, 'plugins', 'agent-memory-backpack'), 'agent-memory-backpack', '6.6.6');
+    process.env.CODEX_HOME = codexHome;
+    const viaCodexHome = capabilityManifest(emptyHome).find(m => m.id === 'codex')!;
+    assert.equal(viaCodexHome.installed, true, 'CODEX_HOME 下的安装必须被识别');
+    assert.equal(viaCodexHome.version, '6.6.6');
+
+    // An explicit destination is where the operator said it lives, so it wins.
+    const explicit = manifestAt(tempDir(), 'dsh-agent-memory-backpack', '7.7.7');
+    process.env.AMB_PLUGIN_DIR = explicit;
+    const viaExplicit = capabilityManifest(emptyHome).find(m => m.id === 'dsh')!;
+    assert.equal(viaExplicit.installed, true);
+    assert.equal(viaExplicit.location, explicit, 'AMB_PLUGIN_DIR 指定的位置应优先');
+
+    // And with nothing set anywhere, an empty home must still report nothing —
+    // the check must not have become credulous in the process.
+    delete process.env.DSH_HOME;
+    delete process.env.CODEX_HOME;
+    delete process.env.AMB_PLUGIN_DIR;
+    const clean = capabilityManifest(tempDir());
+    assert.ok(clean.every(m => m.installed === false), '空目录不得被判定为已安装');
+}));

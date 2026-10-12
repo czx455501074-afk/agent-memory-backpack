@@ -118,10 +118,17 @@ test('技能下的 history/tmp 等运行态目录不被收作叶子', async () =
     assert.equal(entry.kind, 'skill');
     assert.equal(entry.leaves?.length, 1, '只应收到 references 下的有效文档');
     assert.match(entry.leaves![0]!.path, /notes\.md$/);
+    // Judged on the path *below the skill root*, not the absolute one. A leaf's path
+    // is absolute, so matching the raw string also matched the host's own temp
+    // directory whenever that contained a `tmp` segment — the check then failed on a
+    // machine whose TEMP was `…\tmp\…` while the behaviour under test was correct.
+    // The intent is "no leaf came from history/ or tmp/ inside the skill", which is
+    // exactly what the relative segments express.
+    const underSkill = (entry.leaves ?? []).map(leaf => relative(dir, leaf.path).replace(/\\/g, '/'));
     assert.equal(
-      (entry.leaves ?? []).some(leaf => /[\\/](history|tmp)[\\/]/.test(leaf.path)),
+      underSkill.some(path => path.split('/').slice(0, -1).some(segment => segment === 'history' || segment === 'tmp')),
       false,
-      'history/ 与 tmp/ 下的内容不得成为技能叶子',
+      `history/ 与 tmp/ 下的内容不得成为技能叶子；实际叶子：${JSON.stringify(underSkill)}`,
     );
   } finally { await cleanup(root); }
 });
@@ -150,13 +157,19 @@ test('排除清单覆盖凭据、宿主清单与可执行文件，且理由是�
       ['config.toml', /configuration/],
     ];
     for (const [name, pattern] of cases) {
-      const reason = exclusionReason(join(root, name), name);
+      // Relative, because that is the function's contract: only segments *below*
+      // the scan root are the caller's business, and `discover` passes the relative
+      // path. Prefixing the absolute fixture root made the outcome depend on the
+      // machine — a temp path containing a literal `tmp` segment tripped the
+      // runtime-store rule and failed this test on a host whose TEMP was
+      // `D:\amb-wintest\tmp`, while passing wherever TEMP is `…\Temp`.
+      const reason = exclusionReason(join('project', name), name);
       assert.ok(reason, `${name} 必须被排除`);
       assert.match(reason, pattern, `${name} 的排除理由不明确: ${reason}`);
     }
     // Adoptable documents must not be excluded by the path rules.
-    assert.equal(exclusionReason(join(root, 'AGENTS.md'), 'AGENTS.md'), undefined);
-    assert.equal(exclusionReason(join(root, 'skills', 'demo', 'SKILL.md'), 'SKILL.md'), undefined);
+    assert.equal(exclusionReason(join('project', 'AGENTS.md'), 'AGENTS.md'), undefined);
+    assert.equal(exclusionReason(join('project', 'skills', 'demo', 'SKILL.md'), 'SKILL.md'), undefined);
 
     // A non-markdown file is excluded during the scan, with a reason.
     const report = discover([join(root, 'notes.txt')]);
@@ -271,4 +284,43 @@ test('日期命名的日记被识别为知识，而不是当作孤立片段丢�
     assert.equal(report.candidates.some(c => c.source.path.endsWith('notes.md')), false,
       '同目录下非日期命名的 Markdown 不得因为文件夹名被当作日记');
   } finally { await cleanup(root); }
+});
+
+/**
+ * A scan root sitting under a directory named `tmp` must still yield its documents.
+ *
+ * The exclusion rules skip runtime stores by path segment, and a host whose temporary
+ * directory is literally `…/tmp/…` made two checks in this file fail: they prefixed
+ * the absolute fixture root, so the *machine's* temp path — not the tree being
+ * scanned — decided the answer. This pins the behaviour end to end instead: the walk
+ * compares only segments below the root, so a `tmp` segment *above* it is irrelevant,
+ * while a `tmp` directory *inside* it is still skipped.
+ */
+test('扫描根位于 tmp 段之下时文件仍被采纳，而根之下的 tmp 目录仍被跳过', async () => {
+  const outer = await mkdtemp(join(tmpdir(), 'amb-tmpseg-'));
+  try {
+    const scanned = join(outer, 'tmp', 'project');
+    await mkdir(join(scanned, 'skills', 'demo'), { recursive: true });
+    await writeFile(join(scanned, 'AGENTS.md'), '# 工作契约\n\n默认中文。\n');
+    await writeFile(join(scanned, 'skills', 'demo', 'SKILL.md'), '# 技能\n\n## 触发\n需要时。\n');
+    // A directory named tmp *below* the root is a runtime store and must be skipped.
+    await mkdir(join(scanned, 'cache', 'tmp'), { recursive: true });
+    await writeFile(join(scanned, 'cache', 'tmp', 'should-not-adopt.md'), '# 不应被采纳\n');
+
+    const report = discover([scanned]);
+    const adopted = report.candidates.map(c => c.source.path.replace(/\\/g, '/'));
+    assert.ok(
+      report.candidates.some(c => c.source.path.endsWith('AGENTS.md')),
+      `根位于 tmp 段下时 AGENTS.md 必须被采纳；实际候选：${JSON.stringify(adopted)}`,
+    );
+    assert.ok(
+      report.candidates.some(c => c.source.path.endsWith('SKILL.md')),
+      `根位于 tmp 段下时技能文档必须被采纳；实际候选：${JSON.stringify(adopted)}`,
+    );
+    assert.equal(
+      report.candidates.some(c => c.source.path.includes('should-not-adopt')),
+      false,
+      '根之下名为 tmp 的目录内容仍必须被排除',
+    );
+  } finally { await rm(outer, { recursive: true, force: true }); }
 });

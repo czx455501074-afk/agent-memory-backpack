@@ -108,9 +108,35 @@ function checkManifest(dir: string): string | null {
   return null;
 }
 
+/**
+ * The host roots to look under, for each adapter kind.
+ *
+ * Detection used to derive everything from the user's home directory alone, while
+ * the scripts that *deploy* the package honour `DSH_HOME` (`deploy-plugin.mjs`) and
+ * `CODEX_HOME` (`amb-install.mjs`). A deployment made through either variable was
+ * therefore invisible here: the plugin loaded and worked, and the capability list
+ * still answered `installed: false`. Both are read for both kinds so a home
+ * relocated through either variable is found.
+ *
+ * `AMB_PLUGIN_DIR` is a directory the package itself was placed in rather than a
+ * host root, so it is handled separately.
+ */
+function hostRoots(kind: 'dsh' | 'codex', home: string): string[] {
+  const roots = new Set<string>();
+  const add = (value: string | undefined) => { if (value) roots.add(value); };
+  if (kind === 'dsh') {
+    if (home) for (const dir of ['.dsh', '.codex', '.agents']) add(join(home, dir));
+    add(process.env.DSH_HOME);
+  } else {
+    if (home) add(join(home, '.codex'));
+    add(process.env.CODEX_HOME);
+  }
+  return [...roots];
+}
+
 /** Find an installed adapter package in the known profile locations. */
 function locate(kind: 'dsh' | 'codex', home: string): { location: string | null; version: string | null; leftovers: string[] } {
-  if (!home) return { location: null, version: null, leftovers: [] };
+  if (!home && !process.env.DSH_HOME && !process.env.CODEX_HOME) return { location: null, version: null, leftovers: [] };
 
   if (kind === 'dsh') {
     const leftovers: string[] = [];
@@ -135,8 +161,8 @@ function locate(kind: 'dsh' | 'codex', home: string): { location: string | null;
     // come later in the scan order — which is precisely how the stale `desktop`
     // link stayed invisible while the report claimed a clean install.
     let installed: { location: string; version: string } | null = null;
-    for (const dir of ['.dsh', '.codex', '.agents']) {
-      const profilesDir = join(home, dir, 'profiles');
+    for (const root of hostRoots('dsh', home)) {
+      const profilesDir = join(root, 'profiles');
       let profileNames: string[] = [];
       try {
         profileNames = readdirSync(profilesDir).sort();
@@ -159,25 +185,35 @@ function locate(kind: 'dsh' | 'codex', home: string): { location: string | null;
         }
       }
       // A plugin dropped directly into the host's plugin directory, outside any
-      // profile, is still an installation if it carries a valid manifest.
-      const direct = join(home, dir, 'plugins', 'agent-memory-backpack');
+      // profile, is still an installation if it carries a valid manifest. This is
+      // the location `deploy-plugin.mjs` uses by default.
+      const direct = join(root, 'plugins', 'agent-memory-backpack');
       if (existsSync(direct)) {
         const version = checkManifest(direct);
         if (version) installed ??= { location: direct, version };
       }
     }
+    // An explicit destination wins over a discovered one: it is where the operator
+    // said the package lives, so reporting anything else would contradict the
+    // deploy step they just ran.
+    const explicit = process.env.AMB_PLUGIN_DIR;
+    if (explicit) {
+      const version = checkManifest(explicit);
+      if (version) return { location: explicit, version, leftovers };
+    }
     return { location: installed?.location ?? null, version: installed?.version ?? null, leftovers };
   }
   {
     // Codex: direct plugin directory or nested in cache/<marketplace>/agent-memory-backpack/<version>
-    const direct = join(home, '.codex', 'plugins', 'agent-memory-backpack');
-    if (existsSync(direct)) {
-      const version = checkManifest(direct);
-      if (version) return { location: direct, version, leftovers: [] };
-    }
+    for (const root of hostRoots('codex', home)) {
+      const direct = join(root, 'plugins', 'agent-memory-backpack');
+      if (existsSync(direct)) {
+        const version = checkManifest(direct);
+        if (version) return { location: direct, version, leftovers: [] };
+      }
 
-    const cacheRoot = join(home, '.codex', 'plugins', 'cache');
-    if (existsSync(cacheRoot)) {
+      const cacheRoot = join(root, 'plugins', 'cache');
+      if (!existsSync(cacheRoot)) continue;
       try {
         const entries = readdirSync(cacheRoot, { withFileTypes: true });
         for (const entry of entries) {

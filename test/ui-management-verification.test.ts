@@ -24,6 +24,26 @@ function tempDir(): string {
 }
 process.on('exit', () => { for (const dir of dirs) rmSync(dir, { recursive: true, force: true }); });
 
+/**
+ * Run `body` with the host-location overrides cleared.
+ *
+ * Detection consults `DSH_HOME`, `CODEX_HOME` and `AMB_PLUGIN_DIR` because the scripts
+ * that deploy the package honour them, so a test that builds a *synthetic* home must
+ * clear them — otherwise the ambient environment answers instead of the fixture. On
+ * the machine running this suite `DSH_HOME` points at a real home with the plugin
+ * installed, which made an "empty home" report as installed.
+ */
+function withHostEnvCleared<T>(body: () => T): T {
+  const keys = ['DSH_HOME', 'CODEX_HOME', 'AMB_PLUGIN_DIR'] as const;
+  const saved = keys.map(key => [key, process.env[key]] as const);
+  for (const key of keys) delete process.env[key];
+  try { return body(); } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+}
+
 const token = 'a'.repeat(64);
 
 async function setupCore() {
@@ -149,7 +169,7 @@ test('F14: 候选批准通过 schema 校验，且批量批准支持并提示', a
   }
 });
 
-test('F20: locate 不把空 cache 目录判定为已安装', () => {
+test('F20: locate 不把空 cache 目录判定为已安装', () => withHostEnvCleared(() => {
   const home = tempDir();
   // 建立一个空的 .codex/plugins/cache 目录
   mkdirSync(join(home, '.codex', 'plugins', 'cache'), { recursive: true });
@@ -162,7 +182,7 @@ test('F20: locate 不把空 cache 目录判定为已安装', () => {
 
   const dsh = manifest.find(m => m.id === 'dsh')!;
   assert.equal(dsh.installed, false, '未安装 DSH 包时应报 false');
-});
+}));
 
 test('F20: operatingModeFromDisk 在快照格式错误时回退到 Ungoverned，不假阳性报 ReadOnlySnapshot', () => {
   const dir = tempDir();
@@ -174,7 +194,7 @@ test('F20: operatingModeFromDisk 在快照格式错误时回退到 Ungoverned，
   assert.match(mode.detail, /格式错误/, '必须说明格式错误原因');
 });
 
-test('F20: doctor 在适配器未安装时标记为 warn，绝不能标记为 pass', async () => {
+test('F20: doctor 在适配器未安装时标记为 warn，绝不能标记为 pass', () => withHostEnvCleared(async () => {
   const dir = tempDir();
   const emptyHome = tempDir();
   const report = await doctor({ dataDir: dir, offline: true, home: emptyHome });
@@ -187,7 +207,7 @@ test('F20: doctor 在适配器未安装时标记为 warn，绝不能标记为 pa
   const codexCheck = report.checks.find(c => c.id === 'capability-codex');
   assert.ok(codexCheck);
   assert.equal(codexCheck.status, 'warn', 'codex 存在缺口或未安装时必须为 warn');
-});
+}));
 
 test('F20: UI 在 capabilities 失败时绝不假阳性报 Managed', () => {
   assert.equal(UI_JS.includes("return { adapters: [], mode: 'Managed'"), false, 'UI catch 中不得硬编码 mode: Managed 假阳性');
