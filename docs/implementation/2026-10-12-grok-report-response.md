@@ -18,18 +18,18 @@
 | H3 | Codex MCP 不校验项目范围 | 确认机制存在；**成因含我上一轮的改动**（见第 3 节）| 凭据边界与 hook 隔离限制已记录；未加回会误拒的 cwd 检查 |
 | H4 | 同端「继续上次任务」必然 400 | **确认**：`list` 返回 5 个 `taskSchema` 不认的字段 | **已修复并独立核验 10/10**（见 4.7） |
 | H5 | Codex 跑在不支持的 Node 20 且不报错 | 确认：`engines` 声明 `>=24.13 <25`，运行时不校验 | **已修复**；新增一致性测试锁住两处实现（见 4.8） |
-| H6 | 卸载残留 | 确认：不读 `core.lock`、不清部署目标与 junction | 修复中（适配器侧） |
+| H6 | 卸载残留 | 确认：不读 `core.lock`、不清部署目标与 junction | **修复中；归属验证不足**（见 4.12） |
 | H7 | 凭据静默回退到共用文件 | **确认** | **已修复**（见 4.3） |
 | W1 | 登录自启指向不存在的入口 | 确认：写死 `dist/src/cli.js`，打包件只有 `runtime/cli.js` | **已修复并在真实打包件上核验 10/10**（见 4.9） |
-| W2 | 核心运行时卸载半删除（EPERM） | 与 H6 同源，Windows 上更严重 | 修复中（适配器侧） |
-| W3 | 非用户目录下凭据 ACL 过宽 | 确认：只用 mode 0o600，未用 icacls 收紧 | 待办（核心侧） |
+| W2 | 核心运行时卸载半删除（EPERM） | 与 H6 同源，Windows 上更严重 | 修复中（同上） |
+| W3 | 非用户目录下凭据 ACL 过宽 | 确认：只用 mode 0o600，未用 icacls 收紧 | **修复中；引入 `init` 非零退出回归**（见 4.12） |
 | W4 | capabilities 不识别 DSH_HOME/CODEX_HOME | **确认** | **已修复**（见 4.2） |
 | M1 | 未知 workflowId 导致候选丢失 | 确认：404 且队列 0 条 | **已修复并独立核验 7/8**（见 4.10）；余下 1 项为文案缺陷，已回报 |
 | M2 | 跨端去重失败（包装文本污染） | 确认：core 去重按精确文本（正确），问题在适配器包装 | 修复中（适配器侧） |
 | M3 | 负载下降级且事件丢失 | 确认，且为**结构性**：outbox 在核心内，核心不可达即无本地兜底 | 修复中（适配器侧，需明确取舍） |
 | M4 | DSH 缺自由文本检索工具 | 确认：工具清单无对应项 | **已实现**（`amb_search_universal` + `CORE_PATH` 允许连字符） |
 | M5 | 首次部署误报 active=false | 未复核 | 待核 |
-| M6 | seed 的 material 立即消失 | 确认：`expiresAt` 默认 0，导入后即 `not_found` | 修复中（核心侧） |
+| M6 | seed 的 material 立即消失 | 确认：`expiresAt` 默认 0，导入后即 `not_found` | **已修复并独立核验**（见 4.12） |
 | M7 | discovery 路径段误排除 | **确认为测试非密闭，非产品缺陷** | **已修复**（见 4.1） |
 | 低 | `codex-hook.test.mjs` 只设 `USERPROFILE` | 确认：`homedir()` 在非 Windows 读 `HOME` | **已修复**（见 4.5） |
 | 低 | `adapter-core.test.ts` 遗留核心进程 | 确认：非 Windows 分支**未 await** 且依赖 `lsof` | **已修复**（见 4.5） |
@@ -151,9 +151,41 @@ endpoint、token、project 与 role，因此一端可能以**他端的项目或�
 **一处方法教训**：我曾两次用文本邻近搜索去判断"是否存在向 submit 传 0 的调用点"，两次都误报（同一条测试里
 往往既有草稿定义又有提交调用，文本无法区分外层对象）。已放弃文本搜索、改用行为验证，并把结论写进探针注释。
 
+### 4.12 M6 已核验；W3 与 H6/W2 的归属验证仍有缺口
+
+**M6 已修复并核验**：不带 `expiresAt` 导入的 material **导入后立即可读**（此前是 `not_found`）、
+`cleanup` 之后**仍在库中**、读取 200。实现的取舍我认可：默认值补在**导入边界**而非 schema，保留
+`expiresAt: 0 = 立即失效` 这个唯一能表达"已过期"的语义，并**如实报告**仍不可读的条目。
+
+**W3：收紧逻辑对，但复核步骤写错了，导致 `init` 在 Windows 上恒非零退出。**
+
+实测 `init` 对每个凭据报失败并以 exit 1 结束：
+
+```
+ACL FAILED codex: 已执行收紧，但无法复核 ACL：icacls /save 退出 87
+```
+
+根因：`icacls <file> /save <目录>` **exit 87、不写任何文件**；必须传**文件路径**才行（实测
+`icacls <file> /save out.acl` → exit 0）。代码里那句"an explicit destination name cannot be supplied"
+的前提是错的。另外 `/save` 写出的是 **UTF-16LE**（代码里 `TextDecoder('utf-16le')` 是对的，别改）。
+
+**这条回归没有任何测试覆盖**——`npm test` 345/345 全绿却没有一条断言 `init` 的退出码。这本身是覆盖缺口。
+
+**H6/W2：`verifyCoreProcess` 的归属验证不足。** 它用 `/health` 探测（先 `core.lock` 的 port，再
+`core.json` 的 endpoint），拿到 `protocolVersion===1 && status==='ok'` 就放行。但**健康探测只能证明
+"该端口上有核心在服务"，不能证明"锁里那个 PID 就是它"**。于是：锁中的 PID 陈旧 → 该 PID 已被复用给
+无关进程 → 同时确有核心在监听该端口 → 探测通过 → **SIGTERM/SIGKILL 发给那个无关进程**。
+
+正确的做法是把 pid 与监听者**绑定**：按端口反查 owning pid（Windows `Get-NetTCPConnection -LocalPort
+<port> -State Listen` 的 `OwningProcess`），要求其中包含锁里的 pid；做不到的平台应降级为"不自动杀、
+只提示人工处理"，而不是退回只靠健康探测。
+
+**该实现已做对、应保留的部分**：验证不通过时**拒绝发信号且不清理数据**、并发/陈旧锁的分类处理、
+先 SIGTERM 限时等待再升级、停不下来如实报告状态。
+
 ## 5. 未达成与保留
 
-- **M6**（seed 的 material 立即过期）、**W3**（凭据 ACL）、**H6/W2**（卸载停核心清残留，含上述 pid 归属确认）、**M2/M3** 尚未完成，**不宣布通过**。
+- **W3**（凭据 ACL）、**H6/W2**（卸载，含 pid 归属绑定）、**M2/M3** 尚未完成，**不宣布通过**。
 - **H3**（Codex MCP 不校验会话目录）：按"凭据即范围、hook 边界隔离"如实记录，未加回会误拒每一次合法调用
   的 cwd 检查。这是取舍，不是完全修复——MCP 拿不到会话 cwd，只有 hook 能拿到。
 - **M5**（首次部署误报 active=false）未复核。
