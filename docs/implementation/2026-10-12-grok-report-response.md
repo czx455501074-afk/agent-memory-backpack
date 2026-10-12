@@ -13,8 +13,8 @@
 
 | 编号 | 摘要 | 我的复核 | 状态 |
 |---|---|---|---|
-| H1 | deniedTools 可被 shell 绕过 | 确认：`gate` 只按工具名匹配，`bash` 返回 allow | 修复中（适配器侧方案 A：启发式拒绝 + 如实标注局限） |
-| H2 | `read` 对 `id@revision`、norm、journal 返回 404 | **确认**（见下）| 修复中（核心侧） |
+| H1 | deniedTools 可被 shell 绕过 | 确认：`gate` 只按工具名匹配，`bash` 返回 allow | **已实现并独立核验**（见 4.4） |
+| H2 | `read` 对 `id@revision`、norm、journal 返回 404 | **确认**（见第 3 节）| 修复中（核心侧） |
 | H3 | Codex MCP 不校验项目范围 | 确认机制存在；**成因含我上一轮的改动**（见第 3 节）| 修复中（适配器侧，不得加回会误拒的 cwd 检查） |
 | H4 | 同端「继续上次任务」必然 400 | **确认**：`list` 返回 6 个 `taskSchema` 不认的字段 | 修复中（适配器侧） |
 | H5 | Codex 跑在不支持的 Node 20 且不报错 | 确认：`engines` 声明 `>=24.13 <25`，运行时不校验 | 修复中（适配器侧） |
@@ -31,6 +31,9 @@
 | M5 | 首次部署误报 active=false | 未复核 | 待核 |
 | M6 | seed 的 material 立即消失 | 确认：`expiresAt` 默认 0，导入后即 `not_found` | 修复中（核心侧） |
 | M7 | discovery 路径段误排除 | **确认为测试非密闭，非产品缺陷**（见下）| **已修复** |
+| 低 | `codex-hook.test.mjs` 只设 `USERPROFILE` | 确认：`homedir()` 在非 Windows 读 `HOME`，测试会读到真实主目录 | **已修复**（见 4.5） |
+| 低 | `adapter-core.test.ts` 遗留核心进程 | 确认：非 Windows 分支**未 await** 且依赖 `lsof`，缺失时静默失败 | **已修复**（见 4.5） |
+| 低 | 同版本去重仅在适配器侧 | 确认为设计如此，但**文档未写明** | **已在 README 写明** |
 
 ## 3. 我此前结论的更正（重要）
 
@@ -83,7 +86,34 @@ endpoint、token、project 与 role，因此一端可能以**他端的项目或�
 
 修复：保留回退（拒绝会破坏旧安装），但**回退必须可见**——告警点名缺失文件、风险与补救。
 `source` 取值集合未变，两个适配器解析器保持**字节相同**。
-证据：`verify-f22e.mjs` **改前 2/4（两处静默回退 FAIL）→ 改后 4/4**；`test/config-resolution.test.ts` 6/6。
+证据：`verify-f22e.mjs` **改前 2/4（两处静默回退全 FAIL）→ 改后 4/4**；`test/config-resolution.test.ts` 6/6。
+
+### 4.4 H1 shell 绕过启发式（独立核验）
+
+适配器侧实现了"当规范禁止写类工具时，对 shell 命令中的明确写文件写法做启发式拦截"。
+我不采信其自述，独立核验（`verify-shell-bypass.mjs`，7/7）：
+
+| 检查 | 结果 |
+|---|---|
+| 明确写意图必须拦截 | 10 条全拦截（`>`、`>>`、`tee`、`touch`、`mkdir`、`dd of=`、`Set-Content`、`Out-File`、`New-Item`） |
+| **只读命令绝不能被误拦** | 12 条全放行，含 `2>&1`、`> /dev/null`、进程替换、管道 |
+| 作用范围 | 仅在「确有写类工具被禁」且「工具是 shell」时生效 |
+| 两端判定一致 | 22 条命令两端一致；两份 `gate-cache.mjs` 字节相同 |
+| 已知局限**如实存在** | `python -c`、`node -e` 间接写入**仍可绕过**——这是启发式的边界，必须在文档与规范中说明，不得声称已完整防护 |
+
+误拦比漏检更影响可用性（一旦误拦，只要规范禁了写类工具，**每一次** shell 调用都会失败），
+因此负向用例与正向同等重要。README 已写明该边界与配合建议（同时禁用 shell 工具或使用只读沙箱）。
+
+### 4.5 测试卫生（低危，但会在别人的机器上出问题）
+
+- `test/codex-hook.test.mjs` 只设 `USERPROFILE`：`homedir()` 在非 Windows 读 `HOME`，`runHook` 又
+  会展开进程环境，于是在 Linux/macOS 上该测试读的是**操作者真实主目录**，断言的却是它自己建的夹具目录。
+  已同时设置两个变量（`adapter-config.test.ts` 本就是两个都设，此处是漏网的那一个）。
+- `test/adapter-core.test.ts` 的非 Windows 回收分支是 `spawn('sh', ['-c', 'lsof … | xargs -r kill'])`：
+  **未 await**，且依赖 `lsof`（未必安装，`-r` 还是 GNU 扩展）。缺失时静默失败、留下 detached 核心——
+  正是报告在 Linux 上看到的遗留进程。现改为逐个 await、依次尝试 `lsof`/`fuser`/`ss`，并以**端口是否
+  释放**作为完成条件（工具退出 0 不等于端口已释放）；测试还会断言端口确实释放，只在真的拉起了核心时才断言，
+  把"静默泄漏"变成"当场失败"。
 
 ## 5. 未达成与保留
 
