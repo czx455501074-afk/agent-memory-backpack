@@ -167,12 +167,80 @@ if (values['codex-workspace']) {
   }
 }
 
+// ------------------------------------------- Codex 用户级安装检查（默认执行）
+/**
+ * Codex Desktop records a plugin in the **user-level** `$CODEX_HOME/config.toml`, not in a
+ * workspace: a `[marketplaces.<name>]` entry pointing at the local marketplace plus one
+ * `[hooks.state."<plugin>@<marketplace>:…"]` entry per hook it trusts. The workspace check
+ * above looks in `<workspace>/.codex/config.toml` and so never saw the very installation
+ * the desktop app actually loads — an uninstall could report "not found" while the plugin
+ * was live.
+ *
+ * Reported, never edited: the file also carries the user's model settings, marketplaces and
+ * project trust levels, and a regex rewrite of a file like that is how a working install
+ * gets broken. What the user needs is the exact entries to remove, named.
+ */
+function reportCodexHomeInstallation() {
+  const codexHome = process.env.CODEX_HOME && process.env.CODEX_HOME.trim()
+    ? resolve(process.env.CODEX_HOME)
+    : join(homedir(), '.codex');
+  say(`\nCodex 用户级配置：${codexHome}`);
+  const configPath = join(codexHome, 'config.toml');
+  if (!existsSync(configPath)) {
+    say('  未找到 config.toml，Codex 桌面端可能未安装或从未运行。');
+    return;
+  }
+
+  let text;
+  try { text = readFileSync(configPath, 'utf8'); }
+  catch (error) {
+    warn(`  无法读取：${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+
+  const sections = [...text.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]);
+  const marketplaces = sections
+    .filter(name => /^marketplaces\./.test(name))
+    .map(name => name.slice('marketplaces.'.length))
+    .filter(name => /agent-memory-backpack/i.test(name));
+  const pluginSections = sections.filter(name => /^plugins\.".*agent-memory-backpack.*"/i.test(name));
+  const hookStates = sections.filter(name => /^hooks\.state\.".*agent-memory-backpack.*"/i.test(name));
+
+  if (!marketplaces.length && !pluginSections.length && !hookStates.length) {
+    say('  配置里没有本插件的 marketplace / plugins / hooks.state 条目。');
+    return;
+  }
+
+  say(`  检测到 ${marketplaces.length} 个 marketplace、${pluginSections.length} 个 plugins 节、${hookStates.length} 条 hooks.state 信任记录。`);
+  for (const name of marketplaces) say(`    [marketplaces.${name}]`);
+  for (const name of pluginSections) say(`    [plugins."${name.replace(/^plugins\."|"$/g, '')}"]`);
+
+  // A stale trust record is its own small hazard: the hash is pinned, so a later plugin
+  // with different content would silently be treated as untrusted rather than as new.
+  if (hookStates.length) {
+    say(`    另有 ${hookStates.length} 条 [hooks.state."…"] 信任记录，其哈希绑定当时的钩子内容；`);
+    say('    卸载后建议一并删除，否则重装并改动钩子时会因哈希不符而被判为不可信。');
+  }
+
+  say('  移除方式（三选一，本脚本不代改，避免破坏同文件里的模型与项目信任设置）：');
+  say('    a) 在 Codex 桌面「设置 -> 插件」里卸载本插件（推荐，官方路径）；');
+  say(`    b) 备份后手动编辑 ${configPath}，删除上面列出的节；`);
+  say('    c) 若 marketplace 指向本仓库的 .local/codex-marketplace，可直接删除该目录，');
+  say('       但配置里的节仍需删除，否则 Codex 会报 marketplace 缺源。');
+  say('  改完请新建一个 Codex 会话，确认工具列表里不再有本插件的工具。');
+
+  warn('  提醒：本插件曾经在核心离线时拦截过全部工具调用（见 docs/implementation/2026-10-13-f22-core-offline-locks-codex.md）。');
+  warn('        卸载后该拦截随之消失；若保留插件，请确保核心可运行。');
+}
+
+reportCodexHomeInstallation();
+
 // -------------------------------------------------------- 人工步骤报告
 say('\n人工在桌面 UI 里操作的步骤（本脚本不会自动做这些）：');
 say('');
 say('Codex 桌面：');
 say('  - 在插件管理界面停用/卸载本插件。');
-say('  - 或在工作区 .codex/config.toml 里移除 [plugins."<插件名>@<marketplace>"] 节。');
+say('  - 用户级安装记在 $CODEX_HOME/config.toml（见上一节）；工作区级记在 <workspace>/.codex/config.toml。');
 say('');
 say('DSH 桌面：');
 say('  - 设置 -> 插件，停用/卸载本插件。');
