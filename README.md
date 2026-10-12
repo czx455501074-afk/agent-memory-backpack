@@ -287,11 +287,34 @@ node dist/src/cli.js logs --source plugin   # 插件日志（核心不可达时�
 ```powershell
 npm ci --ignore-scripts
 npm run build
-npm test                # 189 项测试，应全部通过（1 项需打包产物会跳过）
+npm run check           # 类型检查，应退出码 0
+npm test                # 见下面的「测试前置条件」
 npm run pack:local      # 生成可分发的产物
 ```
 
-依赖真实桌面运行库的测试需要精确版本目录：默认读取 `.local/dsh-runtime-0.2.0-rc.2/node_modules`，可用 `DSH_PROFILE_NODE_MODULES` 指向其他位置。目标契约为 `@deepseek-ai/* 0.2.0-rc.2`、Cordis 4.0.4。未提取运行库时这些测试会**带原因跳过**，不计为通过；版本不符则直接失败。提取方式见 `scripts/extract-dsh-runtime.py`。
+### 测试前置条件
+
+干净检出的 `npm test` 是 **315 通过 / 14 跳过**。全部失败数为 0；跳过的 14 项都缺少本机前置条件，
+**带原因跳过，不计为通过**。补齐后为 **329 通过 / 0 跳过**：
+
+| 跳过项 | 数量 | 需要什么 |
+|---|---|---|
+| Electron 桌面控制台 | 5 | `node_modules/electron` 的 Electron 二进制（`npm ci` 未下载时缺失） |
+| 真实 DSH 运行库 | 8 | `.local/dsh-runtime-0.2.0-rc.2/node_modules`，或设 `DSH_PROFILE_NODE_MODULES` 指向别处 |
+| 打包产物冒烟 | 1 | `npm run pack:local` 后设 `AMB_ARTIFACT_DIR` 为产物根目录 |
+
+```powershell
+# 提取真实 DSH 运行库（只读桌面归档，不运行安装脚本，不改宿主）
+python scripts/extract-dsh-runtime.py "<桌面安装目录>/resources/app.asar" .local/dsh-runtime-0.2.0-rc.2
+
+# 打包并跑打包产物冒烟
+npm run pack:local
+$env:AMB_ARTIFACT_DIR = (Get-Content artifacts/latest.json | ConvertFrom-Json).directory
+npm test
+```
+
+运行库目标契约为 `@deepseek-ai/* 0.2.0-rc.2`、Cordis 4.0.4；版本不符时这些测试**直接失败**（不是跳过）。
+前置条件与产物均为本地生成、已在 `.gitignore` 中，不随仓库分发。
 
 > PowerShell 示例使用 `$HOME`，需要 PowerShell 7（`pwsh`）。在 Windows PowerShell 5.1 下请改用 `$env:USERPROFILE`。
 
