@@ -624,27 +624,107 @@ export class Store {
   }
 
   /**
-   * Get single raw knowledge entry by ID regardless of kind.
+   * Resolve a caller-supplied knowledge id.
+   *
+   * Two shapes arrive here and both are legitimate:
+   *
+   *   - A bare id, which the console and the CLI use.
+   *   - `id@revision`, which is *not* a convenience form but the only form the
+   *     model ever sees. Every handle in the injected context is written that way
+   *     (`规范 ${id}@${revision}`, `已采纳技能 ${id}@${revision}`), because the
+   *     revision is what tells the reader which version it was shown. A model that
+   *     reads such a handle and is asked to expand it copies the whole token — so
+   *     an exact `candidate.id === id` match failed for every entry the summary
+   *     itself had just advertised, which is why `get` (bare id, 200) and `read`
+   *     (`id@rev`, 404) disagreed about the same entry.
+   *
+   * A named revision is treated as a *requirement*, not a hint: if it does not
+   * match the current one the answer is 409 naming the current revision, never a
+   * silent downgrade to the newest text (which would hand back content the caller
+   * did not ask for) and never a 404 (which claims the entry does not exist when
+   * it does, and is the misleading message this whole defect was made of).
    */
-  getKnowledge(projectId: string, id: string) {
-    const entry = this.liveEntries().find(c => c.id === id);
+  private resolveKnowledgeId(id: string): { id: string; requestedRevision?: number } {
+    const trimmed = id.trim();
+    // `identifier` ids may contain `.`, `:`, `-` and `_`, so only a trailing
+    // `@<digits>` is a revision. A non-numeric suffix stays part of the id, which
+    // keeps ids that legitimately contain `@`-like text from being mis-split.
+    const match = /^(.*)@(\d+)$/.exec(trimmed);
+    if (!match) return { id: trimmed };
+    return { id: match[1]!, requestedRevision: Number(match[2]) };
+  }
+  /**
+   * Resolve an id, apply the scope rule, and honour a requested revision.
+   *
+   * Shared by `getKnowledge` and `readKnowledge` so the two can never disagree
+   * about the same input — the acceptance criterion is literally that get and
+   * read reach the same conclusion, and two copies of this logic would drift.
+   *
+   * `includeExpired` is the one deliberate difference between them: `get` is the
+   * console's raw view of a record and may show material that has lapsed, while
+   * `read` is a retrieval path and must apply the expiry gate. (`liveEntries()`
+   * is where that gate lives; see its comment.)
+   */
+  private resolveVisible(id: string, projectId: string, options: { includeExpired?: boolean } = {}): Entry {
+    const { id: bareId, requestedRevision } = this.resolveKnowledgeId(id);
+    const entry = this.liveEntries().find(candidate => candidate.id === bareId);
     if (!entry || !applicable(entry.content.scope, projectId)) {
-      throw new DomainError('not_found', 'Knowledge entry is unavailable', 404);
+      throw new DomainError('not_found', `Knowledge entry ${bareId} is unavailable`, 404);
+    }
+    if (!options.includeExpired && entry.content.kind === 'material' && !isLive(entry.content.expiresAt, this.now())) {
+      throw new DomainError('not_found', `Knowledge entry ${bareId} is unavailable`, 404);
+    }
+    if (requestedRevision !== undefined && requestedRevision !== entry.revision) {
+      // 409, not 404: the entry exists and the caller named a real version of it,
+      // so "not found" would be false. The current revision is stated so the
+      // caller can retry with a handle that works instead of guessing.
+      throw new DomainError('revision_conflict',
+        `Knowledge entry ${bareId} is at revision ${entry.revision}, not ${requestedRevision}`, 409);
     }
     return entry;
   }
+  /**
+   * Get single raw knowledge entry by ID regardless of kind.
+   *
+   * Accepts the `id@revision` handle as well as a bare id, so a caller that
+   * copied either form from the injected context reaches the same answer.
+   */
+  getKnowledge(projectId: string, id: string) {
+    // Raw view: expired material stays visible here, as it did before, so the
+    // console can still show what lapsed and when.
+    return this.resolveVisible(id, projectId, { includeExpired: true });
+  }
 
   /**
-   * Expand one adopted knowledge entry by ID.
+   * Expand one knowledge entry by ID.
    *
-   * This is the on-demand step the prepare summary points at. A skill returns
-   * its body plus leaves; a leaf body is included only when requested, so the
-   * common path stays small.
+   * This is the on-demand step the prepare summary points at, so it must be able
+   * to serve *every* kind that summary advertises. It previously accepted only
+   * `skill` and `memory` and refused the rest with "Knowledge entry is
+   * unavailable" — which was wrong twice over: the entry was neither missing nor
+   * invisible, and the message sent the reader looking for a problem that did not
+   * exist. `getKnowledge` served all kinds, so the two paths contradicted each
+   * other about the same id.
+   *
+   * The reading shape is now chosen per kind rather than by refusing kinds: a
+   * skill returns its body plus leaves, everything else returns its prose — a
+   * journal's prose is what it *did*, because it has no `body` field — and the
+   * kind-specific extras (`needsStructure`, `outcome`, `stated`, material's
+   * `url`/`expiresAt`) travel alongside so a reader can tell what they are
+   * holding. `relations` stays for every kind: it is the answer to "does a
+   * companion entry exist", which is exactly as relevant for a norm as for a
+   * skill.
    */
   readKnowledge(projectId: string, id: string, includeLeaves = false): {
-    id: string; revision: number; kind: 'skill' | 'memory'; title: string; body: string;
+    id: string; revision: number; kind: Knowledge['kind']; title: string; body: string;
     /** Present only for skills; a memory has no structure to await. */
     needsStructure?: boolean;
+    /** Where a workflow's prose lives, since a workflow has no `body` field. */
+    overview?: string;
+    /** Material's own fields, so a reader knows the source and when it lapses. */
+    url?: string; savedAt?: number; expiresAt?: number;
+    /** Set for preferences and journals, so an inference is not read as a statement. */
+    stated?: boolean; outcome?: 'success' | 'failure' | 'unverified';
     leaves: Array<{ path: string; body: string }>;
     /**
      * How this entry relates to others: what it replaced or supplemented, and what
@@ -654,28 +734,62 @@ export class Store {
      */
     relations: Array<{ direction: 'replaced' | 'supplemented' | 'replaced-by' | 'supplemented-by'; id: string; revision: number; reason: string }>;
   } {
-    const entry = this.current().find(candidate => candidate.id === id);
-    if (!entry) throw new DomainError('not_found', 'Knowledge entry is unavailable', 404);
+    // Retrieval path: the expiry gate applies, so lapsed material is not served.
+    const entry = this.resolveVisible(id, projectId);
     const content = entry.content;
-    if (content.kind !== 'skill' && content.kind !== 'memory') throw new DomainError('not_found', 'Knowledge entry is unavailable', 404);
-    if (!applicable(content.scope, projectId)) throw new DomainError('not_found', 'Knowledge entry is unavailable', 404);
-    const relations = this.supersessions(id, projectId).map(link => ({
-      direction: (link.oldKnowledgeId === id
+    const relations = this.supersessions(entry.id, projectId).map(link => ({
+      direction: (link.oldKnowledgeId === entry.id
         ? (link.action === 'supersede' ? 'replaced' : 'supplemented')
         : (link.action === 'supersede' ? 'replaced-by' : 'supplemented-by')) as 'replaced' | 'supplemented' | 'replaced-by' | 'supplemented-by',
-      id: link.oldKnowledgeId === id ? link.newKnowledgeId : link.oldKnowledgeId,
-      revision: link.oldKnowledgeId === id ? link.newRevision : link.oldRevision,
+      id: link.oldKnowledgeId === entry.id ? link.newKnowledgeId : link.oldKnowledgeId,
+      revision: link.oldKnowledgeId === entry.id ? link.newRevision : link.oldRevision,
       reason: link.reason,
     }));
+    /**
+     * `body` has to mean "the prose of this entry", and which field that is
+     * depends on the kind: only a skill or memory carries `body` literally, while
+     * a journal records `did`, a workflow `overview`, and a norm, preference or
+     * material each carry `body` under a different schema. All of them are prose
+     * a reader asked for; returning an empty string for half the library is the
+     * failure that made "read supports every kind" true only on paper.
+     */
+    const proseOf = (entryContent: Knowledge): string => {
+      switch (entryContent.kind) {
+        case 'skill':
+        case 'memory':
+        case 'norm':
+        case 'preference':
+        case 'material': return entryContent.body;
+        case 'journal': return entryContent.did;
+        case 'workflow': return entryContent.overview;
+      }
+    };
     const base = {
-      id: entry.id, revision: entry.revision, kind: content.kind, title: content.title, body: content.body, relations,
+      id: entry.id, revision: entry.revision, kind: content.kind, title: content.title,
+      body: proseOf(content), relations,
     };
-    if (content.kind === 'memory') return { ...base, leaves: [] };
-    return {
-      ...base,
-      needsStructure: content.needsStructure,
-      leaves: content.leaves.map(leaf => ({ path: leaf.path, body: includeLeaves ? leaf.body : '' })),
-    };
+    switch (content.kind) {
+      case 'skill':
+        return {
+          ...base,
+          needsStructure: content.needsStructure,
+          leaves: content.leaves.map(leaf => ({ path: leaf.path, body: includeLeaves ? leaf.body : '' })),
+        };
+      case 'material':
+        // No leaves, so the "include" flag has nothing to expand; the expiry is
+        // returned so a caller can see how long the entry has left rather than
+        // inferring it from the retention default.
+        return { ...base, url: content.url, savedAt: content.savedAt, expiresAt: content.expiresAt, leaves: [] };
+      case 'preference':
+        return { ...base, stated: content.stated, leaves: [] };
+      case 'journal':
+        return { ...base, outcome: content.outcome, leaves: [] };
+      case 'workflow':
+        return { ...base, overview: content.overview, leaves: [] };
+      default:
+        // norm and memory: both are plain prose with no extra dimension to report.
+        return { ...base, leaves: [] };
+    }
   }
   /**
    * Character budget for the norms injected into one context.
@@ -969,22 +1083,49 @@ export class Store {
         // unattached fragment the workflow requirement exists to prevent.
         throw new DomainError('invalid_request', 'stageId requires workflowId', 400);
       }
+      /**
+       * Workflow attribution is recorded, not enforced by discarding the candidate.
+       *
+       * An unknown workflow id used to abort the submission with 404, and the
+       * candidate was never stored. That inverted the priority the design sets:
+       * a candidate is the user's own recorded experience, and losing it is the
+       * one outcome the project forbids. The measured consequence was 21 failed
+       * tool calls whose text existed nowhere afterwards — the model had filled in
+       * a workflow id for a library with no workflows, and a validation detail
+       * about *where* the experience belongs destroyed the experience itself.
+       *
+       * So an unresolvable id is kept and marked: `attribution.resolved` is false
+       * and `stageId` is null, because a step cannot belong to a workflow that is
+       * not there. Nothing is guessed — the submitted id is preserved verbatim so
+       * a reviewer can see what was claimed and correct it, and the caller is told
+       * plainly that the workflow was not found.
+       *
+       * What is *not* relaxed: once a workflow does resolve, its `baseRevision`
+       * and `stageId` are checked exactly as before. Those answer "is this the
+       * version I observed, and does this step exist", which are real integrity
+       * questions; a missing workflow answers only "the library cannot confirm
+       * this yet", which is not a reason to throw the text away.
+       */
+      let workflowResolved = true;
       if (payload.workflowId) {
         const entry = this.head(payload.workflowId);
-        if (!entry || entry.status !== 'active' || entry.content.kind !== 'workflow' || !applicable(entry.content.scope, payload.projectId)) throw new DomainError('not_found', 'Target workflow is unavailable', 404);
-        if (payload.baseRevision !== undefined && entry.revision !== payload.baseRevision)
-          throw new DomainError('revision_conflict', `Expected baseRevision ${payload.baseRevision} but current is ${entry.revision}`, 409);
-        /**
-         * A stage id is checked against the workflow it claims to belong to.
-         *
-         * The check answers "does this step exist" and nothing more. Whether the
-         * experience really belongs to that step is a semantic judgement this layer
-         * deliberately does not make; accepting an unknown id, though, would let a
-         * candidate point at a step that does not exist and be reviewed as though it
-         * did.
-         */
-        if (payload.stageId !== undefined && !entry.content.stages.some(stage => stage.id === payload.stageId))
-          throw new DomainError('not_found', `Workflow ${payload.workflowId} has no stage ${payload.stageId}`, 404);
+        if (!entry || entry.status !== 'active' || entry.content.kind !== 'workflow' || !applicable(entry.content.scope, payload.projectId)) {
+          workflowResolved = false;
+        } else {
+          if (payload.baseRevision !== undefined && entry.revision !== payload.baseRevision)
+            throw new DomainError('revision_conflict', `Expected baseRevision ${payload.baseRevision} but current is ${entry.revision}`, 409);
+          /**
+           * A stage id is checked against the workflow it claims to belong to.
+           *
+           * The check answers "does this step exist" and nothing more. Whether the
+           * experience really belongs to that step is a semantic judgement this layer
+           * deliberately does not make; accepting an unknown id, though, would let a
+           * candidate point at a step that does not exist and be reviewed as though it
+           * did.
+           */
+          if (payload.stageId !== undefined && !entry.content.stages.some(stage => stage.id === payload.stageId))
+            throw new DomainError('not_found', `Workflow ${payload.workflowId} has no stage ${payload.stageId}`, 404);
+        }
       }
       const id = randomUUID();
       /**
@@ -1055,6 +1196,23 @@ export class Store {
         ...payload,
         review: { tier: decision.tier, reason: decision.reason, constraint: decision.constraint },
         classification,
+        /**
+         * Where this candidate claims to belong, with the program's own verdict.
+         *
+         * Written into the stored payload rather than only the receipt, because the
+         * reviewer reads it from the queue: `attribution.resolved: false` is what
+         * tells them the workflow id was not found and the claim is unverified,
+         * instead of the id silently looking as authoritative as a resolved one.
+         * `stageId` is forced to null when the workflow is unresolved — a step
+         * cannot belong to a workflow the library cannot locate, and keeping the
+         * caller's stage here would re-introduce exactly the unattached fragment
+         * the workflow requirement exists to prevent.
+         */
+        attribution: {
+          workflowId: payload.workflowId ?? null,
+          stageId: workflowResolved ? (payload.stageId ?? null) : null,
+          resolved: workflowResolved,
+        },
         // Held for a decision rather than lapsing on the ordinary deadline; see
         // `expireProposals` for why that matters.
         important: conflict,
@@ -1074,7 +1232,21 @@ export class Store {
       this.db.prepare('INSERT INTO proposals(id,principal,idem,fingerprint,payload,state,created_at,expires_at,project_id) VALUES(?,?,?,?,?,?,?,?,?)')
         .run(id, principal, payload.idempotencyKey, fingerprint, JSON.stringify(record), 'pending', this.now(),
           conflict ? Number.MAX_SAFE_INTEGER : this.now() + 30 * DAY, payload.projectId);
-      return { id, state: 'pending', duplicate: false, review: decision };
+      /**
+       * The receipt says the same thing the record does.
+       *
+       * A caller that only reads the response must not conclude the attribution was
+       * accepted just because the submission was: `note` names the unknown workflow
+       * and states that the candidate was kept unattributed and needs a person to
+       * confirm where it belongs.
+       */
+      return {
+        id, state: 'pending', duplicate: false, review: decision,
+        ...(workflowResolved ? {} : {
+          attribution: { workflowId: payload.workflowId ?? null, stageId: null, resolved: false as const },
+          note: `workflow ${payload.workflowId} 不存在或不可见，候选已按未归属保存，请人工确认它应归属哪个流程/步骤。`,
+        }),
+      };
     });
   }
   /**

@@ -100,6 +100,47 @@ const command = positionals[0]; const dir = resolve(values['data-dir'] ?? defaul
  */
 const here = dirname(fileURLToPath(import.meta.url));
 const root = existsSync(join(here, '..', 'package.json')) ? resolve(here, '..') : resolve(here, '..', '..');
+/**
+ * Candidate core entries, most trustworthy first.
+ *
+ * The entry used to be assembled from `root` on the assumption that a build
+ * keeps `dist/src/cli.js`. It does not: `scripts/package.mjs` copies `dist/src`
+ * to `core/runtime`, so inside an installed artifact the only real entry is
+ * `runtime/cli.js` beside this file. `enable-startup` therefore wrote a logon
+ * command naming a file that does not exist, and the failure surfaced only at
+ * the next logon — silently, with nothing in any log to connect it to the
+ * command that created it.
+ *
+ * The file this process was actually started with is the one fact that cannot
+ * drift from the deployed layout, so it leads. The known layouts follow, and
+ * `AMB_CORE_ENTRY` lets an operator that wraps the CLI name the entry — checked
+ * for existence like every other candidate rather than trusted.
+ */
+function coreEntryCandidates(): Array<{ path: string; source: string }> {
+  const override = (process.env.AMB_CORE_ENTRY ?? '').trim();
+  // An explicitly named entry is a requirement, not a hint: falling back to an
+  // auto-detected file would install logon startup for a different script than
+  // the one the operator named, which is the same "nothing starts and no log
+  // says why" failure in a new shape.
+  if (override) return [{ path: resolve(override), source: 'AMB_CORE_ENTRY' }];
+  const invoked = (process.argv[1] ?? '').trim();
+  return [
+    ...(/\.(?:js|cjs|mjs)$/i.test(invoked) ? [{ path: resolve(invoked), source: '运行本进程时使用的入口' }] : []),
+    { path: join(root, 'runtime', 'cli.js'), source: '打包时间入口（core/runtime/cli.js）' },
+    { path: join(root, 'dist', 'src', 'cli.js'), source: '仓库构建入口（dist/src/cli.js）' },
+  ];
+}
+/** The first candidate that exists, plus every candidate for a failure message. */
+function resolveCoreEntry(): { entry?: { path: string; source: string }; candidates: Array<{ path: string; source: string }> } {
+  const candidates = coreEntryCandidates();
+  return { entry: candidates.find(candidate => existsSync(candidate.path)), candidates };
+}
+/** What to tell a caller for whom no entry could be resolved, or none was named. */
+function coreEntryHint(candidates: Array<{ path: string; source: string }>): string {
+  return '未找到核心入口。已检查：'
+    + candidates.map(candidate => `${candidate.path}（${candidate.source}）`).join('、')
+    + '。先运行 npm run build，或用 AMB_CORE_ENTRY 指向真实的 cli.js。';
+}
 try {
   if (command === 'discover') {
     // Install-time adoption: scan user agents for existing knowledge. Read-only by
@@ -298,7 +339,9 @@ try {
     // account with its own data directory, which would put the user's knowledge
     // somewhere they cannot see, and the design says user-level.
     const action = positionals[1] ?? 'status';
-    const coreEntry = join(root, 'dist', 'src', 'cli.js');
+    // Resolved before the action switch so `status` can report the same entry the
+    // other actions would use, instead of the caller having to guess the layout.
+    const { entry: coreEntry, candidates: coreEntryOptions } = resolveCoreEntry();
     const endpoint = (() => {
       const corePath = join(dir, 'core.json');
       if (!existsSync(corePath)) return null;
@@ -315,19 +358,23 @@ try {
           : lock.state === 'unreadable' ? { state: 'unreadable', detail: lock.detail }
           : { state: lock.state, pid: lock.info.pid, port: lock.info.port, startedAt: lock.info.startedAt },
         healthy: health.healthy, healthDetail: health.detail,
+        // Reported because "which file would logon run" is the question the
+        // silent-startup defect left unanswered; the diagnosis should not need a
+        // second command.
+        coreEntry: coreEntry ? { path: coreEntry.path, source: coreEntry.source } : null,
         loginStartup: startup.registered, loginStartupDetail: startup.detail,
         note: '锁表示"谁在运行"；健康探测表示"核心是否在回应"。两者分开报告，因为一个陈旧的锁和一个挂掉的核心是不同的问题。',
       }, null, 2));
     } else if (action === 'start') {
-      if (!existsSync(coreEntry)) throw new Error(`未找到核心入口：${coreEntry}。先运行 npm run build。`);
+      if (!coreEntry) throw new Error(coreEntryHint(coreEntryOptions));
       const lock = inspectLock(dir);
       if (lock.state === 'held') {
         console.log(JSON.stringify({ started: false, reason: 'already-running', pid: lock.info.pid, note: '已有核心在运行，未启动第二个。' }, null, 2));
       } else {
         if (lock.state === 'stale') console.log(`（清理了上一次异常退出留下的锁，pid ${lock.info.pid}。）`);
         const logFile = join(dir, 'core-service.log');
-        const { pid } = startDetached(coreEntry, dir, logFile);
-        console.log(JSON.stringify({ started: true, pid, log: logFile, note: '核心已脱离本终端运行，关闭本窗口不会停止它。' }, null, 2));
+        const { pid } = startDetached(coreEntry.path, dir, logFile);
+        console.log(JSON.stringify({ started: true, pid, log: logFile, entry: coreEntry.path, note: '核心已脱离本终端运行，关闭本窗口不会停止它。' }, null, 2));
       }
     } else if (action === 'stop') {
       const result = stopFromLock(dir);
@@ -346,8 +393,13 @@ try {
           : '没有发现陈旧锁，无需恢复。',
       }, null, 2));
     } else if (action === 'enable-startup' || action === 'disable-startup') {
+      // The entry is validated *before* the registry write, and a missing one is a
+      // hard failure rather than a value pointing nowhere. Writing a logon command
+      // for a file that does not exist is the defect this guards: the entry looks
+      // installed, nothing starts at the next logon, and no log connects the two.
+      if (action === 'enable-startup' && !coreEntry) throw new Error(coreEntryHint(coreEntryOptions));
       const result = action === 'enable-startup'
-        ? registerLoginStartup(coreEntry, dir)
+        ? registerLoginStartup(coreEntry!.path, dir)
         : unregisterLoginStartup();
       console.log(JSON.stringify({ action, ...result }, null, 2));
       if (!result.ok) process.exitCode = 1;

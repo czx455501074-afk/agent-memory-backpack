@@ -26,7 +26,7 @@ export function isWithinProject(projectRoot: string, cwd: string): boolean {
  * Segments are restricted to lowercase words so a path can never introduce a
  * traversal, a query, or an absolute URL.
  */
-const CORE_PATH = /^\/v1\/[a-z]+(?:\/[a-z]+)*$/;
+const CORE_PATH = /^\/v1\/[a-z]+(?:\/[a-z-]+)*$/;
 
 export class CoreClient {
   private readonly config: ClientConfig;

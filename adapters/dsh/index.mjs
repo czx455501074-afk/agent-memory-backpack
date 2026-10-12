@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 import { createClient, isExplicitClientRejection, isRecordValue, isWithinProject, loadClientConfig } from './core-client.mjs'
 import { createAdapterLogger } from './log.mjs'
 import { ensureCoreRunning } from './ensure-core.mjs'
-import { decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from './gate-cache.mjs'
+import { checkShellWriteBypass, decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from './gate-cache.mjs'
 
 /** The packaged core entry point, resolved beside this adapter. */
 const ADAPTER_DIR = dirname(fileURLToPath(import.meta.url))
@@ -58,6 +58,43 @@ function jsonTool({ name, description, parameters, execute }) {
 function requireString(value, field) {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} must be a non-empty string.`)
   return value.trim()
+}
+
+/**
+ * Convert any task representation (from /v1/tasks/list or /v1/tasks/handoff)
+ * into a payload conforming strictly to the core's taskSchema.
+ *
+ * taskSchema is .strict() and rejects server-managed fields like `projectId`,
+ * `createdAt`, `updatedAt`, `knowledgeRevision`, `completedAt`.
+ */
+export function toTaskRecord(rawTask, extraSessionId) {
+  if (!rawTask || typeof rawTask !== 'object') {
+    throw new Error('Invalid task object passed to toTaskRecord')
+  }
+  const existingSessions = Array.isArray(rawTask.sessionIds) ? rawTask.sessionIds : []
+  const sessionIds = (extraSessionId && !existingSessions.includes(extraSessionId))
+    ? [...existingSessions, extraSessionId]
+    : [...existingSessions]
+
+  const record = {
+    id: String(rawTask.id ?? ''),
+    title: String(rawTask.title ?? ''),
+    status: rawTask.status,
+    summary: typeof rawTask.summary === 'string' ? rawTask.summary : '',
+    notes: typeof rawTask.notes === 'string' ? rawTask.notes : '',
+    unfinished: Array.isArray(rawTask.unfinished) ? rawTask.unfinished.map(String) : [],
+    sessionIds,
+    relatedExperiences: Array.isArray(rawTask.relatedExperiences) ? rawTask.relatedExperiences.map(String) : [],
+    relatedProposals: Array.isArray(rawTask.relatedProposals) ? rawTask.relatedProposals.map(String) : [],
+    files: Array.isArray(rawTask.files) ? rawTask.files.map(String) : [],
+    fileStates: Array.isArray(rawTask.fileStates) ? rawTask.fileStates : [],
+    verified: typeof rawTask.verified === 'string' ? rawTask.verified : '',
+    evidence: typeof rawTask.evidence === 'string' ? rawTask.evidence : 'self-reported',
+  }
+  if (typeof rawTask.startedAt === 'number' && Number.isFinite(rawTask.startedAt) && rawTask.startedAt >= 0) {
+    record.startedAt = Math.floor(rawTask.startedAt)
+  }
+  return record
 }
 
 /** A revision must be a non-negative safe integer; -3 is safe but impossible. */
@@ -303,10 +340,7 @@ export async function apply(ctx) {
           if (payload?.agent?.id && !existingSessions.includes(payload.agent.id)) {
             await client.post('/v1/tasks/record', {
               projectId: config.projectId,
-              task: {
-                ...targetTask,
-                sessionIds: [...existingSessions, payload.agent.id],
-              },
+              task: toTaskRecord(targetTask, payload.agent.id),
             }, { signal: payload.signal })
           }
 
@@ -409,6 +443,14 @@ export async function apply(ctx) {
           checkedExecutions.set(exec, { decision: 'deny', reason: `${exec.name} 由最近一次规则快照禁止（核心当前不可达）。` })
           return { kind: 'deny', reason: `${exec.name} 由最近一次规则快照禁止（核心当前不可达）。` }
         }
+        const cmd = (exec.args && typeof exec.args === 'object' ? exec.args.command : '')
+          || (typeof exec.args === 'string' ? exec.args : '')
+          || (exec.arguments && typeof exec.arguments === 'object' ? exec.arguments.command : '')
+        const bypass = checkShellWriteBypass(exec.name, cmd, snapshot.record?.deniedTools)
+        if (bypass.denied) {
+          checkedExecutions.set(exec, { decision: 'deny', reason: bypass.reason })
+          return { kind: 'deny', reason: bypass.reason }
+        }
         checkedExecutions.set(exec, { decision: 'allow', reason: 'snapshot allowed' })
         warnDegradedOnce(exec.agent, mode, snapshot.detail)
         return next()
@@ -435,6 +477,14 @@ export async function apply(ctx) {
     if (previousRevision !== gate.knowledgeRevision) injectCurrentContext(exec.agent, gate.context)
     checkedExecutions.set(exec, gate)
     if (gate.decision === 'deny') return { kind: 'deny', reason: gate.reason || 'Blocked by Agent Memory Backpack knowledge policy.' }
+    const cmd = (exec.args && typeof exec.args === 'object' ? exec.args.command : '')
+      || (typeof exec.args === 'string' ? exec.args : '')
+      || (exec.arguments && typeof exec.arguments === 'object' ? exec.arguments.command : '')
+    const bypass = checkShellWriteBypass(exec.name, cmd, gate.deniedTools)
+    if (bypass.denied) {
+      checkedExecutions.set(exec, { decision: 'deny', reason: bypass.reason })
+      return { kind: 'deny', reason: bypass.reason }
+    }
     return next()
   })
 
@@ -502,6 +552,27 @@ export async function apply(ctx) {
     async execute(args, exec) {
       const query = requireString(args?.query, 'query')
       return await client.post('/v1/search', { projectId: config.projectId, query }, { signal: exec.signal })
+    },
+  }))
+
+  registerTool(jsonTool({
+    name: 'amb_search_universal',
+    description: 'Search across all knowledge entries (skills, norms, workflows, memories, journals) by free-text query with optional kind and limit filters.',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        query: { type: 'string' },
+        kind: { type: 'string' },
+        limit: { type: 'integer', minimum: 1, maximum: 200 },
+      },
+    },
+    async execute(args, exec) {
+      return await client.post('/v1/knowledge/search-universal', {
+        projectId: config.projectId,
+        query: typeof args?.query === 'string' ? args.query : '',
+        ...(args?.kind ? { kind: String(args.kind) } : {}),
+        ...(Number.isInteger(args?.limit) ? { limit: args.limit } : {}),
+      }, { signal: exec.signal })
     },
   }))
 
@@ -687,7 +758,7 @@ export async function apply(ctx) {
 
   registerTool(jsonTool({
     name: 'amb_submit_experience',
-    description: 'Submit a discovered experience as a pending candidate for human review.',
+    description: 'Submit a discovered experience as a pending candidate for human review. Provide verbatim discovery insight text without conversational framing or platform prefixes to preserve cross-client deduplication.',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
@@ -699,6 +770,7 @@ export async function apply(ctx) {
         discovery: { type: 'string', minLength: 1, maxLength: 12_000 },
         workflowId: { type: 'string', minLength: 1, maxLength: 120 },
         baseRevision: { type: 'integer', minimum: 1 },
+        taskId: { type: 'string', minLength: 1, maxLength: 120 },
       }, required: ['idempotencyKey', 'discovery'],
     },
     async execute(args, exec) {
@@ -707,6 +779,7 @@ export async function apply(ctx) {
         projectId: config.projectId,
         ...(typeof args?.workflowId === 'string' ? { workflowId: args.workflowId } : {}),
         ...(Number.isSafeInteger(args?.baseRevision) && args.baseRevision >= 1 ? { baseRevision: args.baseRevision } : {}),
+        ...(typeof args?.taskId === 'string' ? { taskId: args.taskId } : {}),
         discovery: requireString(args?.discovery, 'discovery'),
       }
       try {

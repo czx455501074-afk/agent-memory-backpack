@@ -88,7 +88,13 @@ test('real DSH ToolRuntime loads, executes and disposes the adapter with a real 
     ctx.on('tools/pre-execute', async (_exec, next) => { if (!skipOtherPolicies) await next(); return { kind: 'allow' }; });
   } });
   const fiber = await plugin(adapter);
-  assert.equal(tools.schemas().filter(x => x.name.startsWith('amb_')).length, 11);
+  const ambToolNames = tools.schemas().filter(x => x.name.startsWith('amb_')).map(x => x.name).sort();
+  assert.equal(ambToolNames.length, 12);
+  assert.deepEqual(ambToolNames, [
+    'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
+    'amb_read_stage', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
+    'amb_submit_experience', 'amb_supersede_experience', 'amb_unstructured_skills',
+  ]);
   const injected = [];
   const agent = { id: 'real-tool-session', session: { header: { cwd: process.cwd() } }, inject(message) { injected.push(message); } };
   const execute = (name, args = {}, owner = agent) => tools.execute({ callId: randomUUID(), name, arguments: args, agent: owner, signal: new AbortController().signal });

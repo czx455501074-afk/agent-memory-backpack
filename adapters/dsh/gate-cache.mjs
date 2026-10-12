@@ -205,3 +205,53 @@ export function operatingMode({ coreReachable, snapshot }) {
   if (snapshot?.state === 'unreadable') return { mode: 'Ungoverned', detail: `核心不可达，且快照无法读取（${snapshot.detail}）` };
   return { mode: 'Ungoverned', detail: '核心从未成功应答过，本会话不受规则约束' };
 }
+
+/** Known write tools that norm policies may forbid. */
+const WRITE_TOOLS = new Set([
+  'write', 'edit', 'apply_patch', 'write_file', 'edit_file', 'create_file', 'patch'
+]);
+
+const SHELL_TOOLS = new Set([
+  'bash', 'pwsh', 'shell', 'terminal', 'cmd'
+]);
+
+/**
+ * Heuristically detect whether a shell command attempts to write or create files
+ * when write tools are denied by active policy.
+ *
+ * NOTE: This is a bounded heuristic (Option A). It intercepts direct redirection
+ * (> and >>) and common write utilities (tee, touch, mkdir, Set-Content, etc.),
+ * but does not claim complete coverage against indirect shell execution
+ * (e.g. python -c, base64 decoding, nested scripts).
+ */
+export function checkShellWriteBypass(toolName, command, deniedTools) {
+  const normTool = normalise(toolName);
+  if (!SHELL_TOOLS.has(normTool)) return { denied: false };
+  if (!Array.isArray(deniedTools)) return { denied: false };
+
+  const hasWriteProhibition = deniedTools.some(t => WRITE_TOOLS.has(normalise(t)));
+  if (!hasWriteProhibition) return { denied: false };
+
+  if (typeof command !== 'string' || !command.trim()) return { denied: false };
+
+  const cmd = command.trim();
+
+  // Pattern 1: Redirections > or >> into a file (excluding /dev/null and fd duplicates like 2>&1)
+  const redirectPattern = /(?:^|[^<>&|])\s*(?:>>|>)\s*(?!\/dev\/null\b|&\d)(?:[^\s>&|]+)/i;
+
+  // Pattern 2: Common file writing / directory creation commands
+  const writeCmdPattern = /\b(?:tee|touch|mkdir|Set-Content|Out-File|New-Item)\b/i;
+
+  // Pattern 3: dd with output file
+  const ddPattern = /\bdd\s+.*?\bof=/i;
+
+  if (redirectPattern.test(cmd) || writeCmdPattern.test(cmd) || ddPattern.test(cmd)) {
+    return {
+      denied: true,
+      reason: '当前生效的规范禁止文件写入；检测到 shell 命令可能包含写文件操作（启发式拦截：>、>>、tee、touch、mkdir 等）。注：此拦截为启发式，不覆盖所有间接写入。',
+    };
+  }
+
+  return { denied: false };
+}
+

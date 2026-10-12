@@ -17,6 +17,7 @@
       "amb_prepare",
       "amb_read_knowledge",
       "amb_read_stage",
+      "amb_search_universal",
       "amb_search_workflows",
       "amb_self_check",
       "amb_structure_skill",

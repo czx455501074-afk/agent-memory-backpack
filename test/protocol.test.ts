@@ -102,7 +102,7 @@ test('built stdio MCP connects using official SDK and exposes read/candidate too
     const names = (await client.listTools()).tools.map(t => t.name).sort();
     assert.deepEqual(names, [
       'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
-      'amb_read_stage', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
+      'amb_read_stage', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
       'amb_submit_experience', 'amb_supersede_experience', 'amb_unstructured_skills',
     ]);
     const result = await client.callTool({ name: 'amb_prepare', arguments: { query: 'P0' } });
@@ -153,6 +153,7 @@ test('every exposed MCP tool actually works end to end', async () => {
 
     await invoke('amb_prepare', { query: 'P0' }, t => t.includes('P0 fixture'));
     await invoke('amb_search_workflows', { query: 'audit' }, t => t.includes('audit-wf'));
+    await invoke('amb_search_universal', { query: 'audit' }, t => t.includes('results'));
     await invoke('amb_read_stage', { workflowId: 'audit-wf', stageId: 'step' }, t => t.includes('audit-wf'));
     await invoke('amb_submit_experience', { idempotencyKey: 'mcp1', discovery: 'Only a candidate' }, t => t.includes('pending'));
 

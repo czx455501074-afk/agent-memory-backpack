@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { createAdapterLogger } from "./log.mjs";
 import { resolveClientConfig } from "./resolve-config.mjs";
 import { ensureCoreRunning } from "./ensure-core.mjs";
-import { decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from "./gate-cache.mjs";
+import { checkShellWriteBypass, decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from "./gate-cache.mjs";
+import { checkNodeVersion } from "./node-version.mjs";
 
 const MAX_STDIN_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 4500;
@@ -363,15 +364,42 @@ async function prepare(input, config) {
         projectId: config.projectId,
         taskId: sessionInfo.taskId,
       });
+function toTaskRecord(rawTask, extraSessionId) {
+  if (!rawTask || typeof rawTask !== 'object') {
+    throw new Error('Invalid task object passed to toTaskRecord');
+  }
+  const existingSessions = Array.isArray(rawTask.sessionIds) ? rawTask.sessionIds : [];
+  const sessionIds = (extraSessionId && !existingSessions.includes(extraSessionId))
+    ? [...existingSessions, extraSessionId]
+    : [...existingSessions];
+
+  const record = {
+    id: String(rawTask.id ?? ''),
+    title: String(rawTask.title ?? ''),
+    status: rawTask.status,
+    summary: typeof rawTask.summary === 'string' ? rawTask.summary : '',
+    notes: typeof rawTask.notes === 'string' ? rawTask.notes : '',
+    unfinished: Array.isArray(rawTask.unfinished) ? rawTask.unfinished.map(String) : [],
+    sessionIds,
+    relatedExperiences: Array.isArray(rawTask.relatedExperiences) ? rawTask.relatedExperiences.map(String) : [],
+    relatedProposals: Array.isArray(rawTask.relatedProposals) ? rawTask.relatedProposals.map(String) : [],
+    files: Array.isArray(rawTask.files) ? rawTask.files.map(String) : [],
+    fileStates: Array.isArray(rawTask.fileStates) ? rawTask.fileStates : [],
+    verified: typeof rawTask.verified === 'string' ? rawTask.verified : '',
+    evidence: typeof rawTask.evidence === 'string' ? rawTask.evidence : 'self-reported',
+  };
+  if (typeof rawTask.startedAt === 'number' && Number.isFinite(rawTask.startedAt) && rawTask.startedAt >= 0) {
+    record.startedAt = Math.floor(rawTask.startedAt);
+  }
+  return record;
+}
+
       if (handoff?.task) {
         const existingSessions = Array.isArray(handoff.task.sessionIds) ? handoff.task.sessionIds : [];
         if (!existingSessions.includes(sessionInfo.sessionId)) {
           await post(config, "/v1/tasks/record", {
             projectId: config.projectId,
-            task: {
-              ...handoff.task,
-              sessionIds: [...existingSessions, sessionInfo.sessionId],
-            },
+            task: toTaskRecord(handoff.task, sessionInfo.sessionId),
           });
         }
         const task = handoff.task;
@@ -439,7 +467,17 @@ async function gate(input, config) {
   }, identity);
   if (result.decision === "deny") {
     deny(safeReason(result.reason, config.token));
-  } else if (result.context.trim()) {
+    return;
+  }
+  const cmd = (input.tool_input && typeof input.tool_input === 'object' ? input.tool_input.command : '')
+    || (typeof input.tool_input === 'string' ? input.tool_input : '')
+    || (typeof input.command === 'string' ? input.command : '');
+  const bypass = checkShellWriteBypass(input.tool_name, cmd, result.deniedTools);
+  if (bypass.denied) {
+    deny(safeReason(bypass.reason, config.token));
+    return;
+  }
+  if (result.context.trim()) {
     const sessionId = sessionInfo.sessionId;
     const lastRev = loadSessionState(config.dataDir, sessionId)?.revision;
     if (lastRev !== result.knowledgeRevision) {
@@ -563,6 +601,17 @@ async function main() {
     return;
   }
 
+  const versionCheck = checkNodeVersion();
+  if (!versionCheck.ok) {
+    logger.error("hook.unsupported_node", { version: versionCheck.version, error: versionCheck.error });
+    if (event === PRE_TOOL_USE) {
+      deny(versionCheck.error);
+      return;
+    }
+    fail(versionCheck.error);
+    return;
+  }
+
   let scopeConfig;
   try {
     scopeConfig = readScopeConfig();
@@ -645,6 +694,14 @@ async function main() {
       if (mode === "ReadOnlySnapshot") {
         if (decideFromSnapshot(snapshot.record, input.tool_name, identity) === "deny") {
           deny(`${input.tool_name} is prohibited by the last policy snapshot; the core is currently unreachable.`);
+          return;
+        }
+        const cmd = (input.tool_input && typeof input.tool_input === 'object' ? input.tool_input.command : '')
+          || (typeof input.tool_input === 'string' ? input.tool_input : '')
+          || (typeof input.command === 'string' ? input.command : '');
+        const bypass = checkShellWriteBypass(input.tool_name, cmd, snapshot.record?.deniedTools);
+        if (bypass.denied) {
+          deny(bypass.reason);
           return;
         }
         logger.warn("hook.degraded", { mode, detail: snapshot.detail ?? "" });

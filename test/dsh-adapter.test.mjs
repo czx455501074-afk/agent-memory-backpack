@@ -170,7 +170,7 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
 
   assert.deepEqual([...registeredTools.keys()].sort(), [
     'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
-    'amb_read_stage', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
+    'amb_read_stage', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
     'amb_submit_experience', 'amb_supersede_experience', 'amb_unstructured_skills',
   ])
 

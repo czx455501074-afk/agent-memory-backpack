@@ -6,6 +6,13 @@ import { readClientConfig } from './config.js';
 import { identifier, workflowSchema } from './schema.js';
 import { pluginVersion } from './doctor.js';
 
+/**
+ * An id as it appears in injected text: `id`, or `id@revision`.
+ * Extends `identifier` to allow an optional `@<digits>` revision suffix
+ * while preserving character set restrictions (no slashes, whitespace, or path traversal).
+ */
+const referenceId = z.string().min(1).max(140).regex(/^[\p{L}\p{N}_.:-]+(@\d{1,9})?$/u);
+
 export function createMcp(client: CoreClient) {
   const server = new McpServer({ name: 'agent-memory-backpack', version: '0.1.0-p0.1' });
   const call = async (path: string, args: Record<string, unknown>, validate?: (value: unknown) => Record<string, unknown>) => {
@@ -62,13 +69,22 @@ export function createMcp(client: CoreClient) {
     description: 'Search complete workflows across categories; never combine isolated snippets into an unverified procedure.',
     inputSchema: { query: z.string().max(4000) }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/search', args));
+  server.registerTool('amb_search_universal', {
+    description: 'Search across all knowledge entries (skills, norms, workflows, memories, journals) by free-text query with optional kind and limit filters.',
+    inputSchema: {
+      query: z.string().max(4000).default(''),
+      kind: z.string().max(100).optional(),
+      limit: z.number().int().positive().max(200).optional(),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, args => call('/v1/knowledge/search-universal', args));
   server.registerTool('amb_read_stage', {
     description: 'Read a workflow stage, required prerequisites and exact dependencies. Unavailable dependencies block execution.',
     inputSchema: { workflowId: identifier, stageId: identifier }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/expand', args));
   server.registerTool('amb_read_knowledge', {
     description: 'Expand one adopted skill or memory by the id shown in the prepare summary. Set includeLeaves to also read the reference documents a skill carries.',
-    inputSchema: { knowledgeId: identifier, includeLeaves: z.boolean().default(false) }, annotations: { readOnlyHint: true, openWorldHint: false },
+    inputSchema: { knowledgeId: referenceId, includeLeaves: z.boolean().default(false) }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/read', args));
   server.registerTool('amb_supersede_experience', {
     description: 'After verifying in practice, replace or supplement an earlier experience. Both action values keep the earlier revision in history; a reason and evidence are required.',
@@ -100,8 +116,14 @@ export function createMcp(client: CoreClient) {
     inputSchema: {}, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/unstructured', args));
   server.registerTool('amb_submit_experience', {
-    description: 'Submit a candidate experience with its parent workflow and observed revision. This never directly changes active knowledge. Reuse idempotencyKey only for an identical retry.',
-    inputSchema: { idempotencyKey: identifier, discovery: z.string().min(1).max(12000), workflowId: identifier.optional(), baseRevision: z.number().int().positive().optional(), taskId: identifier.optional() },
+    description: 'Submit a candidate experience with its parent workflow and observed revision. Provide verbatim discovery insight text without conversational framing or platform prefixes to preserve cross-client deduplication. Reuse idempotencyKey only for an identical retry.',
+    inputSchema: {
+      idempotencyKey: identifier,
+      discovery: z.string().trim().min(1).max(12000).describe('Verbatim discovery text without conversational framing or client prefixes'),
+      workflowId: identifier.optional(),
+      baseRevision: z.number().int().positive().optional(),
+      taskId: identifier.optional(),
+    },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, args => call('/v1/proposals', args));
   /**
@@ -122,6 +144,15 @@ export function createMcp(client: CoreClient) {
   return server;
 }
 
+export function assertSupportedNodeVersion(): void {
+  const versionString = process.env.AMB_TEST_NODE_VERSION || process.versions.node;
+  const raw = String(versionString ?? '').trim().replace(/^v/, '');
+  const match = raw.match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!match || Number(match[1]) !== 24 || Number(match[2]) < 13) {
+    throw new Error(`Agent Memory Backpack 需要 Node 24.x（>=24.13.0 <25），当前运行版本为 v${raw}。请让宿主使用支持的 Node 24 运行时启动。`);
+  }
+}
+
 // The entry is exclusively the stdio server. Importing tests uses createMcp without launching it.
 import { pathToFileURL } from 'node:url';
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -135,6 +166,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // check refused every legitimate session; and measurement shows the core's own
   // per-request scope enforcement is complete without it. See `CoreClient.post`.
   try {
+    assertSupportedNodeVersion();
     await createMcp(new CoreClient(readClientConfig(undefined, 'codex'))).connect(new StdioServerTransport());
   }
   catch (error) { console.error((error as Error).message); process.exitCode = 1; }
