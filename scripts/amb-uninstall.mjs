@@ -5,7 +5,8 @@
 //   - 明确打印「没有动过的东西」清单：用户原始 skills、AGENTS.md、其它插件、node_modules、
 //     宿主 profile 中与本插件无关的部分。
 //   - 呼应 README 承诺：「扫描全程只读」「卸载只删数据目录，不影响你的任何原始文件」。
-import { existsSync, rmSync, statSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, rmSync, statSync, readdirSync, readFileSync, writeFileSync, lstatSync, readlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -178,14 +179,234 @@ say('  - 设置 -> 插件，停用/卸载本插件。');
 say('  - 不要直接删除 DSH 的 node_modules 或其他插件，只移除本插件即可。');
 say('');
 
-// -------------------------------------------------------- 数据目录删除（可选）
+// -------------------------------------------------------- 数据目录删除与清理（可选）
+function isProcessAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getListeningPids(port) {
+  if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) return [];
+  try {
+    if (process.platform === 'win32') {
+      const out = execFileSync('powershell.exe', [
+        '-NoProfile', '-Command',
+        `(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue).OwningProcess`
+      ], { encoding: 'utf8', timeout: 3000, windowsHide: true });
+      return out.trim().split(/\s+/).map(Number).filter(p => Number.isSafeInteger(p) && p > 0);
+    }
+    try {
+      const out = execFileSync('lsof', ['-iTCP:' + port, '-sTCP:LISTEN', '-Fp'], { encoding: 'utf8', timeout: 3000 });
+      return [...out.matchAll(/p(\d+)/g)].map(m => Number(m[1])).filter(p => Number.isSafeInteger(p) && p > 0);
+    } catch {
+      return [];
+    }
+  } catch {
+    return [];
+  }
+}
+
+async function verifyCoreProcess(dir, pid, port) {
+  let targetPort = (typeof port === 'number' && port > 0) ? port : null;
+  if (!targetPort) {
+    const coreJsonFile = join(dir, 'core.json');
+    if (existsSync(coreJsonFile)) {
+      try {
+        const coreConfig = JSON.parse(readFileSync(coreJsonFile, 'utf8'));
+        if (coreConfig?.port) targetPort = Number(coreConfig.port);
+        else if (coreConfig?.endpoint) {
+          const u = new URL(coreConfig.endpoint);
+          if (u.port) targetPort = Number(u.port);
+        }
+      } catch {}
+    }
+  }
+
+  if (!targetPort) {
+    return { verified: false, reason: 'no_port_found' };
+  }
+
+  // 1. Check health on the recorded port
+  let healthOk = false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${targetPort}/health`, { signal: AbortSignal.timeout(800), redirect: 'error' });
+    if (res.ok) {
+      const body = await res.json();
+      if (body?.protocolVersion === 1 && body?.status === 'ok') {
+        healthOk = true;
+      }
+    }
+  } catch {}
+
+  if (!healthOk) {
+    return { verified: false, reason: 'health_probe_failed', port: targetPort };
+  }
+
+  // 2. Bind pid to the listening port: kernel must confirm this pid owns the listening socket
+  const listeningPids = getListeningPids(targetPort);
+  if (listeningPids.length === 0) {
+    // If kernel cannot confirm who owns the port, we cannot bind pid to it.
+    // The only safe action is refusing to kill automatically.
+    return { verified: false, reason: 'socket_owner_unverifiable', port: targetPort, platform: process.platform };
+  }
+  if (!listeningPids.includes(pid)) {
+    return { verified: false, reason: 'pid_not_owning_port', port: targetPort, owningPids: listeningPids };
+  }
+
+  return { verified: true, port: targetPort };
+}
+
+async function stopCoreIfRunning(dir) {
+  const lockFile = join(dir, 'core.lock');
+  if (!existsSync(lockFile)) return { stopped: false, reason: 'no_lock' };
+
+  let lockInfo;
+  try {
+    lockInfo = JSON.parse(readFileSync(lockFile, 'utf8'));
+  } catch {
+    rmSync(lockFile, { force: true });
+    return { stopped: false, reason: 'unreadable_lock_cleaned' };
+  }
+
+  const pid = lockInfo?.pid;
+  if (!pid || typeof pid !== 'number') {
+    rmSync(lockFile, { force: true });
+    return { stopped: false, reason: 'invalid_pid_cleaned' };
+  }
+
+  if (!isProcessAlive(pid)) {
+    rmSync(lockFile, { force: true });
+    return { stopped: false, pid, reason: 'stale_lock_cleaned' };
+  }
+
+  // Ownership verification: ensure this process is genuinely our core before signaling
+  const verification = await verifyCoreProcess(dir, pid, lockInfo?.port);
+  if (!verification.verified) {
+    warn(`锁文件记录的 PID ${pid} 正在运行，但其端口或服务未确认为 Agent Memory Backpack 核心进程（健康探测未响应或协议不符）。`);
+    warn(`为防止误杀其他无关进程，脚本拒绝发信号，数据目录未清理。请人工核对 PID ${pid}。`);
+    return { stopped: false, pid, refused: true, reason: 'foreign_or_unverified_process' };
+  }
+
+  say(`检测到正在运行的核心进程（PID: ${pid}），已通过归属验证，正在停止...`);
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {}
+
+  const start = Date.now();
+  while (isProcessAlive(pid) && Date.now() - start < 3000) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  if (isProcessAlive(pid)) {
+    say(`进程未在 3 秒内退出，发送强制终止信号...`);
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      try { process.kill(pid); } catch {}
+    }
+    const killStart = Date.now();
+    while (isProcessAlive(pid) && Date.now() - killStart < 2000) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  // Wait until port is completely freed to avoid Windows file lock race
+  const port = lockInfo?.port;
+  if (typeof port === 'number' && port > 0) {
+    const portStart = Date.now();
+    while (Date.now() - portStart < 2500) {
+      try {
+        await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(150), redirect: 'error' });
+        await new Promise(r => setTimeout(r, 100));
+      } catch {
+        break;
+      }
+    }
+  }
+
+  rmSync(lockFile, { force: true });
+  // Allow OS to release open SQLite handles (especially on Windows)
+  await new Promise(r => setTimeout(r, 150));
+  return { stopped: !isProcessAlive(pid), pid };
+}
+
+function cleanDeployedDshPlugin() {
+  const PACKAGE = 'dsh-agent-memory-backpack';
+  const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh');
+  const profilesDir = join(dshHome, 'profiles');
+  const cleanedProfiles = [];
+
+  if (existsSync(profilesDir)) {
+    try {
+      for (const profile of readdirSync(profilesDir)) {
+        const profileDir = join(profilesDir, profile);
+        const manifestPath = join(profileDir, 'package.json');
+        let touched = false;
+        if (existsSync(manifestPath)) {
+          try {
+            const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+            if (manifest.dependencies && manifest.dependencies[PACKAGE]) {
+              delete manifest.dependencies[PACKAGE];
+              touched = true;
+            }
+            if (Array.isArray(manifest.dsh?.profile?.bundles) && manifest.dsh.profile.bundles.includes(PACKAGE)) {
+              manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(b => b !== PACKAGE);
+              touched = true;
+            }
+            if (touched) {
+              writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+              cleanedProfiles.push(profile);
+            }
+          } catch {}
+        }
+
+        const link = join(profileDir, 'node_modules', PACKAGE);
+        if (existsSync(link)) {
+          try {
+            const stats = lstatSync(link);
+            if (stats.isSymbolicLink()) {
+              const linkDest = readlinkSync(link);
+              const resolvedDest = resolve(profileDir, 'node_modules', linkDest);
+              // Only remove if it resolves to our target or contains our package sentinel
+              if (resolvedDest === resolve(target) || existsSync(join(link, 'ensure-core.mjs')) || existsSync(join(resolvedDest, 'ensure-core.mjs'))) {
+                rmSync(link, { recursive: true, force: true });
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  const target = process.env.AMB_PLUGIN_DIR
+    ? resolve(process.env.AMB_PLUGIN_DIR)
+    : join(dshHome, 'plugins', 'agent-memory-backpack');
+
+  let targetCleaned = false;
+  if (existsSync(target)) {
+    try {
+      if (existsSync(join(target, 'ensure-core.mjs')) || existsSync(join(target, 'package.json'))) {
+        rmSync(target, { recursive: true, force: true });
+        targetCleaned = true;
+      }
+    } catch {}
+  }
+
+  return { cleanedProfiles, targetCleaned, target };
+}
+
 if (!values['purge-data']) {
   say('未传 --purge-data，数据目录保持原样（不删除任何东西）。');
   say('需要删除时：node scripts/amb-uninstall.mjs --purge-data --yes');
   process.exit(0);
 }
 
-say('\n准备删除数据目录：');
+say('\n准备删除数据目录与清理部署：');
 say(`  目标：${dataDir}`);
 if (!values.yes) {
   warn('未传 --yes，只做干跑（不会真的删除）。');
@@ -196,14 +417,38 @@ if (!values.yes) {
   process.exit(0);
 }
 
-say('开始删除（已确认 --yes）...');
+say('开始执行卸载清理（已确认 --yes）...');
+
+// 1. Stop core if running to release SQLite file handles
+try {
+  const stopOutcome = await stopCoreIfRunning(dataDir);
+  if (stopOutcome.refused) {
+    fail('核心进程归属未通过验证，已拒绝发信号并终止卸载，以避免误伤无关进程。');
+    process.exit(1);
+  }
+  if (stopOutcome.stopped) {
+    say(`已停止核心进程（PID: ${stopOutcome.pid}）。`);
+  }
+} catch (err) {
+  warn(`停止核心进程时遇到异常：${err instanceof Error ? err.message : String(err)}`);
+}
+
+// 2. Clean deployed DSH plugin and profile junctions
+try {
+  const deployClean = cleanDeployedDshPlugin();
+  if (deployClean.targetCleaned) say(`已清理部署目标目录：${deployClean.target}`);
+  if (deployClean.cleanedProfiles.length > 0) say(`已从下列 DSH profiles 移除依赖与链接：${deployClean.cleanedProfiles.join(', ')}`);
+} catch (err) {
+  warn(`清理 DSH 部署时遇到异常：${err instanceof Error ? err.message : String(err)}`);
+}
+
+// 3. Purge dataDir
 try {
   rmSync(dataDir, { recursive: true, force: true });
-  say(`已删除：${dataDir}`);
+  say(`已删除数据目录：${dataDir}`);
 } catch (error) {
-  fail(`删除失败：${error instanceof Error ? error.message : String(error)}`);
-  console.error('  怎么修：检查目录权限，或有进程正在占用该目录（比如核心仍在运行）。');
-  console.error('          先用 Ctrl+C 停止核心，或在任务管理器里结束 node.exe，再重试。');
+  fail(`删除数据目录失败：${error instanceof Error ? error.message : String(error)}`);
+  console.error('  当前状态：核心已尝试停止，部分文件可能仍在释放。请重试执行卸载收敛清理。');
   process.exit(1);
 }
 
