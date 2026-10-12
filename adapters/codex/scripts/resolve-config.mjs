@@ -77,6 +77,19 @@ export function resolveClientConfig(adapterId, env = process.env) {
   }
 
   if (existsSync(own)) return Object.freeze({ path: own, source: 'default', envVar: null, warning: null });
-  if (existsSync(legacy)) return Object.freeze({ path: legacy, source: 'default', envVar: null, warning: null });
+  // Adopting the legacy shared file is a degraded resolution, so it is never silent:
+  // that file was written for the other adapter and carries its project and role, so
+  // this end could act under an identity that is not its own. Kept for installs that
+  // predate the per-adapter files, but with the same visibility the explicit-pointer
+  // case above has. `source` stays 'default' because the location is the shared data
+  // directory; the warning is what marks the degradation.
+  if (existsSync(legacy)) {
+    return Object.freeze({
+      path: legacy,
+      source: 'default',
+      envVar: null,
+      warning: `No ${adapterId}-client.json in ${dataDir}; using the legacy shared client.json, which an older install wrote for the other adapter. This end may then act under that file's project or role. Run init to write a dedicated credential.`,
+    });
+  }
   return Object.freeze({ path: own, source: 'missing', envVar: null, warning: null });
 }

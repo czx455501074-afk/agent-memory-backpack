@@ -100,7 +100,24 @@ export function resolveConfigPath(adapterId: 'dsh' | 'codex', env: NodeJS.Proces
     return { path: fallback, warning };
   }
   if (existsSync(own)) return { path: own, warning: null };
-  if (existsSync(legacy)) return { path: legacy, warning: null };
+  /**
+   * The legacy shared file is adopted, but never silently.
+   *
+   * `client.json` is documented above as where an older install wrote the *Codex*
+   * credential, so falling back to it can hand this end another adapter's identity:
+   * the file carries the endpoint, the token, the project and the role, and a
+   * different project or an `admin` role would change what this end may do. The
+   * fallback is kept because refusing would break installs that predate the
+   * per-adapter files, but a resolution that is not the adapter's own file is a
+   * degraded one and has to say so — the explicit-pointer case above already warns,
+   * and this path warned about nothing at all.
+   */
+  if (existsSync(legacy)) {
+    return {
+      path: legacy,
+      warning: `No ${adapterId}-client.json in ${dir}; using the legacy shared client.json, which an older install wrote for the other adapter. This end may then act under that file's project or role. Run init to write a dedicated credential.`,
+    };
+  }
   return { path: own, warning: null };
 }
 
