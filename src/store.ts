@@ -1034,6 +1034,15 @@ export class Store {
      * stored.
      */
     review?: ReviewDecision;
+    /**
+     * Present only when the submitted workflow could not be resolved and the
+     * candidate was therefore kept unattributed. The retry branch and the
+     * ordinary new-submission branch omit it, which is what keeps the retry
+     * receipt's `{ id, state, duplicate }` shape intact for `deepEqual`.
+     */
+    attribution?: { workflowId: string | null; stageId: string | null; resolved: boolean };
+    /** Human-facing explanation of an unattributed save; absent when resolved. */
+    note?: string;
   } {
     /**
      * Which review tier this candidate falls into, decided here rather than at each
@@ -1077,7 +1086,34 @@ export class Store {
         if (previous.fingerprint !== fingerprint) throw new DomainError('idempotency_conflict', 'Same idempotency key has different content', 409);
         return { id: previous.id, state: previous.state, duplicate: true };
       }
-      if (payload.stageId !== undefined && payload.workflowId === undefined) {
+      /**
+       * The payload is validated here, not only at the HTTP edge.
+       *
+       * The HTTP path parses the body with `proposalSchema`, so a bad submission
+       * from an adapter never reaches this method. The outbox replay path calls
+       * `submit()` directly — `enqueue()` stores the request body as an opaque blob
+       * by design, because it must be able to keep a payload it cannot yet interpret
+       * — and therefore arrived unvalidated. The gap was observable: an empty
+       * `discovery` was stored as a candidate, and a payload missing the field
+       * entirely failed with a raw `TypeError` from `.trim()` instead of a domain
+       * error naming the field. A reviewer's queue is the wrong place to discover
+       * that a candidate has no text.
+       *
+       * So both entry points now accept the same set, and an invalid payload is a
+       * 400 with the offending field named — the same shape the HTTP edge produces,
+       * which is what lets an adapter treat it as a permanent rejection rather than
+       * a retryable transport fault.
+       */
+      const shape = proposalSchema.safeParse(payload);
+      if (!shape.success) {
+        const field = shape.error.issues[0]?.path.join('.') || 'payload';
+        throw new DomainError('invalid_request', `Candidate payload is invalid at field "${field}"`, 400);
+      }
+      // Normalised through the schema's own trimming, so the exact-text duplicate
+      // rule below compares what the schema said it stored rather than the raw
+      // argument, and so the stored record carries the declared shape.
+      const submission = shape.data;
+      if (submission.stageId !== undefined && submission.workflowId === undefined) {
         // A stage cannot be located without its workflow: "step 3" is meaningless
         // until it is "step 3 of this process", and storing it alone would create the
         // unattached fragment the workflow requirement exists to prevent.
@@ -1100,18 +1136,32 @@ export class Store {
        * a reviewer can see what was claimed and correct it, and the caller is told
        * plainly that the workflow was not found.
        *
+       * `resolved` answers "is this candidate *located* in the flow", and it is
+       * true only when a workflow was named *and* found (and, when a step was
+       * named, that the step belongs to it). A candidate that names nothing at all
+       * has no location, so it is `false` — which is exactly the state this flag
+       * exists to distinguish from a real attribution. Reporting `true` there
+       * would have made the flag worse than absent: the queue would have shown an
+       * unattached candidate as a located one.
+       *
        * What is *not* relaxed: once a workflow does resolve, its `baseRevision`
        * and `stageId` are checked exactly as before. Those answer "is this the
        * version I observed, and does this step exist", which are real integrity
        * questions; a missing workflow answers only "the library cannot confirm
        * this yet", which is not a reason to throw the text away.
        */
-      let workflowResolved = true;
+      // False unless a candidate is genuinely located: a workflow must have been
+      // named and found, and a named step must belong to it.
+      let workflowResolved = false;
       if (payload.workflowId) {
         const entry = this.head(payload.workflowId);
         if (!entry || entry.status !== 'active' || entry.content.kind !== 'workflow' || !applicable(entry.content.scope, payload.projectId)) {
           workflowResolved = false;
         } else {
+          // A workflow that was found and a step that checks out is a real
+          // location; the baseRevision and stage checks below can still refuse the
+          // submission outright, in which case nothing is stored at all.
+          workflowResolved = true;
           if (payload.baseRevision !== undefined && entry.revision !== payload.baseRevision)
             throw new DomainError('revision_conflict', `Expected baseRevision ${payload.baseRevision} but current is ${entry.revision}`, 409);
           /**
@@ -1123,8 +1173,9 @@ export class Store {
            * candidate point at a step that does not exist and be reviewed as though it
            * did.
            */
-          if (payload.stageId !== undefined && !entry.content.stages.some(stage => stage.id === payload.stageId))
+          if (payload.stageId !== undefined && !entry.content.stages.some(stage => stage.id === payload.stageId)) {
             throw new DomainError('not_found', `Workflow ${payload.workflowId} has no stage ${payload.stageId}`, 404);
+          }
         }
       }
       const id = randomUUID();
@@ -1211,6 +1262,10 @@ export class Store {
         attribution: {
           workflowId: payload.workflowId ?? null,
           stageId: workflowResolved ? (payload.stageId ?? null) : null,
+          // True only when this candidate is genuinely located in the flow: a
+          // workflow was named and found, and a named step belongs to it. An
+          // unattached candidate is `false`, which is the state the reviewer needs
+          // to be able to recognise.
           resolved: workflowResolved,
         },
         // Held for a decision rather than lapsing on the ordinary deadline; see
@@ -1323,8 +1378,19 @@ export class Store {
          * free-form payload made every consumer re-derive it, and a cleared
          * payload would have hidden the attribution along with the text. It is
          * derived here so listing and detail views cannot disagree about it.
+         *
+         * `resolved` is the program's verdict rather than the submitter's claim:
+         * it is false when the named workflow could not be found, which is what
+         * tells a reviewer that the workflow id and the step are *assertions*
+         * needing confirmation instead of facts. Older rows carry no such flag —
+         * they were written when an unresolved workflow could not be stored at
+         * all — and are reported as resolved, which is what they were.
          */
-        attribution: payload ? { workflowId: payload.workflowId ?? null, stageId: payload.stageId ?? null } : null,
+        attribution: payload ? {
+          workflowId: payload.attribution?.workflowId ?? payload.workflowId ?? null,
+          stageId: payload.attribution?.stageId ?? payload.stageId ?? null,
+          resolved: payload.attribution?.resolved ?? true,
+        } : null,
       };
     });
   }

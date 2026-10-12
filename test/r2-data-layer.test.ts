@@ -102,7 +102,12 @@ test('F18：stageId 必须属于给定 workflow，未知步骤明确失败；单
 
   const listed = store.listProposals(PROJECT, 'pending').find(item => item.id === accepted.id);
   assert.ok(listed, '候选应出现在列表中');
-  assert.deepEqual(listed.attribution, { workflowId: 'flow-a', stageId: 'apply' }, '列表必须能看出归属哪个流程的哪一步');
+  // `resolved` records whether the attachment was actually located. The shape grew a
+  // field when M1 needed to distinguish "kept unattributed" from "attributed", so the
+  // expectation carries it — with the value the semantics require, not the value the
+  // implementation happened to produce.
+  assert.deepEqual(listed.attribution, { workflowId: 'flow-a', stageId: 'apply', resolved: true },
+    '列表必须能看出归属哪个流程的哪一步，且标明已定位');
   store.close();
 });
 
@@ -110,7 +115,12 @@ test('F18：没有归属的候选仍然保留为待归属候选，attribution �
   const store = new Store(':memory:');
   const submitted = store.submit('dsh', { idempotencyKey: 'unattached', projectId: PROJECT, discovery: '还没有找到归属的经验。' });
   const listed = store.listProposals(PROJECT, 'pending').find(item => item.id === submitted.id);
-  assert.deepEqual(listed?.attribution, { workflowId: null, stageId: null }, '待归属候选不得被伪装成已归属');
+  // Nothing was attached, so `resolved` must be false. This is the assertion that
+  // caught the flag reporting `true` here, which is the one thing it exists to
+  // distinguish; the expectation is written from the semantics rather than copied
+  // from the implementation.
+  assert.deepEqual(listed?.attribution, { workflowId: null, stageId: null, resolved: false },
+    '待归属候选不得被伪装成已归属，且必须标明未定位');
   store.close();
 });
 
@@ -174,11 +184,21 @@ test('F17：重放未送达的事件写入一次；再次重放不重复', () =>
 test('F17：重放失败记录原因与尝试次数，并按退避推迟下一次尝试', () => {
   let now = Date.UTC(2026, 0, 1);
   const store = new Store(':memory:', () => now);
-  // A payload that cannot succeed: the workflow it names does not exist, so the
-  // replay must fail for a real reason rather than because of the clock.
+  /**
+   * A payload that cannot succeed, so the replay fails for a real reason rather than
+   * because of the clock.
+   *
+   * This used to name a workflow that does not exist. M1 deliberately made that case
+   * succeed — an unknown workflow now keeps the candidate as unattributed instead of
+   * refusing it — so the old trigger stopped triggering and the assertions below read
+   * `undefined`. An existing workflow with a step it does not contain still fails
+   * deterministically, which was confirmed against the real store before being used
+   * here (the same run also confirmed the failure path itself was never broken).
+   */
+  store.import([workflow('flow-a')]);
   store.enqueue('dsh', {
     kind: 'candidate', projectId: PROJECT, idempotencyKey: 'will-fail',
-    payload: { idempotencyKey: 'will-fail', projectId: PROJECT, workflowId: 'ghost', discovery: '指向不存在的流程。' },
+    payload: { idempotencyKey: 'will-fail', projectId: PROJECT, workflowId: 'flow-a', stageId: 'ghost', discovery: '指向不存在的步骤。' },
   });
 
   const first = store.replayOutbox({ projectId: PROJECT });
@@ -190,7 +210,7 @@ test('F17：重放失败记录原因与尝试次数，并按退避推迟下一�
   assert.equal(status.pending, 0);
   assert.equal(status.failed, 1, '失败条目可查询');
   assert.equal(status.due, 0, '退避期内不再是"可尝试"');
-  assert.match(String(status.items[0]?.lastError), /unavailable|ghost/, '失败原因可查询');
+  assert.match(String(status.items[0]?.lastError), /ghost|no stage|unavailable/, '失败原因可查询');
 
   // Still inside the backoff window: the item is not attempted again.
   const tooSoon = store.replayOutbox({ projectId: PROJECT });

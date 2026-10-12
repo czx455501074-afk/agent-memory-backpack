@@ -181,6 +181,22 @@ export const journalSchema = z.object({
  * Expiry is stored rather than computed so a retention change does not silently
  * resurrect old material, and `renewalReason` exists because the design requires
  * an explicit renewal to say why — ordinary reading must not extend a lifetime.
+ *
+ * `expiresAt` defaults to 0, and 0 means *no lifetime* — an entry that is already
+ * lapsed. That default is what the store's own write path must never fall through
+ * to: `materialEntry` always computes a real 90-day date (design §8), so a
+ * submission through `saveMaterial` is fine either way. But an entry arriving
+ * through an import path that parses a document directly — `cli seed`, a backup
+ * replay — never passes through `materialEntry`, and a missing field then became a
+ * stored 0. The result was material that expired the instant it was written: the
+ * next `cleanup()` purged it and the seed reported success, so the user was told
+ * an entry had been imported that they could never read.
+ *
+ * Making 0 mean "lapsed" is deliberate and must stay: an explicit 0 is the only
+ * way to express "already expired", which `materialSchema` also accepts as
+ * written. The fix for the seed case therefore belongs at the import boundary,
+ * where a store write can tell "the caller wrote no lifetime" from "the caller
+ * deliberately asked for none" — and can say so in its report.
  */
 export const materialSchema = z.object({
   ...common, kind: z.literal('material'),
