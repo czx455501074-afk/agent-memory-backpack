@@ -93,8 +93,32 @@ export function createClient(config, fetchImpl = fetch) {
       throw err
     }
     if (!response.ok) {
-      const err = new Error(`Agent Memory Backpack core returned HTTP ${response.status}.`)
+      /**
+       * Carry the core's structured refusal, not just its status code.
+       *
+       * The core answers every refusal with `{ code, message }`, and that body is
+       * the actionable part: `target_mismatch` tells a reviewer to re-read the
+       * target, `dependency_unavailable` names the exact `workflow@revision` that
+       * is missing, and `idempotency_conflict` says the key was reused with
+       * different text. F06 was raised because this was flattened into a bare
+       * "HTTP 409", which is indistinguishable between a conflict to fix and a
+       * transient fault to retry, and invites the wrong response. The body is read
+       * and re-exposed as `code`/`coreBody`/`retryable` while the message keeps the
+       * `HTTP <status>` prefix callers and tests already match on.
+       */
+      let payload
+      try { payload = await response.json() } catch { payload = undefined }
+      const record = isRecord(payload) ? payload : {}
+      const code = typeof record.code === 'string' && record.code ? record.code : undefined
+      const detail = typeof record.message === 'string' && record.message
+        ? ` [${code ?? 'error'}] ${record.message}` : ''
+      const err = new Error(`Agent Memory Backpack core returned HTTP ${response.status}${detail}.`)
       err.status = response.status
+      if (code) err.code = code
+      err.coreStatus = response.status
+      err.coreBody = record
+      // 4xx is a decision the caller must act on; 5xx/transport is worth retrying.
+      err.retryable = response.status >= 500
       throw err
     }
     try {

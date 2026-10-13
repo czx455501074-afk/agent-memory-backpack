@@ -1449,6 +1449,22 @@ export class Store {
         createdAt: Number(row.created_at),
         expiresAt: Number(row.expires_at),
         /**
+         * The candidate's own text, surfaced as a plain field.
+         *
+         * F09 was raised because a reviewer had to read the raw `payload` object
+         * to see what the candidate actually said, and a review surface that only
+         * showed the id could not answer "what would I be approving?". It is the
+         * same text already stored in the payload, lifted out so list and detail
+         * cannot disagree.
+         */
+        discovery: payload && typeof (payload as { discovery?: unknown }).discovery === 'string'
+          ? String((payload as { discovery: string }).discovery)
+          : null,
+        /** The review decision recorded on the row, when one was made. */
+        decision: payload && typeof (payload as { decision?: unknown }).decision === 'object'
+          ? (payload as { decision?: unknown }).decision as Record<string, unknown>
+          : null,
+        /**
          * Where this candidate says it belongs, surfaced as its own field.
          *
          * The workflow requirement is that a reviewer can see which process and
@@ -1470,6 +1486,87 @@ export class Store {
           resolved: payload.attribution?.resolved ?? true,
         } : null,
       };
+    });
+  }
+  /**
+   * One proposal, with the information a reviewer needs to decide it.
+   *
+   * F01's root cause was that the review page had no way to name the target of an
+   * approval. The page knew only the candidate's UUID, but the core refuses to
+   * promote a workflow-bearing candidate unless the entry it writes is that very
+   * workflow (`target_mismatch`), so approving from the queue could not work.
+   *
+   * This returns the resolved target — the workflow id and the revision the
+   * candidate was submitted against — plus, when the target exists, the workflow
+   * entry itself, so the reviewer sees the version they are about to change rather
+   * than editing it blind. `target.available` is the program's verdict, not the
+   * submitter's claim.
+   */
+  getProposal(id: string, projectId: string) {
+    const row = this.db.prepare('SELECT id,principal,payload,state,created_at,expires_at,project_id FROM proposals WHERE id=?').get(id) as
+      { id: string; principal: string; payload: string | null; state: string; created_at: number; expires_at: number; project_id: string } | undefined;
+    if (!row) throw new DomainError('not_found', `Proposal ${id} is unavailable`, 404);
+    if (row.project_id !== projectId) throw new DomainError('scope_denied', `Proposal ${id} belongs to another project`, 403);
+    let payload: Record<string, unknown> = {};
+    try { payload = JSON.parse(row.payload || '{}') as Record<string, unknown>; } catch { /* cleared or torn row */ }
+    const workflowId = typeof payload.workflowId === 'string' ? payload.workflowId : null;
+    const baseRevision = typeof payload.baseRevision === 'number' ? payload.baseRevision : null;
+    // Only a workflow entry that is visible to this project and still current can be
+    // the object of an approval; anything else is reported as unavailable so the
+    // reviewer is told to re-locate the candidate instead of being handed a target
+    // the core would refuse.
+    let target: { workflowId: string; baseRevision: number | null; currentRevision: number | null; entry: Knowledge | null; available: boolean; reason: string } = {
+      workflowId: workflowId ?? '', baseRevision, currentRevision: null, entry: null, available: false,
+      reason: workflowId ? '目标流程不存在或已不可见' : '本条候选未标注目标流程',
+    };
+    if (workflowId) {
+      const head = this.head(workflowId);
+      if (head && head.status === 'active' && head.content.kind === 'workflow' && applicable(head.content.scope, projectId)) {
+        target = { workflowId, baseRevision, currentRevision: head.revision, entry: head.content as Knowledge, available: true, reason: '目标流程当前可见' };
+      }
+    }
+    return {
+      id: row.id, principal: row.principal, state: row.state,
+      createdAt: row.created_at, expiresAt: row.expires_at,
+      payload,
+      discovery: typeof payload.discovery === 'string' ? payload.discovery : '',
+      attribution: {
+        workflowId: (payload.attribution as { workflowId?: string | null } | undefined)?.workflowId ?? workflowId,
+        stageId: (payload.attribution as { stageId?: string | null } | undefined)?.stageId ?? (typeof payload.stageId === 'string' ? payload.stageId : null),
+        resolved: (payload.attribution as { resolved?: boolean } | undefined)?.resolved ?? false,
+      },
+      review: (payload.review as Record<string, unknown> | undefined) ?? null,
+      decision: (payload.decision as Record<string, unknown> | undefined) ?? null,
+      target,
+    };
+  }
+  /**
+   * Return an archived, rejected or expired proposal to the review queue.
+   *
+   * The design keeps these rows as readable records rather than destroying them,
+   * so a reviewer who set one aside must be able to bring it back. Only a
+   * decision-free state is reopenable: an `approved` proposal already changed the
+   * library, and reopening it would fork the decision history, so it is refused.
+   */
+  reopenProposal(id: string, options: { actor?: string; projectId?: string } = {}): { state: string; dueAt: number } {
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT state,payload,project_id FROM proposals WHERE id=?').get(id) as
+        { state: string; payload: string; project_id: string } | undefined;
+      if (!row) throw new DomainError('not_found', `Proposal ${id} is unavailable`, 404);
+      if (options.projectId !== undefined && row.project_id !== options.projectId)
+        throw new DomainError('scope_denied', `Proposal ${id} belongs to another project`, 403);
+      if (!['archived', 'rejected', 'expired'].includes(row.state))
+        throw new DomainError('not_found', `Proposal ${id} is not reopenable (state ${row.state})`, 404);
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(row.payload || '{}') as Record<string, unknown>; } catch { /* cleared payload */ }
+      if (payload.discovery === undefined)
+        throw new DomainError('not_found', `Proposal ${id} has no retained content to reopen`, 404);
+      const dueAt = this.now() + 30 * DAY;
+      payload.reopened = [...(Array.isArray(payload.reopened) ? payload.reopened as unknown[] : []),
+        { at: this.now(), actor: options.actor ?? 'unattributed' }];
+      this.db.prepare("UPDATE proposals SET state='pending', expires_at=?, payload=? WHERE id=?")
+        .run(dueAt, JSON.stringify(payload), id);
+      return { state: 'pending', dueAt };
     });
   }
   /**
@@ -2328,6 +2425,10 @@ export class Store {
       // for this task id must not appear in the export a reader treats as fact.
       .filter(event => event.taskId === id && (event.projectId === undefined || event.projectId === projectId));
     const stamp = (value: number | null) => value === null ? '—' : new Date(value).toISOString().replace('T', ' ').slice(0, 16);
+    // Label the time system in the document itself: the export is UTC while the
+    // management page shows local time with an offset, and F09 found a reader could
+    // not tell which was which when correlating the two timelines.
+    const UTC_NOTE = '本文件时间均为 UTC，格式 YYYY-MM-DD HH:MM。';
     const outcomeLabel = { success: '完成（有验证依据）', failure: '失败', unverified: '未验证' } as const;
     // Same rule as the diary: the free-text `verified` cannot be the basis for a
     // success claim. Only a level the plugin can stand behind does.
@@ -2341,7 +2442,8 @@ export class Store {
       `**项目**：${projectId}  `,
       `**时间**：${stamp(task.startedAt ?? task.createdAt)} ~ ${stamp(task.completedAt)}  `,
       `**状态**：${outcomeLabel[outcome]}（${task.status}）  `,
-      `**知识版本**：${task.knowledgeRevision}`, '',
+      `**知识版本**：${task.knowledgeRevision}  `,
+      `**时区**：${UTC_NOTE}`, '',
       '## 摘要', task.summary || '（无）', '',
       '## 进展',
       ...(events.length
@@ -3008,6 +3110,61 @@ export class Store {
       // Every immutable revision stays readable, retired or not.
       revisions,
       chain,
+      /**
+       * Where a reader can fetch an old revision's prose.
+       *
+       * F09: the history view listed revisions but the only fetch path refused a
+       * non-current `@revision` with 409, so a reader could see that v1 existed
+       * and never see what it said. The dedicated route below reads history — it
+       * does not weaken the current-version guard on `read`/`get`, which still
+       * refuse a stale handle — and this field tells the page where that is.
+       */
+      revisionReadHint: '历史修订正文通过 /v1/knowledge/history/read 只读查阅（不得作为当前版本使用）。',
+    };
+  }
+  /**
+   * Read one historical revision of an entry, read-only.
+   *
+   * The revision guard on the retrieval path exists so a caller cannot act on a
+   * version that is no longer current; it is not a reason for the human's history
+   * page to be blind. This method is deliberately separate: it answers "what did
+   * v1 say" without ever returning a handle a caller could confuse with the
+   * current one, and it applies the same scope rule as `history` so one project
+   * cannot read another's past.
+   */
+  readRevision(id: string, revision: number, projectId: string) {
+    const { id: bareId } = this.resolveKnowledgeId(id);
+    const row = this.db.prepare('SELECT content FROM revisions WHERE id=? AND revision=?').get(bareId, revision) as { content: string } | undefined;
+    if (!row) throw new DomainError('not_found', `Revision ${bareId}@${revision} does not exist`, 404);
+    let content: Knowledge;
+    try { content = JSON.parse(String(row.content)) as Knowledge; } catch { throw new DomainError('internal_error', `Revision ${bareId}@${revision} is unreadable`, 500); }
+    if (!applicable(content.scope, projectId)) {
+      throw new DomainError('not_found', `Knowledge entry ${bareId} is unavailable`, 404);
+    }
+    const head = this.head(bareId);
+    const proseOf = (value: Knowledge): string => {
+      switch (value.kind) {
+        case 'skill':
+        case 'memory':
+        case 'norm':
+        case 'preference':
+        case 'material': return value.body;
+        case 'journal': return value.did;
+        case 'workflow': return value.overview;
+      }
+    };
+    return {
+      id: bareId, revision,
+      isCurrent: head?.revision === revision,
+      currentRevision: head?.revision ?? null,
+      currentStatus: head?.status ?? null,
+      kind: content.kind, title: content.title,
+      body: proseOf(content),
+      scope: content.scope,
+      provenance: content.provenance,
+      evidence: content.evidence,
+      createdAt: Number((this.db.prepare('SELECT created_at FROM revisions WHERE id=? AND revision=?').get(bareId, revision) as { created_at: number }).created_at),
+      note: '这是历史修订的只读视图；如需以旧版为准，请先提交候选并按审阅流程更新。',
     };
   }
   /** Head lookup that also sees retired entries, for history display only. */

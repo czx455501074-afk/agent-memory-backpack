@@ -51,11 +51,11 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
  * admin-only alongside the review endpoints.
  */
 const ADMIN_ONLY = new Set([
-  '/v1/proposals/list', '/v1/proposals/approve', '/v1/proposals/reject',
+  '/v1/proposals/list', '/v1/proposals/get', '/v1/proposals/approve', '/v1/proposals/reject',
   // The rest of the review lifecycle is the human's for the same reason approval is:
   // holding a candidate for evidence, archiving it, or acting on many at once are all
   // review decisions, and an agent that could call them could clear its own queue.
-  '/v1/proposals/request-evidence', '/v1/proposals/archive', '/v1/proposals/batch',
+  '/v1/proposals/request-evidence', '/v1/proposals/archive', '/v1/proposals/reopen', '/v1/proposals/batch',
   '/v1/rescan/interval', '/v1/rescan/mark',
   '/v1/knowledge/supersede', '/v1/knowledge/structure',
   // Migration moves the whole library, so it belongs to the human. An agent that
@@ -240,6 +240,32 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           });
         }
         case '/v1/proposals/list': { const p = z.object({ projectId: z.string(), state: z.string().optional() }).parse(body); return reply(res, 200, { proposals: store.listProposals(p.projectId, p.state) }); }
+        /**
+         * One candidate, for the review page's approval form.
+         *
+         * The page needs the resolved target — workflow id, the revision the
+         * candidate was based on, and the current entry — because the core refuses
+         * to approve a workflow-bearing candidate as anything other than that
+         * workflow. Without this the page could only offer the candidate's UUID
+         * and every approval of a workflow candidate came back `target_mismatch`.
+         */
+        case '/v1/proposals/get': {
+          const p = z.object({ projectId: z.string(), id: z.string().min(1) }).parse(body);
+          return reply(res, 200, store.getProposal(p.id, p.projectId));
+        }
+        /**
+         * Reopen an archived, rejected or expired candidate.
+         *
+         * F09: the queue kept these rows readable but offered no way back, so a
+         * candidate set aside by mistake could only be recovered by hand. An
+         * approved proposal is deliberately not reopenable — its decision already
+         * changed the library, and the history of that decision must stay single.
+         */
+        case '/v1/proposals/reopen': {
+          const p = z.object({ projectId: z.string(), id: z.string().min(1) }).parse(body);
+          const result = store.reopenProposal(p.id, { actor: principal.id, projectId: p.projectId });
+          return reply(res, 200, { ...result, note: '已回到待审队列，重新开启 30 天审阅期；原记录与历史保留。' });
+        }
         // Approval carries the reviewer-supplied structured entry; the discovery text is never promoted as-is.
         // `allowGlobalScope` must be stated explicitly, because promoting a
         // project-scoped proposal to a global entry applies it everywhere.
@@ -339,6 +365,18 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           return reply(res, 200, store.supersede({ ...p, origin: 'agent', projectId: p.projectId }));
         }
         case '/v1/knowledge/history': { const p = z.object({ projectId: z.string(), knowledgeId: z.string() }).parse(body); return reply(res, 200, store.history(p.knowledgeId, p.projectId)); }
+        /**
+         * Read one historical revision, read-only.
+         *
+         * The retrieval path deliberately refuses a stale `@revision` so a caller
+         * cannot act on an old version; that guard must not make the history page
+         * blind. This returns the past revision's prose as a read-only view and
+         * never as a usable handle (F09).
+         */
+        case '/v1/knowledge/history/read': {
+          const p = z.object({ projectId: z.string(), id: z.string().min(1), revision: z.number().int().positive() }).parse(body);
+          return reply(res, 200, store.readRevision(p.id, p.revision, p.projectId));
+        }
         // Structuring: the caller supplies the authored workflow; nothing is
         // inferred from the adopted Markdown.
         case '/v1/knowledge/structure': {

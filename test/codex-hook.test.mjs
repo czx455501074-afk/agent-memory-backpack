@@ -489,3 +489,27 @@ test("non-loopback endpoints are rejected before any request", async () => {
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /loopback/);
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(TEST_TOKEN));
 });
+
+test("F06: Codex hook 透传核心结构化错误（code/message），不再只剩 HTTP 409", async () => {
+  // F06 covered the DSH adapter and the Codex hook alike; the hook change was
+  // otherwise untested. A structured 4xx must reach the adapter log with the code
+  // and message intact, not as a bare status, so a later diagnosis can tell a
+  // missing dependency from a transient fault.
+  const service = await startServer((_request, response) =>
+    json(response, 409, { code: "dependency_unavailable", message: "Required dependency realistic-prerequisite@1 is not current" }),
+  );
+  const config = await createConfig(service.endpoint);
+  const result = await runHook(
+    { hook_event_name: "PreToolUse", tool_name: "Bash" },
+    config,
+  );
+  // A structured 4xx is not a request to allow: the policy could not be checked,
+  // so the hook records the real reason rather than fabricating a decision.
+  assert.equal(result.stdout.includes('"permissionDecision":"allow"'), false, "未能核对策略时不得声称放行");
+
+  const logPath = join(dirname(config), "amb-plugin.log.jsonl");
+  assert.ok(existsSync(logPath), "适配器必须写出日志文件");
+  const logText = readFileSync(logPath, "utf8");
+  assert.match(logText, /dependency_unavailable/, "错误日志必须保留核心错误码");
+  assert.match(logText, /realistic-prerequisite@1/, "错误日志必须保留可执行的缺失依赖信息");
+});

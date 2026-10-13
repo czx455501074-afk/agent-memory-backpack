@@ -230,8 +230,21 @@ async function post(config, route, payload) {
       throw err;
     }
     if (!response.ok) {
-      const err = new Error(`Agent Memory Backpack service returned HTTP ${response.status}`);
+      // Carry the core's structured refusal so the caller can act on it: the code
+      // (e.g. `dependency_unavailable`, `target_mismatch`, `idempotency_conflict`)
+      // and message are what distinguish a conflict to fix from a fault to retry.
+      // F06 was raised because this used to be flattened to a bare status code.
+      let payload;
+      try { payload = await response.json(); } catch { payload = undefined; }
+      const record = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+      const code = typeof record.code === "string" && record.code ? record.code : undefined;
+      const detail = typeof record.message === "string" && record.message ? ` [${code ?? "error"}] ${record.message}` : "";
+      const err = new Error(`Agent Memory Backpack service returned HTTP ${response.status}${detail}`);
       err.status = response.status;
+      if (code) err.code = code;
+      err.coreStatus = response.status;
+      err.coreBody = record;
+      err.retryable = response.status >= 500;
       throw err;
     }
 

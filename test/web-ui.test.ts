@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Store } from '../src/store.js';
 import { createCoreServer } from '../src/server.js';
+import { Script } from 'node:vm';
 
 /**
  * The management interface the core serves itself.
@@ -66,6 +67,10 @@ test('核心提供管理界面，且不需要额外运行时', async () => {
       const asset = await fetch(`${origin}${path}`);
       assert.equal(asset.status, 200, `${path} 应可访问`);
       assert.match(asset.headers.get('content-type') ?? '', type);
+      if (path === '/ui/app.js') {
+        const awaitedScript = await asset.text();
+        assert.doesNotThrow(() => new Script(awaitedScript), 'served browser script must parse');
+      }
     }
   } finally { await close(); }
 });

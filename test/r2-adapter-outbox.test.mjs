@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -167,6 +167,11 @@ test('1-a & 1-d: 核心故障或不可达时，DSH 候选提交与事件采集�
 
   assert.equal(offlineReceipt.state, 'pending');
   assert.equal(offlineReceipt.id, 'offline-key-2');
+  // F04: the offline receipt must be distinguishable from a server acceptance,
+  // not a bare `pending` that a reader would report as "已入服务器待审".
+  assert.equal(offlineReceipt.receiptSource, 'local');
+  assert.equal(offlineReceipt.deliveryState, 'queued-local');
+  assert.equal(offlineReceipt.clientSubmissionId, 'offline-key-2');
   delete process.env.AMB_DSH_CONFIG;
   await fiber.dispose();
   await toolsFiber.dispose();
@@ -382,4 +387,374 @@ test('1-b & 1-d: 会话开始自动重放是 best-effort，重放故障绝不阻
   assert.equal(prepareAttempted, true, '重放失败后 prepare 必须仍然执行');
   const parsed = JSON.parse(res.stdout.trim());
   assert.match(parsed.hookSpecificOutput?.additionalContext, /Best-effort context successfully delivered/);
+});
+
+test('F05: 同会话（不换聊天）在核心恢复后触发受控重放，且每轮不再无节制重试', { skip: runtimeSkip }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'amb-f05-replay-'));
+  tempDirs.add(dir);
+  const projectRoot = join(dir, 'project');
+  await mkdir(projectRoot, { recursive: true });
+
+  let coreUp = false;
+  let replayCalls = 0;
+  const s = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+    if (!coreUp) { req.socket.destroy(); return; }
+    if (req.url === '/v1/outbox/replay') { replayCalls += 1; return json(res, 200, { attempted: 0, delivered: [], failed: [], abandoned: [] }); }
+    if (req.url === '/v1/prepare') {
+      return json(res, 200, { protocolVersion: 1, knowledgeRevision: 4, mode: 'Managed', norms: [], workflows: [], context: 'recovered context' });
+    }
+    if (req.url === '/v1/tasks/list') return json(res, 200, { tasks: [] });
+    if (req.url === '/v1/events') return json(res, 200, { id: 'e', stored: true, duplicate: false });
+    return json(res, 404, { error: 'not found', body });
+  });
+  await new Promise(r => s.listen(0, '127.0.0.1', r));
+  servers.add(s);
+  const { port } = s.address();
+
+  const configPath = join(dir, 'client.json');
+  await writeFile(configPath, JSON.stringify({
+    endpoint: `http://127.0.0.1:${port}`,
+    token: 'x'.repeat(32),
+    projectId: PROJECT,
+    projectRoot,
+  }), 'utf8');
+
+  const oldEnv = process.env.AMB_DSH_CONFIG;
+  process.env.AMB_DSH_CONFIG = configPath;
+  const base = new Context();
+  const tools = { register: () => () => {}, guard: () => () => {} };
+  const toolsFiber = base.plugin({ name: 'f05-tools', apply(c) { c.provide('tools', tools); } });
+  await toolsFiber;
+  const fiber = base.plugin(adapter);
+  await fiber;
+
+  try {
+    const agent = { id: 'session-f05', session: { header: { cwd: projectRoot } }, inject: () => {} };
+    const runStep = (text) => base.waterfall('agent/pre-step', {
+      agent,
+      messages: [{ id: 'm-' + Math.random().toString(36).slice(2), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }],
+      turn: 1, step: 1, signal: new AbortController().signal,
+    }, async () => ({ kind: 'enter', messages: [] }));
+
+    // Core down on the session's first entry: no replay request can be answered.
+    await runStep('继续工作');
+    assert.equal(replayCalls, 0, '核心不可达时不应产生成功的重放请求');
+
+    // Core recovers; the same session's next step is the
+    // unreachable→reachable transition and must replay exactly once.
+    coreUp = true;
+    await runStep('继续工作');
+    assert.equal(replayCalls, 1, '核心恢复后同一会话必须触发受控重放一次');
+    // Further turns must not replay again (no per-turn retry loop).
+    await runStep('继续工作');
+    await runStep('继续工作');
+    assert.equal(replayCalls, 1, '重放后不得每轮无节制重试');
+  } finally {
+    if (oldEnv === undefined) delete process.env.AMB_DSH_CONFIG; else process.env.AMB_DSH_CONFIG = oldEnv;
+    await fiber.dispose();
+    await toolsFiber.dispose();
+  }
+});
+
+test('F06: 适配器透传核心结构化错误（code/message/retryable），不再只剩 HTTP 409', { skip: runtimeSkip }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'amb-f06-errors-'));
+  tempDirs.add(dir);
+  const projectRoot = join(dir, 'project');
+  await mkdir(projectRoot, { recursive: true });
+
+  const s = createServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    if (req.url === '/v1/expand') {
+      return json(res, 409, { code: 'dependency_unavailable', message: 'Required dependency realistic-prerequisite@1 is not current' });
+    }
+    if (req.url === '/v1/proposals') {
+      return json(res, 409, { code: 'idempotency_conflict', message: 'Same idempotency key has different content' });
+    }
+    return json(res, 200, {});
+  });
+  await new Promise(r => s.listen(0, '127.0.0.1', r));
+  servers.add(s);
+  const { port } = s.address();
+
+  const configPath = join(dir, 'client.json');
+  await writeFile(configPath, JSON.stringify({
+    endpoint: `http://127.0.0.1:${port}`,
+    token: 'x'.repeat(32),
+    projectId: PROJECT,
+    projectRoot,
+  }), 'utf8');
+
+  const oldEnv = process.env.AMB_DSH_CONFIG;
+  process.env.AMB_DSH_CONFIG = configPath;
+  const base = new Context();
+  const registeredTools = new Map();
+  const tools = {
+    guard: () => () => {},
+    register(definition) { registeredTools.set(definition.name, definition); return () => registeredTools.delete(definition.name); },
+  };
+  const toolsFiber = base.plugin({ name: 'f06-tools', apply(c) { c.provide('tools', tools); } });
+  await toolsFiber;
+  const fiber = base.plugin(adapter);
+  await fiber;
+
+  try {
+    const agent = { id: 'session-f06', session: { header: { cwd: projectRoot } }, inject: () => {} };
+    const readStage = registeredTools.get('amb_read_stage');
+    await assert.rejects(
+      () => readStage.execute({ workflowId: 'w', stageId: 's' }, { agent, signal: new AbortController().signal }),
+      (err) => {
+        assert.equal(err.status, 409);
+        assert.equal(err.code, 'dependency_unavailable');
+        assert.match(err.message, /dependency_unavailable/);
+        assert.match(err.message, /realistic-prerequisite@1/);
+        assert.equal(err.retryable, false, '4xx 是可修正的决定，不是可重试故障');
+        return true;
+      },
+      '核心原因必须随错误透传',
+    );
+
+    // 同键异文必须可被调用方按 code 区分
+    const submit = registeredTools.get('amb_submit_experience');
+    await assert.rejects(
+      () => submit.execute({ idempotencyKey: 'k', discovery: 'x' }, { agent, signal: new AbortController().signal }),
+      (err) => {
+        assert.equal(err.code, 'idempotency_conflict');
+        return true;
+      },
+    );
+  } finally {
+    if (oldEnv === undefined) delete process.env.AMB_DSH_CONFIG; else process.env.AMB_DSH_CONFIG = oldEnv;
+    await fiber.dispose();
+    await toolsFiber.dispose();
+  }
+});
+
+test('F08: amb_prepare 接受 query 并真实用于检索；不传 query 时不检索', { skip: runtimeSkip }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'amb-f08-prepare-'));
+  tempDirs.add(dir);
+  const projectRoot = join(dir, 'project');
+  await mkdir(projectRoot, { recursive: true });
+
+  const prepareBodies = [];
+  const s = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+    if (req.url === '/v1/prepare') {
+      prepareBodies.push(body);
+      return json(res, 200, { protocolVersion: 1, knowledgeRevision: 1, mode: 'Managed', norms: [], workflows: [], context: 'ctx' });
+    }
+    return json(res, 200, {});
+  });
+  await new Promise(r => s.listen(0, '127.0.0.1', r));
+  servers.add(s);
+  const { port } = s.address();
+
+  const configPath = join(dir, 'client.json');
+  await writeFile(configPath, JSON.stringify({
+    endpoint: `http://127.0.0.1:${port}`,
+    token: 'x'.repeat(32),
+    projectId: PROJECT,
+    projectRoot,
+  }), 'utf8');
+
+  const oldEnv = process.env.AMB_DSH_CONFIG;
+  process.env.AMB_DSH_CONFIG = configPath;
+  const base = new Context();
+  const registeredTools = new Map();
+  const tools = {
+    guard: () => () => {},
+    register(definition) { registeredTools.set(definition.name, definition); return () => registeredTools.delete(definition.name); },
+  };
+  const toolsFiber = base.plugin({ name: 'f08-tools', apply(c) { c.provide('tools', tools); } });
+  await toolsFiber;
+  const fiber = base.plugin(adapter);
+  await fiber;
+
+  try {
+    const prepare = registeredTools.get('amb_prepare');
+    assert.ok(prepare.parameters.properties.query, '工具 schema 必须声明 query，模型才能按任务检索');
+    const agent = { id: 'session-f08', session: { header: { cwd: projectRoot } }, inject: () => {} };
+    await prepare.execute({ query: '资料交付' }, { agent, signal: new AbortController().signal });
+    assert.equal(prepareBodies.at(-1).query, '资料交付', 'query 必须真实传到核心');
+    await prepare.execute({}, { agent, signal: new AbortController().signal });
+    assert.equal(prepareBodies.at(-1).query, undefined, '未提供 query 时不得伪造检索条件');
+  } finally {
+    if (oldEnv === undefined) delete process.env.AMB_DSH_CONFIG; else process.env.AMB_DSH_CONFIG = oldEnv;
+    await fiber.dispose();
+    await toolsFiber.dispose();
+  }
+});
+
+test('F03: 交接块携带会话真实触碰的文件与进度，并只注入一次', { skip: runtimeSkip }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'amb-f03-handoff-'));
+  tempDirs.add(dir);
+  const projectRoot = join(dir, 'project');
+  await mkdir(projectRoot, { recursive: true });
+  await writeFile(join(projectRoot, 'delivery.md'), '# 交付\n', 'utf8');
+
+  const recorded = [];
+  const s = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+    if (req.url === '/v1/tasks/list') {
+      return json(res, 200, { tasks: [{ id: 'task-f03', title: '交付任务', status: 'in_progress', sessionIds: ['session-a'], files: [], unfinished: [] }] });
+    }
+    if (req.url === '/v1/tasks/handoff') {
+      return json(res, 200, {
+        task: { id: 'task-f03', title: '交付任务', status: 'in_progress', sessionIds: ['session-a'], files: [], unfinished: [] },
+        knowledgeRevision: 2, norms: [], workflows: [],
+        files: [], suggestion: '继续', caveat: '接收端需重新确认文件与环境状态',
+      });
+    }
+    if (req.url === '/v1/tasks/record') { recorded.push(body.task); return json(res, 200, { ok: true }); }
+    if (req.url === '/v1/prepare') {
+      return json(res, 200, { protocolVersion: 1, knowledgeRevision: 2, mode: 'Managed', norms: [], workflows: [], context: 'ctx' });
+    }
+    return json(res, 200, {});
+  });
+  await new Promise(r => s.listen(0, '127.0.0.1', r));
+  servers.add(s);
+  const { port } = s.address();
+
+  const configPath = join(dir, 'client.json');
+  await writeFile(configPath, JSON.stringify({
+    endpoint: `http://127.0.0.1:${port}`,
+    token: 'x'.repeat(32),
+    projectId: PROJECT,
+    projectRoot,
+  }), 'utf8');
+
+  const oldEnv = process.env.AMB_DSH_CONFIG;
+  process.env.AMB_DSH_CONFIG = configPath;
+  const base = new Context();
+  const tools = { register: () => () => {}, guard: () => () => {} };
+  const toolsFiber = base.plugin({ name: 'f03-tools', apply(c) { c.provide('tools', tools); } });
+  await toolsFiber;
+  const fiber = base.plugin(adapter);
+  await fiber;
+
+  try {
+    // 会话事件流使用真实 DSH 形状：tool/call 带 name+callId（无 message），
+    // tool/result 带 message+toolCallId（无 name），两者靠 callId 配对。
+    const session = { id: 'session-f03', header: { cwd: projectRoot } };
+    base.emit('session/event', session, { type: 'tool/call', data: { name: 'write', callId: 'call-w', arguments: JSON.stringify({ file_path: join(projectRoot, 'delivery.md'), content: '# 交付\n' }) } });
+    base.emit('session/event', session, { type: 'tool/result', data: { message: { toolCallId: 'call-w', content: [{ type: 'text', text: 'Created file' }], isError: false } } });
+
+    const injected = [];
+    const agent = { id: 'session-f03', session: { header: { cwd: projectRoot } }, inject: (m) => injected.push(m) };
+    const runStep = () => base.waterfall('agent/pre-step', {
+      agent,
+      messages: [{ id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '继续这个任务' }] }],
+      turn: 1, step: 1, signal: new AbortController().signal,
+    }, async () => ({ kind: 'enter', messages: [] }));
+
+    await runStep();
+    const handoffMessages = injected.filter(m => m.content[0].text.includes('[Task Handoff]'));
+    assert.equal(handoffMessages.length, 1, '交接块必须注入');
+    assert.match(handoffMessages[0].content[0].text, /delivery\.md/, '交接必须列出会话真实触碰的文件');
+    assert.match(handoffMessages[0].content[0].text, /Progress:.*write/, '交接必须携带按 callId 配对出的真实进度（工具名）');
+    assert.ok(recorded.some(t => Array.isArray(t.files) && t.files.some(f => String(f).includes('delivery.md'))), '触碰的文件必须写回任务记录');
+
+    // 关键回归反例：会话继续做更多工具调用（每次输出都不同）。
+    // 内容随活动变化的 ack 会让交接在每一步都重新注入——这正是 F03 的重复模式，
+    // 复核方用 9 个工具步骤观察到 9 次注入。这里逐字复现该序列并断言只有 1 次。
+    for (let i = 0; i < 9; i += 1) {
+      base.emit('session/event', session, { type: 'tool/call', data: { name: 'pwsh', callId: `call-p${i}`, arguments: JSON.stringify({ command: `Get-ChildItem delivery${i}.md` }) } });
+      base.emit('session/event', session, { type: 'tool/result', data: { message: { toolCallId: `call-p${i}`, content: [{ type: 'text', text: `delivery.md   ${10 + i} bytes` }], isError: false } } });
+      await runStep();
+    }
+    const after = injected.filter(m => m.content[0].text.includes('[Task Handoff]'));
+    assert.equal(after.length, 1, '9 个活动步骤之后，同一交接仍必须只注入一次（按任务，而非按内容）');
+  } finally {
+    if (oldEnv === undefined) delete process.env.AMB_DSH_CONFIG; else process.env.AMB_DSH_CONFIG = oldEnv;
+    await fiber.dispose();
+    await toolsFiber.dispose();
+  }
+});
+
+test('F03-crosstask: 同一会话切换任务时，前一个任务的文件不得泄漏进后一个任务', { skip: runtimeSkip }, async () => {
+  // 独立复核发现的缺陷：文件累加器若按会话（或插件）而非按（会话, 任务）保存，
+  // 同一会话先做 task-A 再做 task-B 时，task-A 的文件会出现在 task-B 的记录与交接里。
+  const dir = await mkdtemp(join(tmpdir(), 'amb-f03-crosstask-'));
+  tempDirs.add(dir);
+  const projectRoot = join(dir, 'project');
+  await mkdir(projectRoot, { recursive: true });
+  await writeFile(join(projectRoot, 'a-only.md'), 'A\n', 'utf8');
+  await writeFile(join(projectRoot, 'b-only.md'), 'B\n', 'utf8');
+
+  const tasks = {
+    'task-A': { id: 'task-A', title: '任务A', status: 'in_progress', sessionIds: ['s'], files: [], unfinished: [] },
+    'task-B': { id: 'task-B', title: '任务B', status: 'in_progress', sessionIds: ['s'], files: [], unfinished: [] },
+  };
+  const recorded = [];
+  const s = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+    if (req.url === '/v1/tasks/list') return json(res, 200, { tasks: Object.values(tasks) });
+    if (req.url === '/v1/tasks/handoff') {
+      const task = tasks[body.taskId] ?? tasks['task-A'];
+      return json(res, 200, { task, knowledgeRevision: 2, norms: [], workflows: [], files: task.files, suggestion: '继续', caveat: 'x' });
+    }
+    if (req.url === '/v1/tasks/record') {
+      recorded.push({ taskId: body.task.id, files: body.task.files });
+      tasks[body.task.id] = { ...tasks[body.task.id], ...body.task };
+      return json(res, 200, { ok: true });
+    }
+    if (req.url === '/v1/prepare') return json(res, 200, { protocolVersion: 1, knowledgeRevision: 2, mode: 'Managed', norms: [], workflows: [], context: 'ctx' });
+    return json(res, 200, {});
+  });
+  await new Promise(r => s.listen(0, '127.0.0.1', r));
+  servers.add(s);
+  const { port } = s.address();
+
+  const configPath = join(dir, 'client.json');
+  await writeFile(configPath, JSON.stringify({ endpoint: `http://127.0.0.1:${port}`, token: 'x'.repeat(32), projectId: PROJECT, projectRoot }), 'utf8');
+  const oldEnv = process.env.AMB_DSH_CONFIG;
+  process.env.AMB_DSH_CONFIG = configPath;
+  const base = new Context();
+  const tools = { register: () => () => {}, guard: () => () => {} };
+  const toolsFiber = base.plugin({ name: 'f03x-tools', apply(c) { c.provide('tools', tools); } });
+  await toolsFiber;
+  const fiber = base.plugin(adapter);
+  await fiber;
+
+  try {
+    const session = { id: 'session-x', header: { cwd: projectRoot } };
+    // Events are UNTAGGED, matching the real host (the verifier found the host does
+    // not put a taskId on session events). Task attribution therefore relies on the
+    // pre-step agent's header, and file segmentation on the per-step cohort.
+    const emitWrite = (callId, file) => {
+      base.emit('session/event', session, { type: 'tool/call', data: { name: 'write', callId, arguments: JSON.stringify({ file_path: join(projectRoot, file), content: 'x' }) } });
+      base.emit('session/event', session, { type: 'tool/result', data: { message: { toolCallId: callId, content: [{ type: 'text', text: 'Created' }], isError: false } } });
+    };
+    const agentFor = (taskId) => ({ id: 'session-x', session: { header: { cwd: projectRoot, taskId } }, inject: () => {} });
+    const runStep = (taskId) => base.waterfall('agent/pre-step', {
+      agent: agentFor(taskId),
+      messages: [{ id: 'u', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '继续这个任务' }] }],
+      turn: 1, step: 1, signal: new AbortController().signal,
+    }, async () => ({ kind: 'enter', messages: [] }));
+
+    // task-A: touch a-only.md
+    emitWrite('c-a', 'a-only.md');
+    await runStep('task-A');
+    const aFiles = recorded.find(r => r.taskId === 'task-A')?.files ?? [];
+    assert.ok(aFiles.some(f => String(f).includes('a-only.md')), 'task-A 必须记录 a-only.md');
+
+    // task-B in the same session: touch b-only.md
+    emitWrite('c-b', 'b-only.md');
+    await runStep('task-B');
+    const bFiles = recorded.filter(r => r.taskId === 'task-B').at(-1)?.files ?? [];
+    assert.ok(bFiles.some(f => String(f).includes('b-only.md')), 'task-B 必须记录 b-only.md');
+    assert.equal(bFiles.some(f => String(f).includes('a-only.md')), false, 'task-A 的文件绝不得泄漏进 task-B');
+  } finally {
+    if (oldEnv === undefined) delete process.env.AMB_DSH_CONFIG; else process.env.AMB_DSH_CONFIG = oldEnv;
+    await fiber.dispose();
+    await toolsFiber.dispose();
+  }
 });

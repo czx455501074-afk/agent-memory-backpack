@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { createClient, isExplicitClientRejection, isRecordValue, isWithinProject, loadClientConfig } from './core-client.mjs'
 import { createAdapterLogger } from './log.mjs'
 import { ensureCoreRunning } from './ensure-core.mjs'
 import { checkShellWriteBypass, decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from './gate-cache.mjs'
-import { spoolEnqueue, spoolReplay } from './spool.mjs'
+import { loadSpool, spoolEnqueue, spoolReplay } from './spool.mjs'
 
 /** The packaged core entry point, resolved beside this adapter. */
 const ADAPTER_DIR = dirname(fileURLToPath(import.meta.url))
@@ -175,6 +175,115 @@ function knowledgeMessage(context) {
   }
 }
 
+/** How many recent session events are scanned when recovering handoff context. */
+const SESSION_EVENT_WINDOW = 400
+/** Tools whose arguments name a file the session actually read or wrote. */
+const FILE_TOOLS = new Set(['read', 'write', 'edit', 'apply_patch', 'create_file', 'str_replace_editor'])
+
+function looksLikePath(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 1024 && /[\\/.]/.test(value)
+}
+
+/**
+ * Collect the project-local files a session's tool calls named.
+ *
+ * Only arguments of read/write/edit-style tools count, and only paths that
+ * resolve inside the project root: the point is a checkable list of what the
+ * previous session touched, not a dump of every string the model typed. Paths
+ * are kept as the session named them (relative or absolute) so they still make
+ * sense to a user reading the handoff. Write targets are returned first, because
+ * "what was produced" matters more to a continuation than "what was looked at".
+ *
+ * `taskId` narrows the scan: an event tagged with a different task is skipped, so
+ * one task's files cannot be attributed to another that runs later in the same
+ * session (the verifier's cross-task counterexample). The caller passes only the
+ * *current cohort* of events (those since its previous step); the real host tags
+ * nothing, so cohort membership — not a tag — is what segments tasks in practice.
+ */
+function harvestSessionFiles(events, projectRoot) {
+  const written = new Set()
+  const read = new Set()
+  for (const event of events) {
+    if (event?.type !== 'tool/call') continue
+    const data = event.data
+    if (!isRecordValue(data) || typeof data.name !== 'string') continue
+    const isFileTool = FILE_TOOLS.has(data.name)
+    const isShell = data.name === 'pwsh' || data.name === 'bash' || data.name === 'shell'
+    if (!isFileTool && !isShell) continue
+    let args = data.arguments
+    if (typeof args === 'string') { try { args = JSON.parse(args) } catch { args = undefined } }
+    if (!isRecordValue(args)) continue
+    const writeTool = data.name === 'write' || data.name === 'edit' || data.name === 'apply_patch' || data.name === 'create_file'
+    const target = writeTool ? written : read
+    for (const key of ['file_path', 'filePath', 'path', 'notebook_path']) {
+      if (looksLikePath(args[key])) target.add(String(args[key]))
+    }
+    // A shell command may name the deliverable too; take only a path-shaped
+    // token, never the whole command.
+    if (isShell && typeof args.command === 'string') {
+      for (const match of args.command.matchAll(/[A-Za-z0-9_./\\:-]{3,}\.(?:md|txt|json|ya?ml|ts|tsx|js|mjs|cjs|py|sql|html|css|csv)/g)) {
+        if (looksLikePath(match[0])) read.add(match[0])
+      }
+    }
+  }
+  const inside = (set) => {
+    const kept = []
+    for (const candidate of set) {
+      try {
+        const absolute = isAbsolute(candidate) ? candidate : join(projectRoot, candidate)
+        const rel = relative(realpathSync(projectRoot), realpathSync(dirname(absolute)))
+        if (rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) kept.push(candidate)
+      } catch { /* a path that does not exist yet cannot be confirmed inside the project */ }
+    }
+    return kept
+  }
+  return [...new Set([...inside(written), ...inside(read)])].slice(0, 100)
+}
+
+/**
+ * A one-line account of the last thing the session was doing.
+ *
+ * Real DSH traces split the two halves: a `tool/call` event carries the tool
+ * `name` and `arguments` (but no message), and a `tool/result` event carries the
+ * output message (but no name). An earlier version looked for both on one event
+ * and therefore never matched, so the handoff's Progress line was always
+ * "未记录". The name is therefore recovered by pairing a result's `toolCallId`
+ * with the call that carries it. The output is the session's own account, so it
+ * is labelled as such beside the core-verified fields, and an aborted turn is
+ * reported as stopped rather than as success.
+ */
+function lastSessionProgress(events) {
+  const nameByCallId = new Map()
+  for (const event of events) {
+    if (event?.type !== 'tool/call') continue
+    const data = event.data
+    if (isRecordValue(data) && typeof data.callId === 'string' && typeof data.name === 'string') {
+      nameByCallId.set(data.callId, data.name)
+    }
+  }
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i]
+    if (event?.type === 'turn/end') {
+      const reason = event.data?.reason?.kind
+      if (reason === 'aborted') return `上一轮被中断（${reason}），未标记完成`
+    }
+    const data = event?.data
+    if (!isRecordValue(data) || !isRecordValue(data.message)) continue
+    const callId = typeof data.message.toolCallId === 'string'
+      ? data.message.toolCallId
+      : (isRecordValue(data.message.source) && typeof data.message.source.callId === 'string' ? data.message.source.callId : undefined)
+    const name = callId ? nameByCallId.get(callId) : undefined
+    const text = (Array.isArray(data.message.content) ? data.message.content : [])
+      .map(block => (isRecordValue(block) && typeof block.text === 'string' ? block.text : ''))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (text && name) return `最近一次工具 ${name}：${text.slice(0, 200)}`
+    if (text) return `最近一次工具输出：${text.slice(0, 200)}`
+  }
+  return ''
+}
+
 export async function apply(ctx) {
   const logger = createAdapterLogger()
   // Stamped at load so a later failure can be tied to a specific plugin build and
@@ -236,7 +345,44 @@ export async function apply(ctx) {
   const injectedContextIds = new WeakMap()
   const warnedOutOfScope = new WeakSet()
   const sessionTasks = new Map()
-  const replayedSessions = new Set()
+  /**
+   * Per-session bookkeeping, keyed by session id.
+   *
+   * Everything here is per *session*, not per plugin, because a DSH process can
+   * serve several sessions: a shared accumulator leaked one task's files into
+   * another task's handoff (the verifier's cross-task counterexample) and would
+   * equally leak between sessions.
+   *
+   * F05 replay: `firstEntryDone` — the first-entry replay attempt has run;
+   *   `degraded` — a prepare failure was observed, so the next successful prepare
+   *   is the unreachable→reachable transition that triggers one controlled replay.
+   * F03 handoff: `eventBuffer` — a bounded window of this session's events;
+   *   `cursor` — how many buffered events a pre-step has already consumed, so each
+   *   step harvests only the cohort that arrived *since* the previous step. That
+   *   cohort is what segments work by task even when the host tags nothing: a
+   *   task switch is followed by the new task's first events and then its first
+   *   step, so old-task events are never in a new-task cohort. `touchedFiles` —
+   *   files accumulated for the current task; `lastProgress` — the last progress
+   *   line, reused on idle steps; `currentTaskId` — reset point for a switch;
+   *   `files`/`proposals`/`notes` — last values written back, for hysteresis;
+   *   `handoffKeys` — tasks whose handoff this session already injected.
+   * Task linking: `submittedProposalIds`/`registeredProposalIds`.
+   */
+  const sessionStates = new Map()
+  const getSessionState = (id) => {
+    let state = sessionStates.get(id)
+    if (!state) {
+      state = {
+        firstEntryDone: false, degraded: false,
+        eventBuffer: [], cursor: 0, touchedFiles: new Set(), currentTaskId: '',
+        lastProgress: '',
+        files: '', proposals: '', notes: '', handoffKeys: new Set(),
+        submittedProposalIds: [], registeredProposalIds: new Set(),
+      }
+      sessionStates.set(id, state)
+    }
+    return state
+  }
   ctx.effect(() => () => client.dispose(), 'agent-memory-backpack: abort outstanding requests')
 
   const inProject = (owner) => isWithinProject(config.projectRoot, owner?.session?.header?.cwd)
@@ -278,14 +424,33 @@ export async function apply(ctx) {
     if (decision.kind !== 'enter' || payload.messages.length === 0) return decision
 
     const currentSessionId = payload?.agent?.id
-    if (currentSessionId && !replayedSessions.has(currentSessionId)) {
-      replayedSessions.add(currentSessionId)
+    /**
+     * The session's replay bookkeeping, created on first sight.
+     *
+     * F05: the old flag was set on first entry and never cleared, so a session
+     * that queued work while the core was down never replayed after recovery —
+     * B's 21 items only cleared when a brand-new session C started. Two failure
+     * modes had to be avoided at once: never replaying again (the original bug),
+     * and replaying on every turn (a naive re-arm, which turns a gated action into
+     * an unbounded retry loop). The schedule is:
+     *   - the first entry of a session attempts one replay, so a session that
+     *     starts with a backlog clears it immediately;
+     *   - after that, a replay runs only on the unreachable→reachable transition:
+     *     a failed prepare marks the session degraded, and the first successful
+     *     prepare afterwards runs one controlled replay;
+     *   - once a replay has reached the core the session rests, and only a fresh
+     *     failure makes the next recovery eligible again.
+     */
+    const sessionState = getSessionState(currentSessionId)
+    const sessionReplayState = sessionState
+    const sessionLastWritten = sessionState
+    const REPLAY_ONCE = async (trigger) => {
       try {
         const replayRes = await client.post('/v1/outbox/replay', {
           projectId: config.projectId,
         }, { signal: payload.signal })
         logger.info('outbox.replay', {
-          sessionId: currentSessionId,
+          sessionId: currentSessionId, trigger,
           attempted: replayRes?.attempted ?? 0,
           delivered: Array.isArray(replayRes?.delivered) ? replayRes.delivered : [],
           failed: Array.isArray(replayRes?.failed) ? replayRes.failed : [],
@@ -294,22 +459,39 @@ export async function apply(ctx) {
       } catch (replayError) {
         if (replayError?.name === 'AbortError') throw replayError
         logger.warn('outbox.replay_failed', {
-          sessionId: currentSessionId,
+          sessionId: currentSessionId, trigger,
           message: replayError instanceof Error ? replayError.message : String(replayError),
         })
       }
       try {
         const spoolOutcome = await spoolReplay(config.dataDir, client, logger)
         if (spoolOutcome.replayed > 0) {
-          logger.info('spool.replay', { sessionId: currentSessionId, replayed: spoolOutcome.replayed, remaining: spoolOutcome.remaining })
+          logger.info('spool.replay', { sessionId: currentSessionId, trigger, replayed: spoolOutcome.replayed, remaining: spoolOutcome.remaining })
         }
       } catch (spoolError) {
         logger.warn('spool.replay_failed', {
-          sessionId: currentSessionId,
+          sessionId: currentSessionId, trigger,
           message: spoolError instanceof Error ? spoolError.message : String(spoolError),
         })
       }
     }
+    if (currentSessionId && !sessionReplayState.firstEntryDone) {
+      // First entry: one attempt. A failure leaves the session eligible for the
+      // recovery transition below once the core is back.
+      sessionReplayState.firstEntryDone = true
+      await REPLAY_ONCE('session-first-entry')
+    }
+    // Local files this session actually touched, so the handoff names them
+    // instead of leaving `files` empty. Cleared after each injection so the same
+    // names are not re-reported on every step.
+    let touchedFiles = []
+    let pendingLocalCount = 0
+    // Surface the local queue so a caller can tell "nothing to send" from
+    // "cannot send right now" without reading the spool file by hand.
+    try {
+      pendingLocalCount = loadSpool(config.dataDir).length
+      if (pendingLocalCount > 0) logger.info('spool.pending', { sessionId: currentSessionId, pending: pendingLocalCount })
+    } catch { /* the count is advisory; never let it break the step */ }
 
     const contextIds = contextIdsFor(payload.agent)
     const userMessages = payload.messages.filter((message) => {
@@ -344,29 +526,126 @@ export async function apply(ctx) {
         if (targetTask) {
           rawTaskId = targetTask.id
           if (payload?.agent?.id) sessionTasks.set(payload.agent.id, targetTask.id)
+          /**
+           * Harvest the cohort of events that arrived since the previous step.
+           *
+           * F03: the task recorded no files and no progress, so a handoff could only
+           * say "check the files" with an empty list, and the next model had to
+           * re-read the disk. The session's own event stream recovers the files it
+           * touched, but *which* of those belong to this task matters: the real host
+           * tags nothing, so the boundary between tasks is the step sequence itself.
+           * Each step therefore consumes only the events buffered since its last
+           * consumption; a task switch is followed by the new task's events and then
+           * its first step, so an old task's calls can never appear in a new task's
+           * cohort. The cursor advances to the current end of the buffer.
+           */
+          const cohortStart = Math.min(sessionState.cursor, sessionState.eventBuffer.length)
+          const cohort = sessionState.eventBuffer.slice(cohortStart)
+          sessionState.cursor = sessionState.eventBuffer.length
+          // A task switch starts a fresh accumulator and a fresh progress line;
+          // work already flushed to the previous task's record lives in the core.
+          if (sessionState.currentTaskId && sessionState.currentTaskId !== targetTask.id) {
+            sessionState.touchedFiles = new Set()
+            sessionState.lastProgress = ''
+            sessionState.files = ''
+            sessionState.proposals = ''
+            sessionState.notes = ''
+          }
+          sessionState.currentTaskId = targetTask.id
+
+          // Only paths that resolve inside the project are kept, so the list is a
+          // record rather than a guess.
+          const harvested = harvestSessionFiles(cohort, config.projectRoot)
+          for (const file of harvested) sessionState.touchedFiles.add(file)
+          touchedFiles = [...sessionState.touchedFiles]
+          // Progress is this cohort's last tool output, carried forward on a step
+          // that produced no new output. It travels as the session's account, never
+          // as a core-verified fact.
+          const cohortProgress = lastSessionProgress(cohort)
+          if (cohortProgress) sessionState.lastProgress = cohortProgress
+          const progress = sessionState.lastProgress
+
+          const recordedFiles = Array.isArray(targetTask.files) ? targetTask.files : []
+          const recordedProposals = Array.isArray(targetTask.relatedProposals) ? targetTask.relatedProposals : []
+          const mergedFiles = [...new Set([...recordedFiles, ...touchedFiles])].slice(0, 100)
+          const recordedUnfinished = Array.isArray(targetTask.unfinished) ? targetTask.unfinished : []
+
           const handoff = await client.post('/v1/tasks/handoff', {
             projectId: config.projectId, taskId: targetTask.id,
           }, { signal: payload.signal })
 
-          const existingSessions = Array.isArray(targetTask.sessionIds) ? targetTask.sessionIds : []
-          if (payload?.agent?.id && !existingSessions.includes(payload.agent.id)) {
+          /**
+           * Recover the candidates this session submitted, and bind them to the task.
+           *
+           * The submission receipt carries a proposal id, and the local record of it
+           * lives here; linking it is what lets a later handoff say which candidates
+           * this task produced, instead of the task showing no proposals. A candidate
+           * submitted while the core was unreachable has no server id yet and is
+           * reported from the local spool instead. Registration is tracked so a
+           * repeated pre-step cannot re-append the same id.
+           */
+          const newProposals = sessionState.submittedProposalIds.filter(id => !sessionState.registeredProposalIds.has(id))
+          const mergedProposals = [...new Set([...recordedProposals, ...newProposals])].slice(0, 100)
+          for (const id of newProposals) sessionState.registeredProposalIds.add(id)
+
+          /**
+           * Write back this session's findings, then decide whether to inject.
+           *
+           * The write-back has hysteresis on purpose: the fields are only sent when
+           * they actually changed since this session last wrote them. Sending them
+           * unconditionally re-stamped `updatedAt` on every tool step, which made
+           * the "content changed" check below fire on every step and re-inject the
+           * handoff — the F03 duplication pattern. With hysteresis the first step of
+           * a session may update the record; a step that learns nothing new does
+           * not.
+           */
+          const writeFiles = mergedFiles.length > 0 && JSON.stringify(mergedFiles) !== sessionLastWritten.files
+          const writeProposals = mergedProposals.length > 0 && JSON.stringify(mergedProposals) !== sessionLastWritten.proposals
+          const writeNotes = Boolean(progress) && progress !== sessionLastWritten.notes
+          if ((writeFiles || writeProposals || writeNotes) && payload?.agent?.id) {
             await client.post('/v1/tasks/record', {
               projectId: config.projectId,
-              task: toTaskRecord(targetTask, payload.agent.id),
+              task: {
+                ...toTaskRecord(targetTask, payload.agent.id),
+                ...(writeFiles ? { files: mergedFiles } : {}),
+                ...(writeProposals ? { relatedProposals: mergedProposals } : {}),
+                ...(writeNotes ? { notes: [targetTask.notes, progress].filter(Boolean).join('\n').slice(0, 4000) } : {}),
+              },
             }, { signal: payload.signal })
+            if (writeFiles) sessionLastWritten.files = JSON.stringify(mergedFiles)
+            if (writeProposals) sessionLastWritten.proposals = JSON.stringify(mergedProposals)
+            if (writeNotes) sessionLastWritten.notes = progress
           }
 
-          const unfinishedStr = Array.isArray(targetTask.unfinished) && targetTask.unfinished.length
-            ? targetTask.unfinished.join('；')
+          /**
+           * Inject the handoff once per (session, task).
+           *
+           * F03 reported one unchanged [Task Handoff] appearing six times in a
+           * session, and the verifier's counterexample showed a content-keyed gate
+           * re-injecting it on every active tool step — because "the last tool
+           * output" changes on every step. The receiving end needs the block at the
+           * moment it picks the task up, not each time the session does something;
+           * later state changes are persisted to the task record (with hysteresis,
+           * see the write-back above) instead of being announced again. A different
+           * task in the same session still gets its own block.
+           */
+          touchedFiles = []
+          const seenKey = `${targetTask.id}`
+          const alreadyAcked = sessionLastWritten.handoffKeys.has(seenKey)
+          sessionLastWritten.handoffKeys.add(seenKey)
+          const skipHandoff = alreadyAcked
+
+          const unfinishedStr = recordedUnfinished.length
+            ? recordedUnfinished.join('；')
             : '无'
-          const filesStr = Array.isArray(handoff?.files) && handoff.files.length
-            ? handoff.files.join('；')
+          const filesStr = mergedFiles.length
+            ? mergedFiles.join('；')
             : '未记录'
           const relatedWfs = Array.isArray(handoff?.workflows) && handoff.workflows.length
             ? handoff.workflows.map(w => w.id).join(', ')
             : '无'
 
-          handoffContext = [
+          handoffContext = skipHandoff ? '' : [
             '[Task Handoff]',
             `Task: ${targetTask.id} "${targetTask.title}"`,
             `Status: ${targetTask.status}`,
@@ -374,11 +653,13 @@ export async function apply(ctx) {
             `Related Workflows: ${relatedWfs}`,
             `Important: ${unfinishedStr}`,
             `Files: ${filesStr}`,
+            `Progress: ${progress || targetTask.summary || '未记录'}`,
+            `Candidates: ${mergedProposals.length ? mergedProposals.join('；') : (pendingLocalCount ? `${pendingLocalCount} 条候选仍在本机待发送队列（尚未送达核心）` : '未记录')}`,
             `Suggestion: ${handoff?.suggestion ?? ''}`,
             `Caveat: ${handoff?.caveat || '接收端需重新确认文件与环境状态；本交接不迁移运行中的进程、凭据或工具权限。上面的 files 只是需要核对的清单，不代表已经核对过。'}`,
           ].filter(Boolean).join('\n')
 
-          injectCurrentContext(payload.agent, handoffContext)
+          if (!skipHandoff) injectCurrentContext(payload.agent, handoffContext)
         }
       } catch (err) {
         logger.warn('handoff.failed', { message: err instanceof Error ? err.message : 'failed to fetch handoff' })
@@ -398,8 +679,22 @@ export async function apply(ctx) {
         ...(query ? { query } : {}),
       }, { signal: payload.signal }))
       warnedDegraded.delete(payload.agent)
+      /**
+       * The unreachable→reachable transition is exactly here: prepare just
+       * succeeded. If a previous step failed to reach the core, run one
+       * controlled replay so the session's queue is delivered without waiting for
+       * a new chat (F05), and clear the degraded flag so this fires once per
+       * outage rather than on every turn.
+       */
+      if (currentSessionId && sessionReplayState.degraded) {
+        sessionReplayState.degraded = false
+        await REPLAY_ONCE('core-recovered')
+      }
     } catch (error) {
       if (error?.name === 'AbortError') throw error
+      // Mark the session degraded so the next successful prepare is recognised as
+      // the recovery transition that triggers a replay.
+      if (currentSessionId) sessionReplayState.degraded = true
       const identity = { projectId: config.projectId, endpoint: config.endpoint }
       const snapshot = loadSnapshot(config.dataDir, identity)
       const { mode } = operatingMode({ coreReachable: false, snapshot })
@@ -542,12 +837,25 @@ export async function apply(ctx) {
   }), `agent-memory-backpack: ${tool.name}`)
   registerTool(jsonTool({
     name: 'amb_prepare',
-    description: 'Prepare project knowledge context for the current task.',
-    parameters: EMPTY_OBJECT_INPUT,
-    async execute(_args, exec) {
+    description: 'Prepare project knowledge context before starting or changing a task. Pass the task text as `query` to retrieve the workflows, skills and memories that match it; without a query only the standing rules are returned. Read-only: it grants no permission for extra actions.',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        // The tool previously advertised no inputs and ignored what it was given,
+        // so a model that passed `query` silently retrieved nothing (F08). The
+        // schema now matches what the core's /v1/prepare actually accepts.
+        query: { type: 'string', minLength: 1, maxLength: 4000 },
+        taskId: { type: 'string', minLength: 1, maxLength: 120 },
+      },
+    },
+    async execute(args, exec) {
       const result = assertPrepareResponse(await client.post('/v1/prepare', {
         adapter: 'dsh', projectId: config.projectId,
         ...(exec.agent ? { sessionId: exec.agent.id } : {}),
+        ...(typeof args?.query === 'string' && args.query.trim() ? { query: args.query.trim() } : {}),
+        // The session's own task is the default; an explicit taskId overrides it,
+        // which is how a caller asks about a task other than the current one.
+        ...(typeof args?.taskId === 'string' && args.taskId.trim() ? { taskId: args.taskId.trim() } : {}),
       }, { signal: exec.signal }))
       if (exec.agent) revisions.set(exec.agent, result.knowledgeRevision)
       return result
@@ -796,7 +1104,15 @@ export async function apply(ctx) {
       }
       try {
         const receipt = await client.post('/v1/proposals', proposalPayload, { signal: exec.signal })
-        return assertReceipt(receipt, 'pending')
+        // The core accepted the candidate itself, so the receipt can say so. The
+        // distinction matters on the read side: an agent must not report
+        // "已入服务器待审" from the offline branch, and the two used to be the same
+        // shape of `pending`.
+        const validatedReceipt = assertReceipt(receipt, 'pending')
+        if (typeof validatedReceipt.id === 'string' && validatedReceipt.id && exec.agent?.id) {
+          getSessionState(exec.agent.id).submittedProposalIds.push(validatedReceipt.id)
+        }
+        return { ...validatedReceipt, receiptSource: 'core', deliveryState: 'delivered', clientSubmissionId: proposalPayload.idempotencyKey, serverProposalId: validatedReceipt.id }
       } catch (error) {
         if (error?.name === 'AbortError') throw error
         // Deterministic 4xx rejections (400, 403, 409, 426) must not be queued
@@ -814,11 +1130,18 @@ export async function apply(ctx) {
             attempts: 1,
           }, { signal: exec.signal })
           logger.info('outbox.enqueued', { kind: 'candidate', idempotencyKey: proposalPayload.idempotencyKey })
-          return assertReceipt({
-            id: enqueued?.id || proposalPayload.idempotencyKey,
-            state: 'pending',
-            duplicate: Boolean(enqueued?.duplicate),
-          }, 'pending')
+          return {
+            ...assertReceipt({
+              id: enqueued?.id || proposalPayload.idempotencyKey,
+              state: 'pending',
+              duplicate: Boolean(enqueued?.duplicate),
+            }, 'pending'),
+            receiptSource: 'outbox',
+            deliveryState: 'queued',
+            clientSubmissionId: proposalPayload.idempotencyKey,
+            lastError: (error instanceof Error ? error.message : String(error)).slice(0, 400),
+            note: '核心当前不可达或暂态失败：候选已进入服务器持久队列，尚未正式受理；核心恢复后重放，重放按原幂等键不会重复写入。',
+          }
         } catch (enqueueErr) {
           if (enqueueErr?.name === 'AbortError') throw enqueueErr
           // When enqueue itself fails (e.g. core is completely down), do not break the host
@@ -827,6 +1150,7 @@ export async function apply(ctx) {
             idempotencyKey: proposalPayload.idempotencyKey,
             message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
           })
+          let spooled = false
           try {
             const outcome = spoolEnqueue(config.dataDir, {
               kind: 'candidate',
@@ -835,6 +1159,7 @@ export async function apply(ctx) {
               payload: proposalPayload,
               error: (enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)).slice(0, 2000),
             })
+            spooled = outcome.enqueued === true
             if (outcome.enqueued) {
               logger.info('spool.enqueued', { kind: 'candidate', idempotencyKey: proposalPayload.idempotencyKey })
             } else {
@@ -847,10 +1172,28 @@ export async function apply(ctx) {
               message: spoolErr instanceof Error ? spoolErr.message : String(spoolErr),
             })
           }
+          /**
+           * The honest receipt for "the server never saw this".
+           *
+           * F04: this branch used to return the same `pending` as an accepted
+           * candidate, so a caller (and the model reading it) could claim
+           * "已入服务器待审" when nothing had been received. `receiptSource: 'local'`
+           * and `deliveryState: 'queued-local'` state plainly that the candidate is
+           * recorded on this machine and will be delivered after reconnection -
+           * which is what the disk spool actually guarantees.
+           */
           return {
             id: proposalPayload.idempotencyKey,
             state: 'pending',
             duplicate: false,
+            receiptSource: 'local',
+            deliveryState: spooled ? 'queued-local' : 'local-unsynced',
+            clientSubmissionId: proposalPayload.idempotencyKey,
+            serverProposalId: null,
+            lastError: (enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)).slice(0, 400),
+            note: spooled
+              ? '核心不可达：候选已保存在本机待发送队列（未送达服务器）。恢复后会自动重放；重放前不要把它当作已受理。'
+              : '核心不可达且本地队列未能写入：候选仅在本次回执中保留，请立即重试提交，避免丢失。',
           }
         }
       }
@@ -874,6 +1217,22 @@ export async function apply(ctx) {
   }))
 
   ctx.on('session/event', (session, event) => {    if (!isWithinProject(config.projectRoot, session?.header?.cwd)) return
+    // Retain a bounded window of THIS session's events so a later handoff can name
+    // the files the session actually touched and the last thing it did (F03). The
+    // buffer is per session. Task segmentation is done by the pre-step cursor (each
+    // step consumes only the events since its last consumption), which works with
+    // the real host's untagged events; any taskId the event does carry is kept as a
+    // hint but is never required.
+    if (session?.id) {
+      const state = getSessionState(session.id)
+      const buffer = state.eventBuffer
+      buffer.push({ type: event.type, data: event.data })
+      if (buffer.length > SESSION_EVENT_WINDOW) {
+        buffer.shift()
+        // Keep the cursor aligned so it never points past the window start.
+        if (state.cursor > 0) state.cursor -= 1
+      }
+    }
     const kind = event.type === 'turn/end' && event.data.reason?.kind === 'aborted'
       ? 'turn_stopped'
       : event.type

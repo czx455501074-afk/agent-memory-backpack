@@ -163,6 +163,38 @@ function esc(value) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+/**
+ * Local time with an explicit offset.
+ *
+ * F09: the page showed local time while the Markdown export showed UTC with no
+ * label, so correlating the two timelines was guesswork. Every timestamp now
+ * carries its offset, and the export/KPI views borrow this same helper.
+ */
+function localTime(value) {
+  if (value === undefined || value === null || value === '') return '—';
+  var d = new Date(value);
+  if (isNaN(d.getTime())) return '—';
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  var offset = -d.getTimezoneOffset();
+  var sign = offset >= 0 ? '+' : '-';
+  var abs = Math.abs(offset);
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+    pad(d.getHours()) + ':' + pad(d.getMinutes()) +
+    ' UTC' + sign + pad(Math.floor(abs / 60)) + ':' + pad(abs % 60);
+}
+/** Trigger a browser download without leaving the page or needing a server round-trip. */
+function downloadText(filename, text, mime) {
+  try {
+    var blob = new Blob([text], { type: mime || 'text/plain;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = filename; a.style.display = 'none';
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    return true;
+  } catch (e) { return false; }
+}
 function notice(message, info) {
   return '<div class="notice' + (info ? ' notice--info' : '') + '">' + esc(message) + '</div>';
 }
@@ -226,7 +258,15 @@ function ensureIdentity() {
   });
 }
 
-function renderStatus() {
+/**
+ * Refresh the masthead's knowledge version and project from the core.
+ *
+ * F02: only the status view wrote t-revision, so a knowledge write that called
+ * renderManage() left the header showing the previous revision even though the
+ * table and the core had moved on. Every write path now calls this, so the
+ * header cannot disagree with the data beneath it.
+ */
+function refreshHeader() {
   return post('/v1/stats').then(function (s) {
     if (s.projectId) {
       currentProject = s.projectId;
@@ -236,7 +276,12 @@ function renderStatus() {
     if (s.role) currentRole = s.role;
     var revNode = document.getElementById('t-revision');
     if (revNode) revNode.textContent = String(s.knowledgeRevision);
+    return s;
+  });
+}
 
+function renderStatus() {
+  return refreshHeader().then(function (s) {
     return Promise.all([
       Promise.resolve(s),
       post('/v1/rescan/state').catch(function () { return {}; }),
@@ -255,7 +300,7 @@ function renderStatus() {
     ]) +
       '<div class="card"><div class="card__head"><span class="card__title">定期同步与生命周期</span>' +
       '<span class="card__meta">' + (r.due ? '已到期待扫描' : '正常周期内') + '</span></div>' +
-      '<p class="card__body">上次扫描：' + esc(r.lastRescanAt ? new Date(r.lastRescanAt).toLocaleString() : '从未') +
+      '<p class="card__body">上次扫描：' + esc(localTime(r.lastRescanAt)) +
       '　扫描周期：' + esc(r.intervalMs ? Math.round(r.intervalMs / 3600000) + ' 小时' : '—') + '</p></div>' +
       notice('候选不会自动生效；推翻或补充经验必须附理由与证据，旧版本始终保留在历史中。临时资料具备 90 天到期控制。', true);
   });
@@ -311,6 +356,7 @@ function renderManage(searchQuery, kindFilter) {
             '<td>' + esc(item.excerpt) + (item.why && item.why.matched ? '<div class="card__path">命中: ' + esc(item.why.matched.join(',')) + '</div>' : '') + '</td>' +
             '<td><div class="card__actions" style="margin:0;">' +
             '<button class="ghost btn-sm u-edit-btn" data-id="' + esc(item.id) + '">编辑修改</button>' +
+            '<button class="ghost btn-sm u-history-btn" data-id="' + esc(item.id) + '">历史</button>' +
             '<button class="ghost btn-sm btn-danger u-delete-btn" data-id="' + esc(item.id) + '" data-rev="' + esc(item.revision) + '">删除</button>' +
             '</div></td></tr>';
         }).join('') + '</tbody></table>';
@@ -427,18 +473,20 @@ function renderProposals(filterState) {
       '<select id="prop-filter" class="select">' +
       '<option value="pending"' + (state === 'pending' ? ' selected' : '') + '>待审阅 (pending)</option>' +
       '<option value="needs_evidence"' + (state === 'needs_evidence' ? ' selected' : '') + '>需补证 (needs_evidence)</option>' +
+      '<option value="approved"' + (state === 'approved' ? ' selected' : '') + '>已生效 (approved)</option>' +
       '<option value="archived"' + (state === 'archived' ? ' selected' : '') + '>已归档 (archived)</option>' +
       '<option value="rejected"' + (state === 'rejected' ? ' selected' : '') + '>已拒收 (rejected)</option>' +
       '</select>' +
-      (state === 'pending' ?
+      (state === 'pending' || state === 'needs_evidence' ?
         '<button class="ghost btn-sm" id="batch-select-all">全选</button>' +
+        '<button class="primary btn-sm" id="batch-approve">批量批准</button>' +
         '<button class="ghost btn-sm" id="batch-reject">批量拒收</button>' +
         '<button class="ghost btn-sm" id="batch-archive">批量归档</button>' +
         '<button class="ghost btn-sm btn-warn" id="batch-evidence">批量需补证</button>' : '') +
       '</div>';
 
     if (!items.length) {
-      panel.innerHTML = filterBar + empty('当前状态下没有候选。');
+      panel.innerHTML = filterBar + '<div id="prop-editor-box"></div>' + empty('当前状态下没有候选。');
       return;
     }
 
@@ -454,6 +502,7 @@ function renderProposals(filterState) {
       if (item.state === 'needs_evidence') statePill = '<span class="pill pill--warn">需补证</span>';
       else if (item.state === 'archived') statePill = '<span class="pill pill--idle">已归档</span>';
       else if (item.state === 'rejected') statePill = '<span class="pill pill--fail">已拒收</span>';
+      else if (item.state === 'approved') statePill = '<span class="pill pill--ok">已生效</span>';
 
       var actions = '';
       if (item.state === 'pending' || item.state === 'needs_evidence') {
@@ -463,7 +512,17 @@ function renderProposals(filterState) {
           '<button class="ghost btn-sm action-archive" data-id="' + esc(item.id) + '">移出归档</button>' +
           '<button class="ghost btn-sm btn-danger action-reject" data-id="' + esc(item.id) + '">拒收</button>' +
           '</div>';
+      } else if (item.state === 'archived' || item.state === 'rejected' || item.state === 'expired') {
+        actions = '<div class="card__actions">' +
+          '<button class="ghost btn-sm action-reopen" data-id="' + esc(item.id) + '">重新开启审阅</button>' +
+          '</div>';
       }
+
+      var decision = payload.decision || {};
+      var decisionLine = decision.state
+        ? '<div class="card__meta">审阅决定：' + esc(decision.action || decision.state) +
+          '　操作者 ' + esc(decision.actor || '未署名') + '　时间 ' + esc(localTime(decision.at)) + '</div>'
+        : '';
 
       return '<div class="card">' +
         '<div class="card__head">' +
@@ -474,17 +533,187 @@ function renderProposals(filterState) {
         '<div>' + tierPill + ' ' + statePill + '</div>' +
         '</div>' +
         '<div class="card__meta">ID: <code>' + esc(item.id) + '</code>　来源 ' + esc(item.principal) +
-        '　提交 ' + esc(new Date(item.createdAt).toLocaleString()) +
-        (item.expiresAt ? '　到期 ' + esc(new Date(item.expiresAt).toLocaleDateString()) : '') +
+        '　提交 ' + esc(localTime(item.createdAt)) +
+        (item.expiresAt ? '　到期 ' + esc(localTime(item.expiresAt)) : '') +
         (review.reason ? '　分级策略：' + esc(review.reason) : '') +
         '</div>' +
-        (payload.workflowId ? '<div class="card__path">关联流程 ' + esc(payload.workflowId) + '</div>' : '') +
+        (payload.workflowId ? '<div class="card__path">关联流程 ' + esc(payload.workflowId) +
+          (payload.baseRevision !== undefined && payload.baseRevision !== null ? ' @ 基线版本 v' + esc(payload.baseRevision) : '') + '</div>' : '') +
+        decisionLine +
         '<p class="card__body">' + esc(payload.discovery || '') + '</p>' +
         actions +
         '</div>';
     }).join('');
 
-    panel.innerHTML = filterBar + listHtml;
+    panel.innerHTML = filterBar + '<div id="prop-editor-box"></div>' + listHtml;
+  });
+}
+
+/**
+ * The approval form for one candidate.
+ *
+ * F01: approving used to call window.prompt() and send the candidate's own id as
+ * the entry id. The embedded browser has no prompt(), and the core refuses a
+ * workflow-bearing candidate whose entry id is not that workflow, so the path
+ * could not work for the case it most needed to. This form resolves the target
+ * server-side, shows the workflow and its current revision, and lets the reviewer
+ * edit the prose (or a whole workflow entry as JSON) before approving.
+ *
+ * The same page-form pattern replaces every other prompt() in this file, because
+ * the environment that exposes the weakness is the one the interface is opened
+ * in, not a property of one button.
+ */
+function showProposalEditor(proposalId) {
+  var box = document.getElementById('prop-editor-box');
+  if (box) box.innerHTML = '<p class="muted">正在读取候选与目标流程…</p>';
+  post('/v1/proposals/get', { id: proposalId }).then(function (detail) {
+    if (!box) return;
+    var target = detail.target || {};
+    var scopeKind = detail.payload && detail.payload.scope && detail.payload.scope.kind === 'global' ? 'global' : 'project';
+    var targetLine = target.available
+      ? '<div class="card__path">目标流程：<code>' + esc(target.workflowId) + '</code>' +
+        (target.baseRevision !== null && target.baseRevision !== undefined ? '（候选基于 v' + esc(target.baseRevision) + '，当前 v' + esc(target.currentRevision !== null && target.currentRevision !== undefined ? target.currentRevision : '—') + '）' : '') + '</div>'
+      : '<div class="card__path">' + esc(target.reason || '无目标流程') + '</div>';
+    var needsEvidence = detail.review && detail.review.constraint
+      ? '<div class="card__meta">分级约束：' + esc(detail.review.constraint) + '</div>' : '';
+
+    var body = '';
+    var formBody = '';
+    if (target.available && target.entry && target.entry.kind === 'workflow') {
+      // A workflow entry is structured; editing it as JSON is the honest surface
+      // rather than inventing fields for triggers/stages/checks.
+      body = JSON.stringify(target.entry, null, 2);
+      formBody =
+        '<div class="form-group"><label>完整流程条目（JSON，可编辑后批准；修订号由核心按 CAS 递增）</label>' +
+        '<textarea id="pe-entry-json" rows="14" style="font-family:ui-monospace,Consolas,monospace;">' + esc(body) + '</textarea></div>';
+    } else {
+      body = (detail.discovery || '');
+      formBody =
+        '<div class="form-group"><label>条目 ID' + (detail.payload && detail.payload.workflowId ? '（必须等于目标流程 ID）' : '（默认使用候选 UUID）') + '</label>' +
+        '<input type="text" id="pe-id" value="' + esc(detail.payload && detail.payload.workflowId ? detail.payload.workflowId : detail.id) + '"></div>' +
+        '<div class="form-group"><label>标题</label>' +
+        '<input type="text" id="pe-title" value="' + esc((detail.discovery || '').slice(0, 40) || '经验记录') + '"></div>' +
+        '<div class="form-group"><label>正文</label>' +
+        '<textarea id="pe-body" rows="6">' + esc(body) + '</textarea></div>';
+    }
+
+    box.innerHTML = '<div class="editor-card">' +
+      '<div class="card__head" style="margin-bottom:10px;">' +
+      '<span class="card__title">审阅候选：' + esc(detail.id) + '</span>' +
+      '<button class="ghost btn-sm" id="pe-cancel">取消</button>' +
+      '</div>' +
+      targetLine + needsEvidence +
+      '<p class="card__body">' + esc(detail.discovery || '') + '</p>' +
+      formBody +
+      '<div class="form-group"><label>作用范围</label>' +
+      '<select id="pe-scope" class="select">' +
+      '<option value="project"' + (scopeKind === 'project' ? ' selected' : '') + '>项目专属（默认，最窄）</option>' +
+      '<option value="global"' + (scopeKind === 'global' ? ' selected' : '') + '>全局共享（将应用到所有项目）</option>' +
+      '</select></div>' +
+      '<div class="card__actions">' +
+      '<button class="primary" id="pe-approve" data-id="' + esc(detail.id) + '" data-target="' + esc(target.available ? target.workflowId : '') + '">批准并生效</button>' +
+      '<span class="muted" style="font-size:12px;">批准后目标流程产生新 revision；DSH 下一轮检索即可读到。</span>' +
+      '</div>' +
+      '</div>';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }).catch(function (error) {
+    if (box) box.innerHTML = notice((error && (error.friendlyMessage || error.message)) || '读取候选失败');
+  });
+}
+
+/**
+ * Build the entry an approval will write.
+ *
+ * For a workflow-bearing candidate the entry must be the target workflow itself
+ * (the core enforces this), and its baseRevision is forced to the revision the
+ * candidate was based on so the core's re-comparison check stays meaningful. The
+ * reviewer may edit the prose; the structural fields are preserved around it.
+ */
+function buildApprovalEntry(detail) {
+  var target = detail.target || {};
+  var scopeKind = (document.getElementById('pe-scope') || {}).value === 'global' ? 'global' : 'project';
+  var scope = scopeKind === 'global' ? { kind: 'global' } : { kind: 'project', projectId: getProject() };
+  if (target.available && target.entry && target.entry.kind === 'workflow') {
+    var raw = (document.getElementById('pe-entry-json') || {}).value || '{}';
+    var entry;
+    try { entry = JSON.parse(raw); } catch (e) { throw new Error('流程 JSON 解析失败：' + e.message); }
+    entry.id = target.workflowId;
+    entry.kind = 'workflow';
+    entry.scope = scopeKind === 'global' ? { kind: 'global' } : (target.entry.scope && target.entry.scope.kind === 'project' ? target.entry.scope : scope);
+    entry.baseRevision = target.baseRevision !== null && target.baseRevision !== undefined ? target.baseRevision : (target.entry.baseRevision || 0);
+    return { entry: entry, allowGlobalScope: scopeKind === 'global' };
+  }
+  var id = ((document.getElementById('pe-id') || {}).value || '').trim();
+  var title = ((document.getElementById('pe-title') || {}).value || '').trim();
+  var body = ((document.getElementById('pe-body') || {}).value || '').trim();
+  if (!id) throw new Error('条目 ID 必填');
+  if (target.available && id !== target.workflowId) throw new Error('该候选关联流程 ' + target.workflowId + '，条目 ID 必须与之一致');
+  return {
+    entry: {
+      id: id,
+      kind: 'memory',
+      title: title || '经验记录',
+      body: body,
+      scope: scope,
+      baseRevision: 0,
+      labels: ['approved'],
+      provenance: 'user',
+      evidence: 'verifiable',
+      platforms: [],
+    },
+    allowGlobalScope: scopeKind === 'global',
+  };
+}
+
+/**
+ * The approval entry for a candidate the reviewer did not open a form for.
+ *
+ * Batch approval reads each candidate's resolved target and builds the entry the
+ * core will accept: the target workflow itself when there is one (its base
+ * revision preserved so the stale-proposal check still applies), otherwise a
+ * fresh memory carrying the candidate's own text. This is the same rule the
+ * single-candidate form follows, minus the editable fields.
+ */
+function programmaticApproval(detail) {
+  var target = detail.target || {};
+  var scope = { kind: 'project', projectId: getProject() };
+  if (target.available && target.entry && target.entry.kind === 'workflow') {
+    var entry = JSON.parse(JSON.stringify(target.entry));
+    entry.baseRevision = target.baseRevision !== null && target.baseRevision !== undefined ? target.baseRevision : (target.entry.baseRevision || 0);
+    return { entry: entry, allowGlobalScope: false };
+  }
+  return {
+    entry: {
+      id: detail.id,
+      kind: 'memory',
+      title: (detail.discovery || '经验记录').slice(0, 40),
+      body: detail.discovery || '',
+      scope: scope,
+      baseRevision: 0,
+      labels: ['approved'],
+      provenance: 'user',
+      evidence: 'verifiable',
+      platforms: [],
+    },
+    allowGlobalScope: false,
+  };
+}
+
+function approveProposalForm(proposalId) {
+  return post('/v1/proposals/get', { id: proposalId }).then(function (detail) {
+    var built;
+    try { built = buildApprovalEntry(detail); } catch (e) { throw e; }
+    return post('/v1/proposals/approve', {
+      id: proposalId,
+      entry: built.entry,
+      allowGlobalScope: built.allowGlobalScope,
+    }).then(function (res) {
+      return refreshHeader().then(function () {
+        alert('候选已批准生效！知识版本 v' + res.knowledgeRevision + (res.note ? '\\n' + res.note : ''));
+        var filter = document.getElementById('prop-filter');
+        renderProposals(filter ? filter.value : 'pending');
+      });
+    });
   });
 }
 
@@ -552,7 +781,7 @@ function renderMaterial() {
           '<div class="card__path">' + esc(mat.url) + '</div></td>' +
           '<td>' + esc(mat.summary || '—') + '<div class="card__meta">正文大小: ' + (mat.body ? mat.body.length + ' 字符' : '0') + '</div></td>' +
           '<td><span class="pill pill--skip">' + esc(mat.provenance) + '</span></td>' +
-          '<td><div>' + esc(new Date(mat.expiresAt).toLocaleDateString()) + '</div>' + statePill + ' ' + bodyStatus + '</td>' +
+          '<td><div>' + esc(localTime(mat.expiresAt)) + '</div>' + statePill + ' ' + bodyStatus + '</td>' +
           '<td><button class="ghost btn-sm material-renew" data-id="' + esc(mat.id) + '">延长90天</button></td></tr>';
       }).join('') + '</tbody></table>';
 
@@ -583,7 +812,7 @@ function renderHistory() {
             '<td><div><strong>原因:</strong> ' + esc(item.reason) + '</div>' +
             '<div class="muted">证据: ' + esc(item.evidence) + '</div></td>' +
             '<td><span class="pill pill--skip">' + esc(item.origin) + '</span></td>' +
-            '<td>' + esc(new Date(item.createdAt).toLocaleString()) + '</td></tr>';
+            '<td>' + esc(localTime(item.createdAt)) + '</td></tr>';
         }).join('') + '</tbody></table>';
     }
 
@@ -601,8 +830,19 @@ function renderDoctor() {
   ]).then(function (out) {
     var s = out[0], cap = out[1];
     var modePill = cap.mode === 'Managed' ? '<span class="pill pill--ok">Managed (受控管理)</span>'
-      : (cap.mode === 'ReadOnlySnapshot' ? '<span class="pill pill--warn">ReadOnlySnapshot (只读快照)</span>'
+      : (cap.mode === 'ReadOnlySnapshot' ? '<span class="pill pill--warn">ReadOnlySnapshot (只读快照保护)</span>'
       : '<span class="pill pill--fail">Ungoverned (未受约束)</span>');
+    /**
+     * F07: state what is actually enforced when the core is unreachable, and when
+     * the snapshot was taken, rather than telling the user all protection is gone.
+     * A ReadOnlySnapshot still enforces the recorded prohibitions; only judgments
+     * that were never recorded are unknown.
+     */
+    var modeExplain = cap.mode === 'ReadOnlySnapshot'
+      ? '核心当前不可达；本机最近一次规则快照仍在执行已记录的禁止（只读快照）。快照之后新增或修改的规则无从核对，属于未知边界。'
+      : (cap.mode === 'Managed'
+        ? '核心可达，规则按核心实时裁决。'
+        : '核心不可达且没有可用的规则快照：没有可执行的已记录禁止，但这不代表环境安全，只是无从核对。');
 
     var adaptersHtml = (cap.adapters || []).map(function (ad) {
       var caps = ad.capabilities || {};
@@ -640,6 +880,8 @@ function renderDoctor() {
       '<div class="card__head"><span class="card__title">当前核心运行模式</span>' +
       '<div>' + modePill + ' <button class="ghost btn-sm" id="doctor-reconnect">手动重新检测</button></div></div>' +
       '<p class="card__body">' + esc(cap.detail) + '</p>' +
+      '<p class="card__body muted" style="font-size:12px;">' + esc(modeExplain) +
+      (cap.snapshotAt ? '（快照时间：' + esc(localTime(cap.snapshotAt)) + '）' : '') + '</p>' +
       '</div>' +
       '<div class="section-title">平台适配器能力清单与边界</div>' +
       '<div class="grid-2">' + adaptersHtml + '</div>';
@@ -649,11 +891,19 @@ function renderDoctor() {
 function reportError(error) {
   setConnection(false);
   var msg = (error && (error.friendlyMessage || error.message)) ? (error.friendlyMessage || error.message) : '请求失败';
+  /**
+   * F07: the offline copy claimed every protection degrades to "未受规则约束",
+   * while the observed behaviour is that a recent rule snapshot still blocks
+   * prohibited tools (LocalGuarded/ReadOnlySnapshot). The wording now names the
+   * actual states and what is and is not known, instead of asserting the weaker
+   * claim as fact.
+   */
   panel.innerHTML = notice(msg) +
     '<div class="card" style="margin-top:14px;">' +
-    '<div class="card__head"><span class="card__title">核心状态：Ungoverned（未连接或无法读取）</span>' +
+    '<div class="card__head"><span class="card__title">核心状态：无法读取（离线）</span>' +
     '<button class="primary btn-sm" id="err-retry-btn">重新连接</button></div>' +
-    '<p class="card__body">核心服务可能未启动或当前凭据已被撤销。若核心离线，所有工具防护降级为未受规则约束。<br>启动核心命令：<code>node dist/src/cli.js serve</code></p>' +
+    '<p class="card__body">核心服务可能未启动或当前凭据已被撤销。若曾成功连接过，本机保留的最近规则快照仍会执行已记录的禁止（只读快照保护）；未记录过的判断则无从核对，属于未知边界，不等于“无风险”。<br>' +
+    '启动核心命令（在已安装插件的运行时目录执行，或直接重新打开本页触发重试）：<code>node runtime/cli.js serve --data-dir &lt;数据目录&gt;</code></p>' +
     '</div>';
 }
 
@@ -675,7 +925,9 @@ function show(name) {
   }
   panel.innerHTML = '<p class="muted">正在读取核心…</p>';
   var renderer = RENDERERS[name] || renderStatus;
-  ensureIdentity()
+  // Returned so a caller can chain after the view has rendered (e.g. the manage
+  // table's "历史" button jumps to the history tab and then fills the query).
+  return ensureIdentity()
     .then(function () { return renderer(); })
     .then(function () { setConnection(true); }, reportError);
 }
@@ -809,6 +1061,9 @@ panel.addEventListener('click', function (event) {
     post('/v1/knowledge/write', { entry: entry }).then(function (res) {
       alert('保存成功！' + (res.note || ''));
       currentEditingEntry = null;
+      // F02: the header's version must move with the data, not only when the
+      // status tab is opened.
+      refreshHeader().catch(function () {});
       renderManage();
     }).catch(reportError);
     return;
@@ -824,12 +1079,24 @@ panel.addEventListener('click', function (event) {
     return;
   }
 
+  if (target.classList.contains('u-history-btn')) {
+    // Reuse the history tab's single-query flow: jump there and prefill the id.
+    show('history').then(function () {
+      var input = document.getElementById('hist-id-input');
+      if (input) { input.value = target.dataset.id; }
+      var btn = document.getElementById('hist-query-btn');
+      if (btn) btn.click();
+    });
+    return;
+  }
+
   if (target.classList.contains('u-delete-btn')) {
     var delId = target.dataset.id;
     var delRev = Number(target.dataset.rev || 0);
     if (!confirm('确定退役删除条目 ' + delId + '？历史版本将完整保留可追溯。')) return;
     post('/v1/knowledge/delete', { id: delId, baseRevision: delRev }).then(function () {
       alert('条目已成功删除！');
+      refreshHeader().catch(function () {});
       renderManage();
     }).catch(reportError);
     return;
@@ -837,27 +1104,27 @@ panel.addEventListener('click', function (event) {
 
   // Proposals single actions
   if (target.classList.contains('action-approve')) {
-    var pId = target.dataset.id;
-    var pTitle = prompt('请输入批准后的条目标题：', '经验记录');
-    if (!pTitle) return;
-    post('/v1/proposals/approve', {
-      id: pId,
-      entry: {
-        id: pId,
-        kind: 'memory',
-        title: pTitle,
-        body: target.closest('.card').querySelector('.card__body').textContent,
-        scope: { kind: 'project', projectId: getProject() },
-        baseRevision: 0,
-        labels: ['approved'],
-        provenance: 'user',
-        evidence: 'verifiable',
-        platforms: []
-      }
-    }).then(function () {
-      alert('已成功批准条目入库！');
-      var filter = document.getElementById('prop-filter');
-      renderProposals(filter ? filter.value : 'pending');
+    showProposalEditor(target.dataset.id);
+    return;
+  }
+
+  if (target.id === 'pe-cancel') {
+    var peBox = document.getElementById('prop-editor-box');
+    if (peBox) peBox.innerHTML = '';
+    return;
+  }
+
+  if (target.id === 'pe-approve') {
+    approveProposalForm(target.dataset.id).catch(function (error) {
+      alert((error && (error.friendlyMessage || error.message)) || '批准失败');
+    });
+    return;
+  }
+
+  if (target.classList.contains('action-reopen')) {
+    post('/v1/proposals/reopen', { id: target.dataset.id }).then(function () {
+      alert('候选已回到待审队列，可重新审阅。');
+      renderProposals('pending');
     }).catch(reportError);
     return;
   }
@@ -872,9 +1139,24 @@ panel.addEventListener('click', function (event) {
   }
 
   if (target.classList.contains('action-evidence')) {
-    var reason = prompt('请输入需要补充的证据要求（必填）：', '缺少实际命令运行输出或独立测试验证产物');
-    if (!reason) return;
-    post('/v1/proposals/request-evidence', { id: target.dataset.id, reason: reason }).then(function () {
+    // Inline required-reason form instead of window.prompt() (F01's environment).
+    var evBox = document.getElementById('prop-editor-box');
+    if (evBox) {
+      evBox.innerHTML = '<div class="editor-card">' +
+        '<div class="card__head" style="margin-bottom:10px;"><span class="card__title">要求补证：' + esc(target.dataset.id) + '</span>' +
+        '<button class="ghost btn-sm" id="pe-cancel">取消</button></div>' +
+        '<div class="form-group"><label>需要补充的证据要求（必填）</label>' +
+        '<textarea id="req-evidence-reason" rows="3">缺少实际命令运行输出或独立测试验证产物</textarea></div>' +
+        '<button class="primary" id="req-evidence-submit" data-id="' + esc(target.dataset.id) + '">提交补证要求</button>' +
+        '</div>';
+    }
+    return;
+  }
+
+  if (target.id === 'req-evidence-submit') {
+    var evReason = ((document.getElementById('req-evidence-reason') || {}).value || '').trim();
+    if (!evReason) { alert('补证要求为必填项。'); return; }
+    post('/v1/proposals/request-evidence', { id: target.dataset.id, reason: evReason }).then(function () {
       var filter = document.getElementById('prop-filter');
       renderProposals(filter ? filter.value : 'pending');
     }).catch(reportError);
@@ -905,34 +1187,37 @@ panel.addEventListener('click', function (event) {
   if (target.id === 'batch-approve') {
     var approveIds = getCheckedIds();
     if (!approveIds.length) { alert('请先勾选要批量批准的候选！'); return; }
-    if (!confirm('确定批量批准选中的 ' + approveIds.length + ' 条候选？')) return;
-    var entriesMap = {};
-    approveIds.forEach(function (id) {
-      entriesMap[id] = {
-        id: id,
-        kind: 'memory',
-        title: '批量批准候选: ' + id,
-        body: '批量批准经验记录。',
-        scope: { kind: 'project', projectId: getProject() },
-        baseRevision: 0,
-        labels: ['approved'],
-        provenance: 'user',
-        evidence: 'verifiable',
-        platforms: []
-      };
-    });
-    post('/v1/proposals/batch', {
-      action: 'approve',
-      ids: approveIds,
-      entries: entriesMap
+    if (!confirm('确定批量批准选中的 ' + approveIds.length + ' 条候选？\\n关联流程的候选将按各自目标流程生成新 revision。')) return;
+    /**
+     * Resolve each candidate's own target before approving.
+     *
+     * A single hand-written memory entry per id (the previous behaviour) is
+     * exactly the shape F01 rejects: it turns a workflow candidate into an
+     * unrelated memory, and the core refuses it with target_mismatch. Each id is
+     * therefore read back and given the entry its target actually requires.
+     */
+    Promise.all(approveIds.map(function (id) {
+      return post('/v1/proposals/get', { id: id }).then(function (detail) {
+        return { id: id, built: programmaticApproval(detail) };
+      });
+    })).then(function (resolved) {
+      var entriesMap = {};
+      resolved.forEach(function (item) { entriesMap[item.id] = item.built.entry; });
+      return post('/v1/proposals/batch', {
+        action: 'approve',
+        ids: approveIds,
+        entries: entriesMap
+      });
     }).then(function (res) {
-      if (res.failed && res.failed.length) {
-        alert('部分候选批准未完成（' + res.failed.length + ' 条）：\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n'));
-      } else {
-        alert('选中的 ' + approveIds.length + ' 条候选已全部批准入库！');
-      }
-      renderProposals('pending');
+      return refreshHeader().then(function () {
+        if (res.failed && res.failed.length) {
+          alert('部分候选批准未完成（' + res.failed.length + ' 条）：\\n' +
+            res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n'));
+        } else {
+          alert('选中的 ' + approveIds.length + ' 条候选已全部批准入库！');
+        }
+        renderProposals('pending');
+      });
     }).catch(reportError);
     return;
   }
@@ -943,8 +1228,8 @@ panel.addEventListener('click', function (event) {
     if (!confirm('确定批量拒收选中的 ' + rejectIds.length + ' 条候选？')) return;
     post('/v1/proposals/batch', { action: 'reject', ids: rejectIds }).then(function (res) {
       if (res.failed && res.failed.length) {
-        alert('部分候选拒收未完成（' + res.failed.length + ' 条）：\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n'));
+        alert('部分候选拒收未完成（' + res.failed.length + ' 条）：\\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n'));
       }
       renderProposals('pending');
     }).catch(reportError);
@@ -956,8 +1241,8 @@ panel.addEventListener('click', function (event) {
     if (!arcIds.length) { alert('请先勾选要批量归档的候选！'); return; }
     post('/v1/proposals/batch', { action: 'archive', ids: arcIds }).then(function (res) {
       if (res.failed && res.failed.length) {
-        alert('部分候选归档未完成（' + res.failed.length + ' 条）：\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n'));
+        alert('部分候选归档未完成（' + res.failed.length + ' 条）：\\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n'));
       }
       renderProposals('pending');
     }).catch(reportError);
@@ -967,12 +1252,28 @@ panel.addEventListener('click', function (event) {
   if (target.id === 'batch-evidence') {
     var evIds = getCheckedIds();
     if (!evIds.length) { alert('请先勾选要要求补证的候选！'); return; }
-    var evReason = prompt('请输入统一补证要求：', '需补充验证输出，30天未补证将自动归档');
-    if (!evReason) return;
-    post('/v1/proposals/batch', { action: 'request-evidence', ids: evIds, reason: evReason }).then(function (res) {
+    var evBatchBox = document.getElementById('prop-editor-box');
+    if (evBatchBox) {
+      evBatchBox.innerHTML = '<div class="editor-card">' +
+        '<div class="card__head" style="margin-bottom:10px;"><span class="card__title">批量要求补证（' + evIds.length + ' 条）</span>' +
+        '<button class="ghost btn-sm" id="pe-cancel">取消</button></div>' +
+        '<div class="form-group"><label>统一补证要求（必填）</label>' +
+        '<textarea id="req-evidence-batch-reason" rows="3">需补充验证输出，30天未补证将自动归档</textarea></div>' +
+        '<button class="primary" id="req-evidence-batch-submit">提交补证要求</button>' +
+        '</div>';
+    }
+    return;
+  }
+
+  if (target.id === 'req-evidence-batch-submit') {
+    var batchReason = ((document.getElementById('req-evidence-batch-reason') || {}).value || '').trim();
+    var batchIds = getCheckedIds();
+    if (!batchReason) { alert('补证要求为必填项。'); return; }
+    if (!batchIds.length) { alert('请先勾选要要求补证的候选！'); return; }
+    post('/v1/proposals/batch', { action: 'request-evidence', ids: batchIds, reason: batchReason }).then(function (res) {
       if (res.failed && res.failed.length) {
-        alert('部分候选要求补证未完成（' + res.failed.length + ' 条）：\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n'));
+        alert('部分候选要求补证未完成（' + res.failed.length + ' 条）：\\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n'));
       }
       renderProposals('pending');
     }).catch(reportError);
@@ -1012,28 +1313,69 @@ panel.addEventListener('click', function (event) {
 
   if (target.classList.contains('task-export-md')) {
     post('/v1/tasks/export', { taskId: target.dataset.id, format: 'markdown' }).then(function (res) {
+      window.__ambExport = { filename: target.dataset.id + '.md', text: res.markdown || '', mime: 'text/markdown;charset=utf-8' };
       var box = document.getElementById('task-detail-box');
-      if (box) box.innerHTML = '<div class="card"><div class="card__head"><span class="card__title">Markdown 导出预览</span></div>' +
-        '<div class="pre-box">' + esc(res.markdown || '') + '</div></div>';
+      if (box) box.innerHTML = '<div class="card"><div class="card__head"><span class="card__title">Markdown 预览（可下载）</span>' +
+        '<button class="primary btn-sm" id="export-download">下载 .md 文件</button></div>' +
+        '<div class="pre-box">' + esc(res.markdown || '') + '</div>' +
+        '<p class="muted" style="font-size:12px;">预览中的时间为 UTC；页面其它处时间为本地时间（含偏移）。</p></div>';
     }).catch(reportError);
     return;
   }
 
   if (target.classList.contains('task-export-json')) {
     post('/v1/tasks/export', { taskId: target.dataset.id, format: 'json' }).then(function (res) {
+      var pretty = JSON.stringify(res.task || {}, null, 2);
+      window.__ambExport = { filename: target.dataset.id + '.json', text: pretty, mime: 'application/json;charset=utf-8' };
       var box = document.getElementById('task-detail-box');
-      if (box) box.innerHTML = '<div class="card"><div class="card__head"><span class="card__title">JSON 导出预览</span></div>' +
-        '<div class="pre-box">' + esc(JSON.stringify(res.task || {}, null, 2)) + '</div></div>';
+      if (box) box.innerHTML = '<div class="card"><div class="card__head"><span class="card__title">JSON 预览（可下载）</span>' +
+        '<button class="primary btn-sm" id="export-download">下载 .json 文件</button></div>' +
+        '<div class="pre-box">' + esc(pretty) + '</div></div>';
     }).catch(reportError);
+    return;
+  }
+
+  if (target.id === 'export-download') {
+    var payload = window.__ambExport;
+    if (!payload) { alert('没有可下载的内容。'); return; }
+    if (downloadText(payload.filename, payload.text, payload.mime)) {
+      alert('已开始下载：' + payload.filename);
+    } else {
+      alert('当前浏览器不允许直接下载，请手动复制预览内容。');
+    }
     return;
   }
 
   // Material actions
   if (target.classList.contains('material-renew')) {
     var matId = target.dataset.id;
-    var rReason = prompt('请输入续期 90 天的明确理由（必填）：', '项目周期延长，该外部资料仍有参考价值');
-    if (!rReason) return;
-    post('/v1/material/renew', { id: matId, reason: rReason }).then(function () {
+    var matBox = document.getElementById('mat-form-box');
+    if (!matBox) {
+      var head = panel.querySelector('.toolbar');
+      if (head) { matBox = document.createElement('div'); matBox.id = 'mat-form-box'; head.parentNode.insertBefore(matBox, head.nextSibling); }
+    }
+    if (matBox) {
+      matBox.innerHTML = '<div class="editor-card">' +
+        '<div class="card__head" style="margin-bottom:10px;"><span class="card__title">续期 90 天：' + esc(matId) + '</span>' +
+        '<button class="ghost btn-sm" id="mat-renew-cancel">取消</button></div>' +
+        '<div class="form-group"><label>续期的明确理由（必填）</label>' +
+        '<textarea id="mat-renew-reason" rows="3">项目周期延长，该外部资料仍有参考价值</textarea></div>' +
+        '<button class="primary" id="mat-renew-submit" data-id="' + esc(matId) + '">确认续期</button>' +
+        '</div>';
+    }
+    return;
+  }
+
+  if (target.id === 'mat-renew-cancel') {
+    var cancelBox = document.getElementById('mat-form-box');
+    if (cancelBox) cancelBox.innerHTML = '';
+    return;
+  }
+
+  if (target.id === 'mat-renew-submit') {
+    var renewReason = ((document.getElementById('mat-renew-reason') || {}).value || '').trim();
+    if (!renewReason) { alert('续期理由为必填项。'); return; }
+    post('/v1/material/renew', { id: target.dataset.id, reason: renewReason }).then(function () {
       alert('续期成功！到期时间已延长 90 天。');
       renderMaterial();
     }).catch(reportError);
@@ -1047,8 +1389,8 @@ panel.addEventListener('click', function (event) {
       var failedCount = res.failed ? res.failed.length : 0;
       var msg = '清理完成！已清理 ' + purgedCount + ' 条资料。';
       if (failedCount > 0) {
-        msg += '\n警告：' + failedCount + ' 条资料清理失败：\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\n');
+        msg += '\\n警告：' + failedCount + ' 条资料清理失败：\\n' +
+          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n');
       }
       alert(msg);
       renderMaterial();
@@ -1064,12 +1406,39 @@ panel.addEventListener('click', function (event) {
       var hBox = document.getElementById('hist-single-box');
       if (!hBox) return;
       var cur = res.current ? '当前版本: v' + esc(res.current.revision) + ' [' + esc(res.current.status) + ']' : '（已退役或不存在）';
+      /**
+       * Every revision is now readable in place (F09): each line carries a
+       * read-only fetch that renders the old prose below, so the viewer never has
+       * to treat the current-version guard as an obstacle to history.
+       */
       var revs = (res.revisions || []).map(function (r) {
-        return '• v' + esc(r.revision) + '　创建时间: ' + esc(new Date(r.createdAt).toLocaleString());
-      }).join('<br>');
+        var isCurrent = res.current && Number(res.current.revision) === Number(r.revision);
+        return '<div style="margin:4px 0;">• <code>v' + esc(r.revision) + '</code>　' + esc(localTime(r.createdAt)) +
+          (isCurrent ? '　<span class="pill pill--ok">当前版本</span>' : '') +
+          '　<button class="ghost btn-sm hist-rev-btn" data-id="' + esc(kId.trim()) + '" data-rev="' + esc(r.revision) + '">只读查看此版本</button>' +
+          '</div>';
+      }).join('');
       hBox.innerHTML = '<div class="card"><div class="card__head"><span class="card__title">条目完整版本历史: ' + esc(kId) + '</span>' +
         '<span class="pill pill--ok">' + cur + '</span></div>' +
-        '<div class="card__body">' + (revs || '无版本历史') + '</div></div>';
+        '<div class="card__body">' + (revs || '无版本历史') + '</div>' +
+        '<div id="hist-rev-body"></div></div>';
+    }).catch(reportError);
+    return;
+  }
+
+  if (target.classList.contains('hist-rev-btn')) {
+    var hrId = target.dataset.id;
+    var hrRev = Number(target.dataset.rev);
+    post('/v1/knowledge/history/read', { id: hrId, revision: hrRev }).then(function (res) {
+      var bodyBox = document.getElementById('hist-rev-body');
+      if (!bodyBox) return;
+      bodyBox.innerHTML = '<div class="pre-box">' +
+        '【历史只读视图】' + esc(res.id) + ' @ v' + esc(res.revision) +
+        (res.isCurrent ? '（当前版本）' : '（非当前版本，不可作为现行规范使用）') + '\\n' +
+        '标题: ' + esc(res.title) + '\\n' +
+        '范围: ' + esc(res.scope && res.scope.kind === 'global' ? '全局' : '项目 ' + (res.scope && res.scope.projectId ? res.scope.projectId : '')) + '\\n' +
+        '来源: ' + esc(res.provenance) + '　证据等级: ' + esc(res.evidence) + '　创建: ' + esc(localTime(res.createdAt)) + '\\n\\n' +
+        esc(res.body || '') + '</div>';
     }).catch(reportError);
     return;
   }
@@ -1096,7 +1465,11 @@ panel.addEventListener('keydown', function (event) {
 });
 
 if (!token) {
-  panel.innerHTML = notice('缺少凭据。请用 node dist/src/cli.js ui 生成带凭据的地址后打开。');
+  panel.innerHTML = notice('缺少凭据。请用已安装插件的运行时执行 node runtime/cli.js ui --data-dir <数据目录>（源码目录则为 node dist/src/cli.js ui）生成带凭据的地址后打开；地址中的凭据只在本页内存中使用。') +
+    '<div class="card"><div class="card__head"><span class="card__title">如何取得带凭据的地址</span></div>' +
+    '<p class="card__body">在插件运行时目录（例如 <code>.dsh/plugins/agent-memory-backpack-test-20261013/runtime</code>）执行：<br>' +
+    '<code>node cli.js ui --data-dir &lt;数据目录&gt;</code><br>' +
+    '命令会打印一个包含凭据 fragment 的本地地址，用浏览器打开即可。数据目录即核心启动时使用的目录（与 core.json 同处）。</p></div>';
   setConnection(false);
 } else {
   show('status');
