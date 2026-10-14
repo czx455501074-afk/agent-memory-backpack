@@ -1317,6 +1317,32 @@ export async function apply(ctx) {
       }
     })
   })
+
+  // Serve the UI access link to the DSH client-side tab if webServer service is available
+  ctx.inject(['webServer'], (host) => {
+    if (host.webServer && typeof host.webServer.register === 'function') {
+      host.webServer.register({
+        kind: 'prefix',
+        path: '/amb',
+        handler: (req, res) => {
+          if (req.url === '/amb/ui-url' || req.url === '/amb/config') {
+            res.writeHead(200, {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            })
+            res.end(JSON.stringify({
+              endpoint: config.endpoint,
+              url: `${config.endpoint}/ui#${encodeURIComponent(config.token)}`,
+              projectId: config.projectId,
+            }))
+            return
+          }
+          res.writeHead(404)
+          res.end()
+        },
+      })
+    }
+  })
 }
 
 export default { name, inject, apply }

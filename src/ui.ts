@@ -152,6 +152,11 @@ var panel = document.getElementById('panel');
 var tabs = document.getElementById('tabs');
 
 var token = decodeURIComponent((location.hash || '').replace(/^#/, ''));
+if (token) {
+  try { sessionStorage.setItem('amb_ui_token', token); } catch (e) {}
+} else {
+  try { token = sessionStorage.getItem('amb_ui_token') || ''; } catch (e) {}
+}
 if (location.hash) history.replaceState(null, '', location.pathname);
 
 var currentProject = '';
@@ -245,7 +250,31 @@ function metrics(pairs) {
   }).join('') + '</div>';
 }
 
+function renderTokenPrompt() {
+  panel.innerHTML = '<div class="card" style="max-width:520px;margin:40px auto;padding:24px;text-align:center;">' +
+    '<h2>连接到知识库</h2>' +
+    '<p class="muted" style="margin:12px 0 20px;">未检测到访问凭据，请输入凭据令牌（Token）：</p>' +
+    '<input id="token-input" type="password" placeholder="粘贴 token（可在 ~/.agent-memory-backpack/*.json 查看）" style="width:100%;box-sizing:border-box;padding:8px 12px;margin-bottom:16px;border-radius:4px;border:1px solid var(--border,#333);background:var(--bg-input,#181c24);color:#fff;" />' +
+    '<button id="token-save-btn" class="primary" style="padding:8px 24px;cursor:pointer;">连接并保存</button>' +
+    '<p class="muted" style="margin-top:16px;font-size:12px;">凭据仅保存在当前标签页内存中，不写入磁盘。</p>' +
+    '</div>';
+  var btn = document.getElementById('token-save-btn');
+  if (btn) {
+    btn.onclick = function() {
+      var val = (document.getElementById('token-input').value || '').trim();
+      if (!val) return;
+      token = val;
+      try { sessionStorage.setItem('amb_ui_token', token); } catch (e) {}
+      show('status');
+    };
+  }
+}
+
 function ensureIdentity() {
+  if (!token) {
+    renderTokenPrompt();
+    return Promise.reject(new Error('未配置凭据'));
+  }
   if (currentProject) return Promise.resolve(currentProject);
   return post('/v1/stats', {}).then(function (s) {
     if (s.projectId) {

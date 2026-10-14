@@ -13,12 +13,14 @@
     "./core-client": {
       "default": "./core-client.mjs"
     },
+    "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",
     "index.d.ts",
     "core-client.mjs",
+    "client.js",
     "log.mjs",
     "cordis.patch.yml",
     "dsh-plugin.naming.json",
@@ -40,13 +42,16 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    },
     "verifiedWith": {
       "note": "Versions this adapter was actually exercised against. A host outside this list is supported on a best-effort basis: capabilities are probed at load time and a missing one fails loudly rather than degrading silently.",
       "runtime": "0.2.0-rc.2",
       "cordis": "4.0.4"
-    },
-    "noClientHalf": {
-      "note": "This plugin deliberately declares no dsh.client browser half. Its UI is a separate Electron application that talks to the core directly, so there is nothing for the host's client module loader to mount. Declaring one would require a window.__ModuleLoader__ bundle and would fail at load time."
     }
   }
 }

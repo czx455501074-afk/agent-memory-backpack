@@ -32,12 +32,14 @@ if (typeof electron !== 'object' || typeof electron.app?.whenReady !== 'function
   process.exit(1);
 }
 
-const { app, BrowserWindow, dialog, ipcMain, shell } = electron;
+const { app, BrowserWindow, dialog, ipcMain, shell, Tray, Menu, nativeImage } = electron;
 
 let config;
 let client;
 let adapter = 'codex';
 let window;
+let tray;
+let isQuitting = false;
 /** Resolved at startup; the self-check needs both after the client is built. */
 let runtimeBase = '';
 let configPath = '';
@@ -311,7 +313,69 @@ function registerIpc() {
 // Disable hardware acceleration to prevent GPU process crashes on some systems
 app.disableHardwareAcceleration();
 
+function createTray() {
+  const iconPath = join(__dirname, 'assets', 'tray-icon.png');
+  const icon = existsSync(iconPath)
+    ? nativeImage.createFromPath(iconPath)
+    : nativeImage.createEmpty();
+
+  tray = new Tray(icon);
+  tray.setToolTip('Agent Memory Backpack 知识控制台 (核心 47631)');
+
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: '打开知识控制台',
+      click: () => {
+        if (!window) return;
+        window.show();
+        window.focus();
+      },
+    },
+    {
+      label: '在浏览器中打开 Web UI',
+      click: () => {
+        void shell.openExternal('http://127.0.0.1:47631/ui');
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '核心状态: 运行中 (127.0.0.1:47631)',
+      enabled: false,
+    },
+    {
+      label: `运行模式: 全局共享知识库 (${adapter})`,
+      enabled: false,
+    },
+    { type: 'separator' },
+    {
+      label: '彻底退出',
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+  tray.setContextMenu(contextMenu);
+
+  tray.on('click', () => {
+    if (!window) return;
+    if (window.isVisible() && !window.isMinimized()) {
+      window.hide();
+    } else {
+      window.show();
+      window.focus();
+    }
+  });
+
+  tray.on('double-click', () => {
+    if (!window) return;
+    window.show();
+    window.focus();
+  });
+}
+
 function createWindow() {
+  const startMinimized = process.argv.includes('--minimized') || process.argv.includes('--tray');
   window = new BrowserWindow({
     width: 1120,
     height: 780,
@@ -328,7 +392,15 @@ function createWindow() {
       sandbox: true,
     },
   });
-  window.once('ready-to-show', () => window.show());
+  window.once('ready-to-show', () => {
+    if (!startMinimized) window.show();
+  });
+  window.on('close', (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      window.hide();
+    }
+  });
   window.webContents.setWindowOpenHandler(({ url }) => { void shell.openExternal(url); return { action: 'deny' }; });
   window.loadFile(join(__dirname, 'renderer', 'index.html'));
 }
@@ -457,15 +529,25 @@ app.whenReady().then(async () => {
     client = new CoreClient(config, adapter);
     registerIpc();
     createWindow();
+    createTray();
 
     // Diagnostic modes: visit what was asked for, then quit. Dump and screenshot
     // are mutually exclusive; dump is checked first because it covers more panels.
-    if (await maybeDump()) { app.quit(); return; }
-    if (await maybeScreenshot()) app.quit();
+    if (await maybeDump()) { isQuitting = true; app.quit(); return; }
+    if (await maybeScreenshot()) { isQuitting = true; app.quit(); return; }
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : 'Console failed to start'}\n`);
+    isQuitting = true;
     app.quit();
   }
 });
 
-app.on('window-all-closed', () => app.quit());
+app.on('before-quit', () => {
+  isQuitting = true;
+});
+
+app.on('window-all-closed', () => {
+  if (isQuitting) {
+    app.quit();
+  }
+});

@@ -93,28 +93,23 @@ test('every manifest and version constant reports the same version', async () =>
   assert.equal(advertised, root.version, 'MCP 服务声明的版本必须与清单一致');
 });
 
-test('plugin declares no browser half, and its Node-side client module is safe', async () => {
-  // DSH's client module loader resolves `exports["./client"]` and requires the
-  // bundle to register itself via `window.__ModuleLoader__.load(...)`; a package
-  // that declares `dsh.client` without such a bundle fails to load. This plugin
-  // has no browser half by design — its UI is a separate Electron application —
-  // so the declaration must be absent rather than wrong.
+test('plugin declares safe browser client bundle and isolated core client', async () => {
   const manifest = JSON.parse(await readFile(join(dshDir, 'package.json'), 'utf8')) as {
     exports: Record<string, unknown>;
-    dsh: { client?: unknown; bundle?: { patch?: string }; noClientHalf?: { note?: string } };
+    dsh: { client?: { inject?: string[]; platform?: string }; bundle?: { patch?: string } };
   };
-  assert.equal(manifest.dsh.client, undefined,
-    '不得声明 dsh.client：没有浏览器 bundle 会让宿主加载失败');
-  assert.equal('./client' in manifest.exports, false, '不得导出 ./client 子路径');
-  assert.ok(manifest.dsh.noClientHalf?.note, '应说明为何没有浏览器半，避免日后被误加回来');
+  assert.ok(manifest.dsh.client, '应声明 dsh.client：提供 Agent 内置知识库页面');
+  assert.equal('./client' in manifest.exports, true, '必须导出 ./client 子路径');
+
+  // Verify the client bundle conforms to __ModuleLoader__ registration
+  const clientBundle = await readFile(join(dshDir, 'client.js'), 'utf8');
+  assert.ok(/__ModuleLoader__/.test(clientBundle), '客户端组件必须经由 __ModuleLoader__ 挂载');
+  assert.equal(/from\s+['"]node:/.test(clientBundle), false, '客户端组件不得引用 Node 原生模块');
 
   // The Node-side core client is a plain module export, not a browser half.
   assert.ok('./core-client' in manifest.exports, '核心客户端应通过独立子路径导出');
   assert.equal(manifest.dsh.bundle?.patch, './cordis.patch.yml');
 
-  // Every built-in UI client half avoids Node builtins and registers through
-  // __ModuleLoader__; this module is Node-only, which is exactly why it must not
-  // be reachable as a browser bundle.
   const coreClient = await readFile(join(dshDir, 'core-client.mjs'), 'utf8');
   assert.match(coreClient, /from\s+['"]node:/, '核心客户端依赖 Node 能力');
   assert.equal(/__ModuleLoader__/.test(coreClient), false, '核心客户端不是浏览器 bundle');

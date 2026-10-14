@@ -130,8 +130,8 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           'Content-Type': asset.type,
           'Cache-Control': 'no-store',
           'X-Content-Type-Options': 'nosniff',
-          // No inline script or style, and nothing may be loaded from elsewhere.
-          'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
+          // No inline script or style, and allow embedding from local loopback origins.
+          'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'self' http://127.0.0.1:* http://localhost:*",
         }).end(asset.body);
       }
       if (req.method !== 'POST') throw new DomainError('method', 'POST required', 405);

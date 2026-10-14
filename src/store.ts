@@ -991,7 +991,9 @@ export class Store {
         + `（正文 ${k.chars} 字符，需要时调用 amb_read_knowledge 读取）`
         + (k.kind === 'skill' && k.needsStructure ? '［尚未结构化：原文保存，未经核实为完整方法］' : '')
         + `\n摘要: ${k.excerpt}`),
-      '发现新经验请提交候选，明确所属完整流程和步骤。Stop不表示任务已完成。',
+      '【AMB 经验双向闭环协议】\n'
+      + '1. 【主动读经验】：任务涉及上述领域技能或遇到排错难点时，严禁凭空臆想！必须主动调用 `amb_read_knowledge` 展开技能正文与参考文档，或调用 `amb_search_universal` 深度检索库内避坑记录与历史日记。\n'
+      + '2. 【主动落盘沉淀】：排查出问题根因、验证了新方案或获得可复用操作结论时，必须主动调用 `amb_submit_experience` 将经验落盘入库（提供因果事实、完整步骤与避坑规则），坚决杜绝经验留在临时会话中流失。Stop不表示任务已完成。',
     ].join('\n\n');
     // A caller that already received this revision gets a pointer instead of the
     // whole normative text again. The gate hook runs before every tool call, so

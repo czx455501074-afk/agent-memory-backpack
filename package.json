@@ -23,6 +23,7 @@
     "doctor": "node dist/src/cli.js doctor",
     "logs": "node dist/src/cli.js logs",
     "console": "electron console/main.cjs",
+    "tray": "electron console/main.cjs --tray",
     "accept:desktop": "node scripts/desktop-accept.mjs",
     "pack:local": "node scripts/package.mjs",
     "deploy:plugin": "node scripts/deploy-plugin.mjs",
