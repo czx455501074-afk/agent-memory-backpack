@@ -684,7 +684,6 @@ export class Store {
         evidence: entry.content.evidence,
         excerpt: body.length > 300 ? `${body.slice(0, 300)}…` : body,
         chars: body.length,
-        rawContent: entry.content,
         why: reasonFor.get(entry.id) ?? null,
       };
     });

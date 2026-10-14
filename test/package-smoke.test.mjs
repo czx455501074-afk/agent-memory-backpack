@@ -8,7 +8,19 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { test } from 'node:test';
 
-const artifactDir = process.env.AMB_ARTIFACT_DIR ? resolve(process.env.AMB_ARTIFACT_DIR) : undefined;
+let resolvedArtifactDir = process.env.AMB_ARTIFACT_DIR ? resolve(process.env.AMB_ARTIFACT_DIR) : undefined;
+if (!resolvedArtifactDir) {
+  const latestPath = resolve('artifacts', 'latest.json');
+  if (existsSync(latestPath)) {
+    try {
+      const latest = JSON.parse(readFileSync(latestPath, 'utf8'));
+      if (latest && typeof latest.directory === 'string' && existsSync(latest.directory)) {
+        resolvedArtifactDir = resolve(latest.directory);
+      }
+    } catch {}
+  }
+}
+const artifactDir = resolvedArtifactDir;
 
 function run(command, args, options = {}) {
   return new Promise((resolveRun, reject) => {

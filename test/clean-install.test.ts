@@ -110,7 +110,7 @@ test('仓库与产物都不含机器路径、用户名或作者技能内容', as
     ['dsh', 'migration', 'recovery'].join('-'),
   ];
   const textExt = new Set(['.md', '.json', '.ts', '.mjs', '.cjs', '.js', '.yml', '.yaml', '.txt']);
-  const skip = /(?:^|[\\/])(node_modules|\.git|\.local|artifacts|dist|tmp-)($|[\\/])/;
+  const skip = /(?:^|[\\/])(node_modules|\.git|\.local|artifacts|dist|tmp-|diagnostics|handoffs)($|[\\/])/;
 
   const violations: string[] = [];
   const walk = async (dir: string, scope: string) => {

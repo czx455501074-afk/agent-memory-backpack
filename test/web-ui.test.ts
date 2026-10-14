@@ -151,6 +151,7 @@ test('界面支持综合检索、手动添加、修改与退役删除端点', as
     const searchBody = await searchRes.json() as { results: Array<{ id: string; title: string }> };
     assert.ok(searchBody.results.length >= 1);
     assert.equal(searchBody.results[0]!.id, 'ui-norm');
+    assert.equal('rawContent' in (searchBody.results[0] as Record<string, unknown>), false, '通用检索结果不得包含未截断的 rawContent，以防上下文膨胀');
 
     // 2. 手动添加新条目
     const writeRes = await post(origin, '/v1/knowledge/write', {

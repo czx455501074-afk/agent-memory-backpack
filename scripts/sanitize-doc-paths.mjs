@@ -51,6 +51,10 @@ const RULES = [
   // and requiring a following segment left the bare form untouched.
   [/[A-Za-z]:[\\/]{1,2}harness(?:[\\/]{1,2}[^\s"'`,;)\]}>]*)?/gi, '<HOST_PLUGIN_ROOT>'],
   [new RegExp(['DeepSeek', 'Harness', 'plugins'].join('-'), 'g'), '<HOST_PLUGINS_DIR>'],
+  [new RegExp(['cliproxyapi', 'ops'].join('-'), 'g'), '<AUTHOR_SKILL_1>'],
+  [new RegExp(['h3', 'camera', 'language'].join('-'), 'g'), '<AUTHOR_SKILL_2>'],
+  [new RegExp(['plugin', 'fleet', 'sweep'].join('-'), 'g'), '<AUTHOR_SKILL_3>'],
+  [new RegExp(['dsh', 'migration', 'recovery'].join('-'), 'g'), '<AUTHOR_SKILL_4>'],
 ];
 
 const TEXT = new Set(['.md', '.json', '.ts', '.mjs', '.cjs', '.js', '.yml', '.yaml', '.txt']);
