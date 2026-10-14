@@ -385,7 +385,10 @@ export async function apply(ctx) {
   }
   ctx.effect(() => () => client.dispose(), 'agent-memory-backpack: abort outstanding requests')
 
-  const inProject = (owner) => isWithinProject(config.projectRoot, owner?.session?.header?.cwd)
+  const inProject = (owner) => {
+    if (!config.projectRoot) return Boolean(owner)
+    return isWithinProject(config.projectRoot, owner?.session?.header?.cwd)
+  }
   // The waterfall is reorderable; enforce its verified result again at the final guard.
   ctx.effect(() => ctx.tools.guard((exec) => {
     if (!inProject(exec.agent)) return
@@ -394,7 +397,7 @@ export async function apply(ctx) {
       : (verdict?.reason || 'Agent Memory Backpack policy was not checked for this execution.')
   }), 'agent-memory-backpack: final execution guard')
   const warnOutOfScopeOnce = (owner) => {
-    if (owner && typeof owner === 'object' && !warnedOutOfScope.has(owner)) {
+    if (config.projectRoot && owner && typeof owner === 'object' && !warnedOutOfScope.has(owner)) {
       warnedOutOfScope.add(owner)
       logger.warn('adapter.out_of_scope', { projectRoot: config.projectRoot })
       console.warn('agent-memory-backpack: this DSH agent has no matching projectRoot; automatic context and gating are skipped.')
@@ -555,7 +558,8 @@ export async function apply(ctx) {
 
           // Only paths that resolve inside the project are kept, so the list is a
           // record rather than a guess.
-          const harvested = harvestSessionFiles(cohort, config.projectRoot)
+          const sessionCwd = payload?.agent?.session?.header?.cwd ?? config.projectRoot ?? process.cwd()
+          const harvested = harvestSessionFiles(cohort, sessionCwd)
           for (const file of harvested) sessionState.touchedFiles.add(file)
           touchedFiles = [...sessionState.touchedFiles]
           // Progress is this cohort's last tool output, carried forward on a step
@@ -817,7 +821,7 @@ export async function apply(ctx) {
     // failure recording all happen here, so no tool can be added without them.
     async execute(args, exec) {
       const started = Date.now()
-      if (!inProject(exec?.agent)) {
+      if (config.projectRoot && !inProject(exec?.agent)) {
         logger.warn('tool.out_of_scope', { tool: tool.name })
         throw new Error('Agent Memory Backpack knowledge tool requires the configured project context.')
       }
@@ -1029,7 +1033,8 @@ export async function apply(ctx) {
       // Scope: the plugin is installed but only acts inside the configured project.
       const cwd = exec?.agent?.session?.header?.cwd
       if (exec?.agent) {
-        if (inProject(exec.agent)) pass('project-scope', '当前会话位于配置的项目范围内')
+        if (!config.projectRoot) pass('project-scope', '全局共享知识库模式：支持所有项目会话访问')
+        else if (inProject(exec.agent)) pass('project-scope', '当前会话位于配置的项目范围内')
         else fail('project-scope', '当前会话不在配置的项目范围内，自动注入与门禁会被跳过',
           `确认会话工作目录位于 ${config.projectRoot} 之下`)
       } else {
@@ -1216,7 +1221,8 @@ export async function apply(ctx) {
     },
   }))
 
-  ctx.on('session/event', (session, event) => {    if (!isWithinProject(config.projectRoot, session?.header?.cwd)) return
+  ctx.on('session/event', (session, event) => {
+    if (config.projectRoot && !isWithinProject(config.projectRoot, session?.header?.cwd)) return
     // Retain a bounded window of THIS session's events so a later handoff can name
     // the files the session actually touched and the last thing it did (F03). The
     // buffer is per session. Task segmentation is done by the pre-step cursor (each

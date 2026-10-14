@@ -82,11 +82,11 @@ function readScopeConfig() {
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     return { diagnostic: "client configuration is unavailable or invalid" };
   }
-  if (typeof config.projectRoot !== "string" || !isAbsolute(config.projectRoot)) {
-    return { diagnostic: "client configuration has no absolute projectRoot" };
+  if (config.projectRoot !== undefined && config.projectRoot !== null && (typeof config.projectRoot !== "string" || !isAbsolute(config.projectRoot))) {
+    return { diagnostic: "client configuration has invalid projectRoot" };
   }
 
-  return { config, projectRoot: config.projectRoot, configPath: path };
+  return { config, projectRoot: (typeof config.projectRoot === "string" && config.projectRoot.trim()) ? config.projectRoot : null, configPath: path };
 }
 
 function loadConfig(config, configPath) {
@@ -688,14 +688,16 @@ async function main() {
     return;
   }
 
-  // Plugin hooks may be global. Scope all effects to the configured project;
-  // an absent/invalid cwd is unknown scope and therefore produces no action.
-  const scope = projectScope(input, scopeConfig.projectRoot);
-  if (scope === "outside") return;
-  if (scope === "unknown") {
-    logger.info("hook.skipped", { event, reason: "unverifiable project cwd" });
-    diagnoseSkip("Codex did not provide a verifiable project cwd");
-    return;
+  // Plugin hooks may be global. If projectRoot is configured, scope effects to that project;
+  // otherwise operate in shared library mode for all project sessions.
+  if (scopeConfig.projectRoot) {
+    const scope = projectScope(input, scopeConfig.projectRoot);
+    if (scope === "outside") return;
+    if (scope === "unknown") {
+      logger.info("hook.skipped", { event, reason: "unverifiable project cwd" });
+      diagnoseSkip("Codex did not provide a verifiable project cwd");
+      return;
+    }
   }
 
   let config;

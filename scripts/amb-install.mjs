@@ -212,13 +212,18 @@ try {
   console.error('  怎么修：先确保构建成功（npm run build），再用 --data-dir 显式指定目录。');
   process.exit(1);
 }
-const projectRoot = resolve(values['project-root'] ?? root);
+const projectRoot = values['project-root'] ? resolve(values['project-root']) : null;
 const corePath = join(dataDir, 'core.json');
 const clientPath = join(dataDir, 'client.json');
 say(`数据目录：${dataDir}`);
-say(`项目根（适配器绑定）：${projectRoot}`);
+if (projectRoot) {
+  say(`项目根（适配器绑定）：${projectRoot}`);
+} else {
+  say('项目根：未绑定（全局共享知识库模式，所有项目会话均可调用）');
+}
 
-const initArgs = ['init', '--data-dir', dataDir, '--project-root', projectRoot];
+const initArgs = ['init', '--data-dir', dataDir];
+if (projectRoot) initArgs.push('--project-root', projectRoot);
 if (values.project) initArgs.push('--project', values.project);
 if (values.port) initArgs.push('--port', values.port);
 if (values['admin-dir']) initArgs.push('--admin-dir', resolve(values['admin-dir']));

@@ -747,7 +747,8 @@ try {
     for (const c of config.clients) {
       const client = JSON.stringify({
         endpoint: `http://127.0.0.1:${config.port}`, token: c.token,
-        projectId: c.projectId, projectRoot: resolve(values['project-root'] ?? process.cwd()),
+        projectId: c.projectId,
+        ...(values['project-root'] ? { projectRoot: resolve(String(values['project-root'])) } : {}),
         role: c.role,
       }, null, 2);
       const target = c.role === 'admin' ? adminDir : dir;

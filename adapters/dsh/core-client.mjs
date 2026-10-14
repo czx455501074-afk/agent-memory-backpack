@@ -33,8 +33,8 @@ export async function loadClientConfig(env = process.env) {
 
   if (!isRecord(raw) || typeof raw.endpoint !== 'string' || typeof raw.token !== 'string'
     || !raw.token.trim() || typeof raw.projectId !== 'string' || !raw.projectId.trim()
-    || typeof raw.projectRoot !== 'string' || !isAbsolute(raw.projectRoot)) {
-    throw new Error('Agent Memory Backpack DSH client configuration must define endpoint, token, projectId, and an absolute projectRoot.')
+    || (raw.projectRoot !== undefined && raw.projectRoot !== null && (typeof raw.projectRoot !== 'string' || !isAbsolute(raw.projectRoot)))) {
+    throw new Error('Agent Memory Backpack DSH client configuration must define endpoint, token, and projectId.')
   }
 
   let endpoint
@@ -53,7 +53,7 @@ export async function loadClientConfig(env = process.env) {
     endpoint: endpoint.origin,
     token: raw.token,
     projectId: raw.projectId.trim(),
-    projectRoot: resolve(raw.projectRoot),
+    projectRoot: (typeof raw.projectRoot === 'string' && raw.projectRoot.trim()) ? resolve(raw.projectRoot) : null,
     // Where the shared database lives. The adapter needs it to start a core
     // when none is running; the credential's own directory is authoritative.
     dataDir: dirname(configPath),
