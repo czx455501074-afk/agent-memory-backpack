@@ -493,7 +493,7 @@ try {
       const lock = inspectLock(dir);
       const health = endpoint ? await probeHealth(endpoint) : { healthy: false, detail: '未找到 core.json，无法确定端口' };
       const startup = loginStartupStatus();
-      console.log(JSON.stringify({
+      const payload = {
         lock: lock.state === 'absent' ? { state: 'absent' }
           : lock.state === 'unreadable' ? { state: 'unreadable', detail: lock.detail }
           : { state: lock.state, pid: lock.info.pid, port: lock.info.port, startedAt: lock.info.startedAt },
@@ -504,7 +504,30 @@ try {
         coreEntry: coreEntry ? { path: coreEntry.path, source: coreEntry.source } : null,
         loginStartup: startup.registered, loginStartupDetail: startup.detail,
         note: '锁表示"谁在运行"；健康探测表示"核心是否在回应"。两者分开报告，因为一个陈旧的锁和一个挂掉的核心是不同的问题。',
-      }, null, 2));
+      };
+      // Prose by default. `status` is the first command a user runs, and the answer it owes
+      // is "is it running right now" - a wall of JSON is not that answer. The other commands
+      // already follow this convention (doctor, logs, restore); this one had missed it.
+      // `--json` still returns the raw shape for scripts.
+      if (values.json === true) {
+        console.log(JSON.stringify(payload, null, 2));
+      } else {
+        const l = payload.lock;
+        const lockLine = l.state === 'absent' ? '未在运行（没有锁文件）'
+          : l.state === 'unreadable' ? '锁不可读：' + l.detail
+          : `运行中（pid ${l.pid}，端口 ${l.port}，启动于 ${l.startedAt}）`;
+        console.log('Agent Memory Backpack 状态');
+        console.log('  运行      ' + lockLine);
+        console.log('  核心响应  ' + (payload.healthy ? '有响应' : '无响应')
+          + (payload.healthDetail ? ' — ' + payload.healthDetail : ''));
+        console.log('  开机启动  ' + (payload.loginStartup ? '已登记' : '未登记')
+          + (payload.loginStartupDetail ? ' — ' + payload.loginStartupDetail : ''));
+        if (payload.coreEntry) {
+          console.log('  核心入口  ' + payload.coreEntry.path + '（来源：' + payload.coreEntry.source + '）');
+        }
+        console.log('');
+        console.log('  ' + payload.note);
+      }
     } else if (action === 'start') {
       if (!coreEntry) throw new Error(coreEntryHint(coreEntryOptions));
       const lock = inspectLock(dir);
