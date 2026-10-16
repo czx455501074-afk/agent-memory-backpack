@@ -197,7 +197,15 @@ export async function probeHealth(endpoint: string, timeoutMs = 1500): Promise<{
     if (body.status !== 'ok') return { healthy: false, detail: `状态标识不符：${String(body.status)}` };
     return { healthy: true, detail: `协议 v${body.protocolVersion}，状态 ${String(body.status)}` };
   } catch (error) {
-    return { healthy: false, detail: error instanceof Error ? error.message : 'unreachable' };
+    // `fetch` reports a refused connection as the bare string "fetch failed", which
+    // says nothing a user can act on: not what happened, not what it means. Name what
+    // it means for them, and keep the original wording in parentheses so a diagnosis
+    // is still possible.
+    if (error instanceof Error && error.name === 'TimeoutError') {
+      return { healthy: false, detail: `在 ${timeoutMs}ms 内没有回应` };
+    }
+    const raw = error instanceof Error ? error.message : 'unreachable';
+    return { healthy: false, detail: `可能未启动（原始错误：${raw}）` };
   }
 }
 

@@ -567,7 +567,7 @@ try {
         const l = payload.lock;
         const lockLine = l.state === 'absent' ? '未在运行（没有锁文件）'
           : l.state === 'unreadable' ? '锁不可读：' + l.detail
-          : `运行中（pid ${l.pid}，端口 ${l.port}，启动于 ${l.startedAt}）`;
+          : `运行中（pid ${l.pid}，端口 ${l.port}，启动于 ${typeof l.startedAt === 'number' ? new Date(l.startedAt).toLocaleString() : '未知'}）`;
         console.log('Agent Memory Backpack 状态');
         console.log('  运行      ' + lockLine);
         console.log('  核心响应  ' + (payload.healthy ? '有响应' : '无响应')
