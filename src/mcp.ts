@@ -16,7 +16,7 @@ import { pluginVersion } from './doctor.js';
 const referenceId = z.string().min(1).max(140).regex(/^[^\s]+(@\d{1,9})?$/);
 
 export function createMcp(client: CoreClient, logger?: Logger) {
-  const server = new McpServer({ name: 'agent-memory-backpack', version: '0.1.0-p0.1' });
+  const server = new McpServer({ name: 'agent-memory-backpack', version: '1.0.0' });
   const call = async (path: string, args: Record<string, unknown>, validate?: (value: unknown) => Record<string, unknown>) => {
     try {
       const result = await client.post(path, args);

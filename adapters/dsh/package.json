@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-memory-backpack",
-  "version": "0.1.0-p0.1",
+  "version": "1.0.0",
   "description": "Agent Memory Backpack shared knowledge adapter for DeepSeek Harness with management UI",
   "type": "module",
   "main": "./index.mjs",

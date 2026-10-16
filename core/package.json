@@ -1,6 +1,6 @@
 {
   "name": "agent-memory-backpack",
-  "version": "0.1.0-p0.1",
+  "version": "1.0.0",
   "type": "module",
   "description": "Shared workflow knowledge core with DeepSeek Harness and Codex desktop adapters",
   "license": "MIT",

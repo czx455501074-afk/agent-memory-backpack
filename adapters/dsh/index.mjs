@@ -31,7 +31,7 @@ export const name = 'agent-memory-backpack'
 export const inject = ['tools']
 
 /** Kept in step with package.json; asserted by the adapter tests. */
-const PLUGIN_VERSION = '0.1.0-p0.1'
+const PLUGIN_VERSION = '1.0.0'
 
 const JSON_OBJECT = Object.freeze({ type: 'object', additionalProperties: true })
 const EMPTY_OBJECT_INPUT = Object.freeze({
