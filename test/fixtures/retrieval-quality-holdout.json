@@ -1,0 +1,33 @@
+{
+  "description": "Fixed multi-domain relevance fixtures. Hand-authored labels; no model judging and no real user data. The diagnostic split was initially held out, measured at precision 0.70, then inspected and used to revise rules; it is no longer blind evaluation. The broad database-query label was corrected to include the relevant SQLite document. This is a lexical regression corpus, not production efficacy evidence.",
+  "documents": [
+    {"id":"skill-memory","kind":"skill","title":"共享记忆维护","description":"AMB 经验检索、数据库写入、日记同步","body":"先读取历史经验，工作后保存新发现。","leaf":"执行任务需要主动调用参考资料，检查功能并完成验收。"},
+    {"id":"skill-drama","kind":"skill","title":"短剧剧本创作","description":"短剧剧情与角色对白、场次节奏","body":"编写人物对白和剧情冲突。执行任务需要主动调用参考资料，检查功能并完成验收。","leaf":"插件、数据库、经验落盘、skill、自动检索属于共享模板示例，不是本技能用途。"},
+    {"id":"skill-dsh","kind":"skill","title":"DSH 插件安装","description":"DSH 插件挂载、依赖和卸载诊断","body":"核对桌面 profile 版本和插件路径。"},
+    {"id":"memory-long","kind":"memory","title":"2026-09-27 工作日记","body":"短剧生成今天完成，继续确认任务，检查功能并完成验收。\n插件用于创作，DSH 作为宿主。\n数据库迁移背景。\n自动检索模板需要调整。\n经验落盘共享。\n角色对白和动作场面。","repeat":90},
+    {"id":"memory-tls","kind":"memory","title":"TLS 证书校验失败","body":"CERT_HAS_EXPIRED 表示证书过期。核对系统时间、证书链和有效期，更新服务证书后验证。"},
+    {"id":"skill-pdf","kind":"skill","title":"PDF 表单填写","description":"PDF 可填写表单字段、签名位置和页面尺寸","body":"先读取表单字段后填写并导出。"},
+    {"id":"memory-sqlite","kind":"memory","title":"SQLite 并发锁恢复","body":"SQLITE_BUSY 出现在事务持锁时间过长时。检查写事务和 busy_timeout；不要删除数据库。"},
+    {"id":"memory-colour","kind":"memory","title":"颜色空间转换","body":"sRGB 与 Display P3 色域转换时检查 ICC 配置。"},
+    {"id":"skill-git","kind":"skill","title":"Git 合并冲突","description":"Git 分支合并、冲突标记和版本核对","body":"先检查工作树，逐文件解决冲突并核对差异。"},
+    {"id":"skill-cooking","kind":"skill","title":"面包烘焙","description":"面团发酵温度、含水率和烘焙时间","body":"执行任务需要主动调用参考资料，检查功能并完成验收。"}
+  ],
+  "cases": [
+    {"split":"development","query":"AMB 经验检索 数据库写入 日记同步","relevant":["skill-memory"]},
+    {"split":"development","query":"继续","relevant":[]},
+    {"split":"development","query":"确认","relevant":[]},
+    {"split":"development","query":"主动调用参考资料 完成任务验收","relevant":[]},
+    {"split":"development","query":"短剧剧本角色对白","relevant":["skill-drama"]},
+    {"split":"development","query":"DSH 插件挂载依赖","relevant":["skill-dsh"]},
+    {"split":"diagnostic","query":"PDF 表单字段填写","relevant":["skill-pdf"]},
+    {"split":"diagnostic","query":"SQLITE_BUSY 事务持锁","relevant":["memory-sqlite"]},
+    {"split":"diagnostic","query":"CERT_HAS_EXPIRED","relevant":["memory-tls"]},
+    {"split":"diagnostic","query":"Git 分支合并冲突","relevant":["skill-git"]},
+    {"split":"diagnostic","query":"面团发酵温度","relevant":["skill-cooking"]},
+    {"split":"diagnostic","query":"颜色空间 ICC","relevant":["memory-colour"]},
+    {"split":"diagnostic","query":"检查功能验收","relevant":[]},
+    {"split":"diagnostic","query":"量子纠缠实验","relevant":[]},
+    {"split":"diagnostic","query":"网络路由 BGP 邻居断开","relevant":[]},
+    {"split":"diagnostic","query":"数据库","relevant":["skill-memory","memory-sqlite"]}
+  ]
+}

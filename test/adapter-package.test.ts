@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { Script } from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -103,6 +104,7 @@ test('plugin declares safe browser client bundle and isolated core client', asyn
 
   // Verify the client bundle conforms to __ModuleLoader__ registration
   const clientBundle = await readFile(join(dshDir, 'client.js'), 'utf8');
+  assert.doesNotThrow(() => new Script(clientBundle), '客户端脚本必须能作为 classic script 解析');
   assert.ok(/__ModuleLoader__/.test(clientBundle), '客户端组件必须经由 __ModuleLoader__ 挂载');
   assert.equal(/from\s+['"]node:/.test(clientBundle), false, '客户端组件不得引用 Node 原生模块');
 

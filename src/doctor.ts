@@ -238,14 +238,16 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
         ? `已安装${adapter.version ? ` ${adapter.version}` : ''}`
         : '未在该机器的已知位置找到已安装的包';
       // Missing adapter installation or any capability shortfall must be reported as warn/fail, never pass.
-      const status: CheckStatus = (!adapter.installed || unmet.length > 0) ? 'warn' : 'pass';
+      // Installation and designed capabilities do not attest a live desktop
+      // session. No runtime receipt is consulted here, so never report verified.
+      const status: CheckStatus = 'warn';
       checks.push({
         id: `capability-${adapter.id}`,
         title: `${adapter.id} 能力清单`,
         status,
         detail: `${installedNote}；` + (unmet.length
           ? `不支持：${unmet.join('、')}`
-          : '设计能力齐备'),
+          : '设计能力齐备；当前宿主会话是否加载并使用尚未验证'),
         ...(adapter.notes.length ? { hint: adapter.notes[0] } : {}),
       });
     }

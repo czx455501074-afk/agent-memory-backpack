@@ -10,7 +10,10 @@ import { resolveClientConfig } from "./resolve-config.mjs";
 import { ensureCoreRunning } from "./ensure-core.mjs";
 import { checkShellWriteBypass, decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from "./gate-cache.mjs";
 import { checkNodeVersion } from "./node-version.mjs";
-import { spoolEnqueue, spoolReplay } from "./spool.mjs";
+import { loadSpool, spoolEnqueue, spoolReplay } from "./spool.mjs";
+import { captureFailure, failureCandidate } from "./failure-capture.mjs";
+import { captureMaterial, replayMaterials } from "./material-capture.mjs";
+import { isContinuationQuery, recallKnowledge } from "./recall.mjs";
 
 const MAX_STDIN_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 4500;
@@ -90,6 +93,12 @@ function readScopeConfig() {
 }
 
 function loadConfig(config, configPath) {
+  if (config.autoCaptureMaterial !== undefined && typeof config.autoCaptureMaterial !== 'boolean') {
+    throw new Error('autoCaptureMaterial must be a boolean when configured');
+  }
+  if (config.autoCaptureFailures !== undefined && typeof config.autoCaptureFailures !== 'boolean') {
+    throw new Error('autoCaptureFailures must be a boolean when configured');
+  }
   if (typeof config.projectId !== "string" || !config.projectId.trim()) {
     throw new Error("Agent Memory Backpack client configuration requires projectId");
   }
@@ -125,6 +134,8 @@ function loadConfig(config, configPath) {
     token: config.token,
     projectId: config.projectId.trim(),
     projectRoot: config.projectRoot,
+    autoCaptureFailures: config.autoCaptureFailures !== false,
+    autoCaptureMaterial: config.autoCaptureMaterial !== false,
     // The credential's directory is where the shared database lives, which the
     // core needs when it has to be started.
     dataDir: dirname(configPath),
@@ -208,11 +219,122 @@ function safeReason(value, token) {
   return reason || "The project policy denied this tool call.";
 }
 
-async function post(config, route, payload) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+/**
+ * Every failure this hook raises, carrying what a caller must branch on.
+ *
+ * Mirrors the DSH adapter's `CoreClientError` (adapters/dsh/core-client.mjs) so a
+ * failure looks the same in either host: `kind` names the class, `code` is the
+ * controlled machine-readable reason, and `status` is the HTTP status when there
+ * was one. The message is a fixed template plus that status and code only - the
+ * core's free-form `message` is never copied in, because a hook error reaches the
+ * adapter log and the host's stderr and server text may echo a payload or a path.
+ */
+class CoreClientError extends Error {
+  constructor(message, kind, code, status, cause) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "CoreClientError";
+    this.kind = kind;
+    this.code = code;
+    if (status !== undefined) this.status = status;
+  }
+}
+
+/** Kinds a later attempt may still survive, and which may therefore be queued. */
+const RETRYABLE_KINDS = new Set(["timeout", "network", "transport", "http5xx", "capacity"]);
+
+/**
+ * Whether a failed delivery is worth queueing or replaying.
+ *
+ * `http4xx` (including 426), `protocol` and `cancelled` are decisions rather than
+ * faults: queueing one guarantees a replay that fails the same way. Errors with no
+ * `kind` fall back to their status, then to their message.
+ */
+function isRetryableClientError(error) {
+  if (!error) return false;
+  if (typeof error.kind === "string") return RETRYABLE_KINDS.has(error.kind);
+  if (error.name === "AbortError") return false;
+  const status = error.status ?? error.statusCode;
+  if (typeof status === "number") return status === 507 || status >= 500;
+  const message = error instanceof Error ? error.message : String(error);
+  return !(/\bHTTP\s*4\d\d\b/.test(message) || message.includes("protocol version mismatch"));
+}
+
+/** Whether the caller (or hook teardown) withdrew the request. */
+function isCancelledClientError(error) {
+  if (!error) return false;
+  return error.kind === "cancelled" || error.name === "AbortError";
+}
+
+/**
+ * Failure metadata kept with a spooled item: kind, code, status, reason, at.
+ *
+ * `reason` is this hook's own template message, never a server-supplied string, so
+ * the spool file cannot become a place where a payload or a path is written.
+ */
+/** Map an HTTP status to the kind that describes it (507 is capacity). */
+function statusKind(status) {
+  return status === 507 ? "capacity" : status >= 500 ? "http5xx" : "http4xx";
+}
+
+function clientFailureMeta(error) {
+  const status = Number(error?.status ?? error?.statusCode);
+  const reason = String(error instanceof Error ? error.message : error ?? "").slice(0, 2000);
+  const fromMessage = /\bHTTP\s*(\d{3})\b/.exec(reason);
+  const meta = {
+    // An error from an older build carries neither kind nor status, so its
+    // `HTTP <n>` message is read instead: a legacy 4xx must still be recognised as
+    // permanent by the replay logic rather than retried until the attempt cap.
+    kind: typeof error?.kind === "string" && error.kind
+      ? error.kind
+      : Number.isFinite(status) && status > 0 ? statusKind(status)
+        : fromMessage ? statusKind(Number(fromMessage[1])) : "unknown",
+    at: Date.now(),
+  };
+  if (typeof error?.code === "string" && error.code) meta.code = error.code;
+  if (Number.isFinite(status) && status > 0) meta.status = status;
+  else if (fromMessage) meta.status = Number(fromMessage[1]);
+  meta.reason = reason;
+  return meta;
+}
+
+/** Cap on the core's message that is carried into an error. */
+const MAX_SERVER_MESSAGE_CHARS = 500;
+
+/**
+ * The core's own message, made safe to carry.
+ *
+ * The server's text is the actionable half of a refusal: it names the missing
+ * dependency, the conflicting key or the field that was wrong. It is therefore
+ * kept, not dropped. What is removed is anything credential-shaped - this hook's
+ * own token, a `Bearer` header, a `password=`/`api_key=` pair, a long base64 or hex
+ * blob, and a body that is nothing but a JSON dump - because a hook error reaches
+ * the adapter log and the host's stderr. The result is capped so a chatty core
+ * cannot push the error into unbounded output.
+ */
+function sanitizeServerMessage(value, token) {
+  if (typeof value !== "string") return "";
+  let text = value;
+  if (typeof token === "string" && token) text = text.split(token).join("[redacted]");
+  text = text
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|\S+)/gi, "$1$2[redacted]")
+    .replace(/[A-Za-z0-9+/=_-]{40,}/g, "[redacted]")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim();
+  if (!text) return "";
+  // A body that is nothing but a JSON dump is a payload echo, not guidance.
+  if (/^[[{]/.test(text) && text.length > 200) return "[redacted-json]";
+  return text.slice(0, MAX_SERVER_MESSAGE_CHARS);
+}
+
+async function post(config, route, payload, options = {}) {
+  const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const requestSignal = options.signal
+    ? AbortSignal.any([timeoutSignal, options.signal])
+    : timeoutSignal;
+  let response;
   try {
-    const response = await fetch(new URL(route, config.endpoint), {
+    response = await fetch(new URL(route, config.endpoint), {
       method: "POST",
       headers: {
         authorization: `Bearer ${config.token}`,
@@ -222,58 +344,79 @@ async function post(config, route, payload) {
       },
       body: JSON.stringify(payload),
       redirect: "error",
-      signal: controller.signal,
+      signal: requestSignal,
     });
-    if (response.status === 426) {
-      const err = new Error("Agent Memory Backpack protocol version mismatch (HTTP 426)");
-      err.status = 426;
-      throw err;
-    }
-    if (!response.ok) {
-      // Carry the core's structured refusal so the caller can act on it: the code
-      // (e.g. `dependency_unavailable`, `target_mismatch`, `idempotency_conflict`)
-      // and message are what distinguish a conflict to fix from a fault to retry.
-      // F06 was raised because this used to be flattened to a bare status code.
-      let payload;
-      try { payload = await response.json(); } catch { payload = undefined; }
-      const record = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
-      const code = typeof record.code === "string" && record.code ? record.code : undefined;
-      const detail = typeof record.message === "string" && record.message ? ` [${code ?? "error"}] ${record.message}` : "";
-      const err = new Error(`Agent Memory Backpack service returned HTTP ${response.status}${detail}`);
-      err.status = response.status;
-      if (code) err.code = code;
-      err.coreStatus = response.status;
-      err.coreBody = record;
-      err.retryable = response.status >= 500;
-      throw err;
-    }
-
-    let value;
-    try {
-      value = await response.json();
-    } catch {
-      throw new Error("Agent Memory Backpack service returned invalid JSON");
-    }
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("Agent Memory Backpack service returned an invalid response");
-    }
-    return value;
-  } finally {
-    clearTimeout(timeout);
+  } catch (cause) {
+    // Only a deadline this hook raised itself is a timeout; when the caller's own
+    // signal is the reason the call was withdrawn, and a TypeError means the core
+    // was never reached at all.
+    const name = cause instanceof Error ? cause.name : "";
+    const kind = name === "TimeoutError" && timeoutSignal.aborted && timeoutSignal.reason === cause
+      ? "timeout"
+      : options.signal?.aborted ? "cancelled"
+        : cause instanceof TypeError ? "network" : "transport";
+    const code = kind === "timeout" ? "request_timeout"
+      : kind === "cancelled" ? "request_cancelled"
+        : kind === "network" ? "network_error" : "transport_error";
+    throw new CoreClientError(
+      "Agent Memory Backpack core unavailable. Governance could not be checked.",
+      kind, code, undefined, cause,
+    );
   }
+
+  let result;
+  try {
+    result = await response.json();
+  } catch (cause) {
+    // A body that will not parse is a protocol fault, not a transport one: the core
+    // answered, but not in the shape this hook was built against.
+    throw new CoreClientError(
+      `Agent Memory Backpack core returned an invalid response (HTTP ${response.status}, invalid_response).`,
+      "protocol", "invalid_response", response.status, cause,
+    );
+  }
+  if (!response.ok) {
+    const status = response.status;
+    // Only the core's controlled `code` is kept: it matches a lowercase-word shape,
+    // so a buggy or hostile body cannot inject arbitrary text into a log line or
+    // the host's stderr. `code` plus `status` is what a caller needs to decide
+    // between fixing and retrying, and it is what the spool stores.
+    const structuredCode = typeof result?.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(result.code)
+      ? result.code : undefined;
+    const code = structuredCode ?? (status === 507 ? "capacity_exhausted" : status >= 500 ? "http5xx" : "http4xx");
+    const kind = statusKind(status);
+    // The core's message is the actionable half of a refusal: it names the missing
+    // dependency, the conflicting key or the field that was wrong. It is kept -
+    // sanitized and capped - while `code` and `status` stay the fields a caller
+    // branches on.
+    const detail = sanitizeServerMessage(result?.message, config.token);
+    const err = new CoreClientError(
+      `Agent Memory Backpack request rejected (HTTP ${status}, ${code}).${detail ? ` Detail: ${detail}` : ""}`,
+      kind, code, status,
+    );
+    err.coreStatus = status;
+    err.retryable = isRetryableClientError(err);
+    throw err;
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new CoreClientError(
+      `Agent Memory Backpack core returned an invalid response (HTTP ${response.status}, invalid_response).`,
+      "protocol", "invalid_response", response.status,
+    );
+  }
+  return result;
 }
 
+/**
+ * Whether this failure is a decision the caller must act on, not a fault to queue.
+ *
+ * Defined as the complement of `isRetryableClientError` so the two can never drift
+ * apart: `http4xx` (including 426), `protocol` and `cancelled` are explicit
+ * rejections, and queueing one would only replay a guaranteed failure.
+ */
 function isExplicitClientRejection(error) {
   if (!error) return false;
-  const status = error.status ?? error.statusCode;
-  if (typeof status === 'number' && status >= 400 && status < 500) {
-    return true;
-  }
-  const message = error instanceof Error ? error.message : String(error);
-  if (/\b(?:HTTP\s*4\d\d|426)\b/i.test(message) || message.includes('protocol version mismatch')) {
-    return true;
-  }
-  return false;
+  return !isRetryableClientError(error);
 }
 
 function sessionStatePath(dataDir, sessionId) {
@@ -345,13 +488,27 @@ function deny(reason) {
 
 async function prepare(input, config) {
   const sessionInfo = sessionFields(input, config);
+  let query = typeof input.prompt === 'string' ? input.prompt.trim().slice(0, 4000) : '';
+  if (isContinuationQuery(query)) {
+    query = loadSessionState(config.dataDir, sessionInfo.sessionId)?.lastMeaningfulQuery || '';
+    if (!query && sessionInfo.sessionId) {
+      try {
+        const activity = await post(config, '/v1/tasks/activity', { projectId: config.projectId, ...sessionInfo });
+        const task = activity?.task;
+        if (task && !isContinuationQuery(task.title)) query = [task.title, task.summary].filter(Boolean).join(' ').slice(0, 4000);
+      } catch { /* no linked task means norms only */ }
+    }
+  } else if (query && sessionInfo.sessionId) {
+    saveSessionState(config.dataDir, sessionInfo.sessionId, { lastMeaningfulQuery: query });
+  }
+  if (input.hook_event_name === 'UserPromptSubmit' && sessionInfo.sessionId) {
+    saveSessionState(config.dataDir, sessionInfo.sessionId, { turnKey: input.turn_id || randomUUID() });
+  }
   const payload = {
     adapter: "codex",
     projectId: config.projectId,
     ...sessionInfo,
-    ...(typeof input.prompt === "string" && input.prompt.trim()
-      ? { query: input.prompt.slice(0, 4000) }
-      : {}),
+    ...(query ? { query } : {}),
   };
   const result = await post(config, "/v1/prepare", payload);
   // Rules match the DSH adapter exactly, so the two ends cannot disagree about
@@ -437,7 +594,12 @@ function toTaskRecord(rawTask, extraSessionId) {
     }
   }
 
-  const finalContext = [handoffBlock, redact(result.context, config.token)].filter(Boolean).join("\n\n");
+  logger.info("context.injected", { adapter: "codex", sessionId: sessionInfo.sessionId,
+    knowledgeRevision: result.knowledgeRevision, chars: result.context.length,
+    knowledgeIds: (result.knowledge ?? []).map(item => item.id) });
+  const recalled = await recallKnowledge({ client: { post: (route, payload, options) => post(config, route, payload, options) },
+    config, logger, adapter: 'codex', sessionId: sessionInfo.sessionId, query, trigger: 'task' });
+  const finalContext = [handoffBlock, redact(result.context, config.token), redact(recalled.context, config.token)].filter(Boolean).join("\n\n");
   emit({
     hookSpecificOutput: {
       hookEventName: input.hook_event_name,
@@ -513,7 +675,7 @@ async function replayOutboxIfNeeded(input, config) {
   const sessionId = sessionInfo.sessionId;
   if (sessionId && config?.dataDir) {
     const state = loadSessionState(config.dataDir, sessionId);
-    if (state?.outboxReplayed) return;
+    if (state?.outboxReplayed && !state?.pendingDelivery && loadSpool(config.dataDir).length === 0) return;
   }
   try {
     const replayRes = await post(config, "/v1/outbox/replay", {
@@ -527,12 +689,17 @@ async function replayOutboxIfNeeded(input, config) {
       abandoned: Array.isArray(replayRes?.abandoned) ? replayRes.abandoned : [],
     });
     if (sessionId && config?.dataDir) {
-      saveSessionState(config.dataDir, sessionId, { outboxReplayed: true });
+      saveSessionState(config.dataDir, sessionId, { outboxReplayed: true,
+        pendingDelivery: Array.isArray(replayRes?.failed) && replayRes.failed.length > 0 });
     }
   } catch (error) {
+    saveSessionState(config.dataDir, sessionInfo.sessionId, { pendingDelivery: true });
     // Best-effort: failures to replay must never block session startup or prepare
     logger.warn("outbox.replay_failed", {
       sessionId: sessionId || "unknown",
+      failureKind: error?.kind,
+      code: error?.code,
+      status: error?.status,
       message: error instanceof Error ? error.message : "unknown",
     });
   }
@@ -540,10 +707,23 @@ async function replayOutboxIfNeeded(input, config) {
     const clientAdapter = {
       post: (path, body) => post(config, path, body),
     };
-    await spoolReplay(config.dataDir, clientAdapter, logger);
+    const spoolOutcome = await spoolReplay(config.dataDir, clientAdapter, logger);
+    await replayMaterials({ config, client: clientAdapter, logger });
+    if (spoolOutcome.replayed > 0 || spoolOutcome.rejected > 0) {
+      // Categorized counts only: a replayed item was delivered, a rejected one was
+      // refused permanently and dropped. The payload is never logged.
+      logger.info("spool.replay", {
+        sessionId: sessionId || "unknown",
+        replayed: spoolOutcome.replayed,
+        rejected: spoolOutcome.rejected ?? 0,
+        remaining: spoolOutcome.remaining,
+      });
+    }
   } catch (spoolError) {
     logger.warn("spool.replay_failed", {
       sessionId: sessionId || "unknown",
+      failureKind: spoolError?.kind,
+      code: spoolError?.code,
       message: spoolError instanceof Error ? spoolError.message : String(spoolError),
     });
   }
@@ -552,11 +732,35 @@ async function replayOutboxIfNeeded(input, config) {
 async function recordEvent(input, config) {
   const stopped = input.hook_event_name === "Stop";
   const sessionInfo = sessionFields(input, config);
+  const state = loadSessionState(config.dataDir, sessionInfo.sessionId) ?? {};
+  const stopTurnKey = input.turn_id || state.turnKey || 'session-stop';
+  const stopTaskId = state.stopTurnKey === stopTurnKey ? state.stopTaskId : sessionInfo.taskId;
+  if (stopped && state.stopTurnKey !== stopTurnKey) {
+    saveSessionState(config.dataDir, sessionInfo.sessionId, { stopTurnKey, stopTaskId: stopTaskId ?? null });
+  }
+  let recalled;
+  if (!stopped) {
+    await captureMaterial({ adapter: 'codex', sessionId: sessionInfo.sessionId, taskId: sessionInfo.taskId,
+      tool: input.tool_name, result: input.tool_response ?? input.tool_result },
+    { config, client: { post: (route, payload) => post(config, route, payload) }, logger });
+    await captureFailure({ adapter: "codex", sessionId: sessionInfo.sessionId,
+      tool: input.tool_name, result: input.tool_response ?? input.tool_result },
+    { config, client: { post: (route, payload) => post(config, route, payload) }, logger });
+    const failure = failureCandidate({ adapter: 'codex', projectId: config.projectId, sessionId: sessionInfo.sessionId,
+      tool: input.tool_name, result: input.tool_response ?? input.tool_result, secret: config.token });
+    if (failure) recalled = await recallKnowledge({ client: { post: (route, payload, options) => post(config, route, payload, options) },
+      config, logger, adapter: 'codex', sessionId: sessionInfo.sessionId,
+      query: failure.discovery.match(/观察：(.*)/)?.[1] ?? input.tool_name, trigger: 'failure' });
+  }
   const eventPayload = {
-    eventId: randomUUID(),
+    eventId: stopped && sessionInfo.sessionId
+      ? `stop:${createHash('sha256').update(JSON.stringify([sessionInfo.sessionId, stopTurnKey])).digest('hex')}`
+      : randomUUID(),
     adapter: "codex",
     projectId: config.projectId,
-    ...sessionInfo,
+    // Snapshot the task id once per turn: learning it from a stop receipt must
+    // not change a retried event, while an explicitly linked task is preserved.
+    ...(stopped ? { sessionId: sessionInfo.sessionId, ...(stopTaskId ? { taskId: stopTaskId } : {}) } : sessionInfo),
     kind: stopped ? "turn_stopped" : "tool_completed",
     summary: stopped
       ? "Codex turn stopped."
@@ -571,12 +775,20 @@ async function recordEvent(input, config) {
     ) {
       throw new Error("Agent Memory Backpack event response does not match protocol v1");
     }
+    if (result.journalId) {
+      saveSessionState(config.dataDir, sessionInfo.sessionId, { taskId: result.taskId, journalId: result.journalId });
+      logger.info('journal.persisted', { adapter: 'codex', sessionId: sessionInfo.sessionId,
+        taskId: result.taskId, journalId: result.journalId, revision: result.revision, outcome: result.outcome });
+    }
+    if (recalled?.context) emit({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: `${SOURCE_MARKER}\n${redact(recalled.context, config.token)}` } });
     if (stopped) emit({ continue: true });
   } catch (error) {
-    // Deterministic 4xx rejection: do not queue, throw immediately
+    // An `http4xx` refusal, a protocol mismatch or a withdrawn call is a decision
+    // to report, never a queue entry: replaying it would fail the same way.
     if (isExplicitClientRejection(error)) {
       throw error;
     }
+    saveSessionState(config.dataDir, sessionInfo.sessionId, { pendingDelivery: true });
     // Network / timeout / 5xx: enqueue full payload into persistent outbox
     /**
      * Whether the core has this event — either it accepted the delivery, or its own
@@ -606,6 +818,9 @@ async function recordEvent(input, config) {
       logger.warn("outbox.enqueue_failed", {
         kind: "event",
         idempotencyKey: eventPayload.eventId,
+        failureKind: enqueueErr?.kind,
+        code: enqueueErr?.code,
+        status: enqueueErr?.status,
         message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
       });
       try {
@@ -615,6 +830,10 @@ async function recordEvent(input, config) {
           projectId: config.projectId,
           payload: eventPayload,
           error: (enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)).slice(0, 2000),
+          // Structured kind/code/status/reason: replay must tell a transient fault
+          // (worth another attempt) from a permanent refusal (drop) without parsing
+          // text, and these fields are what the adapter log reports.
+          failure: clientFailureMeta(enqueueErr),
         });
         if (outcome.enqueued) {
           // Saved for replay on the next session. Note that `deliveredToCore` stays false:
@@ -646,7 +865,49 @@ async function recordEvent(input, config) {
   }
 }
 
+/**
+ * A plugin the user switched off must stay off.
+ *
+ * Codex records the switch as `[plugins."<name>@<marketplace>"] enabled = false` in
+ * `~/.codex/config.toml`, and that file is the only durable place the decision
+ * lives. The host is supposed to stop invoking these hooks once a plugin is
+ * disabled, but a 2026-10-10 acceptance run recorded exactly the opposite: the
+ * settings UI said the plugin was disabled while new chats kept receiving injected
+ * context. Reading the flag here makes the promise hold regardless of which side
+ * forgets it - and a switch that switches nothing is worse than no switch at all.
+ *
+ * Only an explicit `false` stops the hook: a missing entry means "never switched
+ * off" (the plugin ships enabled), and anything unreadable fails open, because a
+ * config we cannot parse must not silently turn memory capture off.
+ */
+function pluginExplicitlyDisabled() {
+  try {
+    const path = join(homedir(), '.codex', 'config.toml');
+    if (!existsSync(path)) return false;
+    const text = readFileSync(path, 'utf8');
+    // Section headers read like: [plugins."agent-memory-backpack@agent-memory-backpack-local"]
+    const sections = text.split(/^[ \t]*\[/m);
+    for (const section of sections) {
+      const end = section.indexOf(']');
+      if (end === -1) continue;
+      if (!/^plugins\.["']agent-memory-backpack@/i.test(section.slice(0, end))) continue;
+      const body = section.slice(end + 1);
+      const match = /^[ \t]*enabled[ \t]*=[ \t]*(true|false)[ \t]*$/im.exec(body);
+      if (match && match[1].toLowerCase() === 'false') return true;
+    }
+    return false;
+  } catch {
+    // Failing open is deliberate: a hook that cannot read the config should keep
+    // working, not silently stop serving knowledge.
+    return false;
+  }
+}
+
 async function main() {
+  // Checked before stdin is read: a disabled plugin should produce no output at all,
+  // which also keeps it from claiming a status line in the host's UI.
+  if (pluginExplicitlyDisabled()) return;
+
   let input;
   try {
     input = await readInput();
@@ -726,6 +987,10 @@ async function main() {
     }
     if (event === "SessionStart" || event === "UserPromptSubmit") {
       await prepare(input, config);
+      if (event === 'UserPromptSubmit') {
+        const state = loadSessionState(config.dataDir, input.session_id);
+        if (state?.pendingDelivery || loadSpool(config.dataDir).length > 0) await replayOutboxIfNeeded(input, config);
+      }
     } else if (event === PRE_TOOL_USE) {
       await gate(input, config);
     } else {
@@ -737,7 +1002,7 @@ async function main() {
     // Recorded before the host is told: the log is what makes a later report
     // actionable, and it is the only place the real cause is kept.
     logger.error("hook.failed", { event, ms: Date.now() - started, message });
-    if (message.includes("426") || message.includes("protocol version mismatch") || message.includes("HTTP 426")) {
+    if (error?.status === 426 || error?.code === "protocol_mismatch" || message.includes("HTTP 426")) {
       if (event === PRE_TOOL_USE) {
         deny("Agent Memory Backpack protocol version mismatch (HTTP 426); tool execution blocked.");
         return;

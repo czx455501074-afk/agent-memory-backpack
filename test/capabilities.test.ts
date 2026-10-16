@@ -51,16 +51,14 @@ function withHostEnvCleared<T>(body: () => T): T {
   }
 }
 
-test('两端分别列出，且已知的能力缺口如实标为不支持', () => {
+test('两端分别列出代码设计能力，不冒充当前会话运行证据', () => {
   const manifest = capabilityManifest(tempDir());
   assert.equal(manifest.length, 2, '必须两端分别标记，不能合并成一份');
   assert.deepEqual(manifest.map(m => m.id).sort(), ['codex', 'dsh']);
 
   const codex = manifest.find(m => m.id === 'codex')!;
-  // Codex hooks are one short-lived process per event, so there is nowhere to hold
-  // "which task is this session doing". Reporting `yes` because the core has the API
-  // would be exactly the overstatement this list exists to prevent.
-  assert.equal(codex.capabilities.linkTask, 'no', 'codex 不支持任务关联，必须如实标注');
+  assert.equal(codex.capabilities.linkTask, 'yes', 'codex持久session状态和核心已实现任务关联');
+  assert.ok(codex.notes.some(note => /当前会话.*实际/.test(note)), '设计能力必须与当前运行证据区分');
 
   const dsh = manifest.find(m => m.id === 'dsh')!;
   assert.equal(dsh.capabilities.linkTask, 'yes', 'dsh 能保存会话级任务关联');
@@ -112,7 +110,7 @@ test('运行模式从磁盘推导：无快照即未受约束，有快照即只�
 
 test('自检把运行模式与能力清单都列出来，且缺口不标为通过', async () => {
   const dir = tempDir();
-  const report = await doctor({ dataDir: dir, offline: true });
+  const report = await doctor({ dataDir: dir, home: dir, offline: true });
 
   const mode = report.checks.find(check => check.id === 'operating-mode');
   assert.ok(mode, '自检必须报告运行模式：它决定规则是否真的在被执行');
@@ -126,8 +124,8 @@ test('自检把运行模式与能力清单都列出来，且缺口不标为通�
     assert.ok(entry, `必须为 ${id} 单独列一条`);
   }
   const codexEntry = report.checks.find(check => check.id === 'capability-codex')!;
-  assert.equal(codexEntry.status, 'warn', 'codex 有已知缺口，不得标为通过');
-  assert.match(codexEntry.detail, /linkTask/, '必须点名缺哪一项');
+  assert.equal(codexEntry.status, 'warn', '临时home未安装插件，不得标为通过');
+  assert.match(codexEntry.detail, /未安装|未找到|未检测|未发现|未在|尚未验证/, '缺少实机证据必须明确说明');
 });
 
 test('核心侧与适配器侧对快照文件名的约定一致', () => {

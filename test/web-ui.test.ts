@@ -70,6 +70,11 @@ test('核心提供管理界面，且不需要额外运行时', async () => {
       if (path === '/ui/app.js') {
         const awaitedScript = await asset.text();
         assert.doesNotThrow(() => new Script(awaitedScript), 'served browser script must parse');
+        const hashRead = awaitedScript.indexOf('location.hash');
+        const hashCleared = awaitedScript.indexOf('history.replaceState');
+        assert.ok(hashRead >= 0 && hashCleared > hashRead, '凭据 hash 必须先读取再清除');
+        assert.match(awaitedScript, /history\.replaceState\(null,\s*['"]['"],\s*location\.pathname\)/,
+          '页面应通过 replaceState 清除地址栏中的凭据 fragment');
       }
     }
   } finally { await close(); }
@@ -86,6 +91,11 @@ test('同源请求被允许，跨域请求仍被拒绝', async () => {
     const crossOrigin = await post(origin, '/v1/stats', {}, { origin: 'http://evil.example.com' });
     assert.equal(crossOrigin.status, 403, '跨域页面不得驱动核心');
     assert.equal((await crossOrigin.json() as { code?: string }).code, 'origin_denied');
+
+    // The DSH desktop embeds this page from its own loopback port. That origin is
+    // not the core's, but it is still this machine. A different site stays refused.
+    const embedded = await post(origin, '/v1/stats', {}, { origin: 'http://127.0.0.1:19387' });
+    assert.equal(embedded.status, 200, '本机另一个回环端口嵌入页面必须能读取数据');
 
     // And the page still needs the credential: narrowing the origin check must
     // not have turned into dropping authentication.

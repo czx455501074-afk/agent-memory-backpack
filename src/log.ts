@@ -37,6 +37,7 @@ export interface LogRecord {
 }
 
 export interface LoggerOptions {
+  fileName?: 'amb.log.jsonl' | 'amb-plugin.log.jsonl';
   level?: LogLevel;
   maxBytes?: number;
   keep?: number;
@@ -104,7 +105,7 @@ export class Logger {
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
     this.keep = options.keep ?? DEFAULT_KEEP;
     this.now = options.now ?? Date.now;
-    this.file = join(dir, 'amb.log.jsonl');
+    this.file = join(dir, options.fileName ?? 'amb.log.jsonl');
     try { mkdirSync(dir, { recursive: true }); } catch { this.degraded = true; }
   }
 

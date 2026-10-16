@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, relative, isAbsolute, posix, win32 } from 'node:path';
 import type { Knowledge, Workflow } from './schema.js';
 import type { Store } from './store.js';
 
@@ -63,7 +63,7 @@ function slug(id: string, title?: string): string {
  * nothing is paraphrased and nothing is lost. In both cases the result is plain
  * Markdown that a host can use without this plugin.
  */
-export function renderSkill(entry: Knowledge): string | undefined {
+export function renderSkill(entry: Knowledge, sourcePath?: string): string | undefined {
   const lines: string[] = [`# ${entry.title}`, ''];
   if (entry.kind === 'workflow') {
     lines.push(entry.overview, '', '## 触发条件', '');
@@ -92,12 +92,12 @@ export function renderSkill(entry: Knowledge): string | undefined {
     }
   } else if (entry.kind === 'skill') {
     // Verbatim: the adopted text is the user's own wording.
-    lines.push(entry.body, '');
+    lines.splice(0, lines.length, entry.body, '');
     if (entry.leaves.length) {
       lines.push('## 参考文档', '');
       for (const leaf of entry.leaves) {
-        const baseName = leaf.path.split(/[\\/]/).pop() || 'reference.md';
-        lines.push(`- references/${baseName}`);
+        const location = leafExportPath(leaf.path, sourcePath);
+        lines.push(`- [${location}](<${location}>)`);
       }
       lines.push('');
     }
@@ -109,6 +109,38 @@ export function renderSkill(entry: Knowledge): string | undefined {
     return undefined;
   }
   return lines.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
+/** Keep paths relative to the adopted SKILL.md, including nested references.
+ * Never flatten basenames: distinct a/readme.md and b/readme.md must survive.
+ * Absolute legacy leaves without a source cannot be safely relocated by guessing.
+ */
+function leafExportPath(path: string, sourcePath?: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  let value = normalized;
+  if (win32.isAbsolute(path) || posix.isAbsolute(normalized)) {
+    if (!sourcePath) throw new Error(`Absolute reference has no source SKILL.md: ${path}`);
+    const api = win32.isAbsolute(sourcePath) ? win32 : posix;
+    value = api.relative(api.dirname(sourcePath), path).replace(/\\/g, '/');
+  }
+  const segments = value.split('/');
+  if (!value || segments.some(part => !part || part === '.' || part === '..'
+    || /[<>:"|?*\u0000-\u001f]/.test(part) || /[. ]$/.test(part)
+    || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))
+    || value.toLowerCase() === 'skill.md') {
+    throw new Error(`Unsafe reference path: ${path}`);
+  }
+  return value;
+}
+
+function ownedPath(root: string, target: string): void {
+  const rel = relative(root, target);
+  if (!rel || isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) throw new Error('Export path leaves its owned directory');
+  let current = root;
+  for (const part of rel.split(/[\\/]/)) {
+    current = join(current, part);
+    if (existsSync(current) && lstatSync(current).isSymbolicLink()) throw new Error('Export refuses symbolic links in its output');
+  }
 }
 
 function checkWorkflowReady(workflow: Workflow, allMap: Map<string, StoreEntry>, ancestors = new Set<string>()): { ready: boolean; reason?: string } {
@@ -144,6 +176,9 @@ export function exportSkills(store: Store, options: {
   dryRun?: boolean;
 }): ExportResult {
   const directory = resolve(options.directory);
+  if (existsSync(directory) && lstatSync(directory).isSymbolicLink()) {
+    throw new Error('Export directory must not be a symbolic link');
+  }
   const kinds = options.kinds ?? ['workflow', 'skill'];
   const markerPath = join(directory, EXPORT_MARKER);
   const written: string[] = [];
@@ -164,6 +199,7 @@ export function exportSkills(store: Store, options: {
   const allEntries = store.allEntries();
   const allMap = new Map<string, StoreEntry>(allEntries.map(e => [e.id, e]));
   const records: Array<{ id: string; title: string; folder: string; markdown: string; leaves: Array<{ relPath: string; body: string }> }> = [];
+  const sources = new Map(store.adoptions().map(item => [item.knowledgeId, item.sourcePath]));
   const usedFolders = new Set<string>();
   for (const entry of allEntries) {
     if (!kinds.includes(entry.content.kind)) { skipped.push({ id: entry.id, reason: `kind ${entry.content.kind} is not exported as a skill` }); continue; }
@@ -174,20 +210,29 @@ export function exportSkills(store: Store, options: {
         continue;
       }
     }
-    const markdown = renderSkill(entry.content);
+    const sourcePath = sources.get(entry.id);
+    let markdown: string | undefined;
+    const leaves: Array<{ relPath: string; body: string }> = [];
+    try {
+      markdown = renderSkill(entry.content, sourcePath);
+      const seen = new Set<string>();
+      if (entry.content.kind === 'skill') for (const leaf of entry.content.leaves) {
+        const relPath = leafExportPath(leaf.path, sourcePath);
+        const key = relPath.toLowerCase();
+        if (seen.has(key)) throw new Error(`Duplicate reference destination: ${relPath}`);
+        seen.add(key);
+        leaves.push({ relPath, body: leaf.body || '' });
+      }
+    } catch (error) {
+      skipped.push({ id: entry.id, reason: error instanceof Error ? error.message : 'Invalid reference path' });
+      continue;
+    }
     if (!markdown) { skipped.push({ id: entry.id, reason: 'not representable as a skill document' }); continue; }
     let folder = slug(entry.id, entry.content.title);
     // Two entries can share a title, and a readable name must still be unique.
     while (usedFolders.has(folder)) folder = `${folder}-${digest(folder + entry.id).slice(0, 4)}`;
     usedFolders.add(folder);
 
-    const leaves: Array<{ relPath: string; body: string }> = [];
-    if (entry.content.kind === 'skill' && Array.isArray(entry.content.leaves)) {
-      for (const leaf of entry.content.leaves) {
-        const baseName = leaf.path.split(/[\\/]/).pop() || 'reference.md';
-        leaves.push({ relPath: join('references', baseName), body: leaf.body || '' });
-      }
-    }
     records.push({ id: entry.id, title: entry.content.title, folder, markdown, leaves });
   }
 
@@ -210,6 +255,8 @@ export function exportSkills(store: Store, options: {
         for (const oldFolder of Object.keys(oldMarker.skills)) {
           if (!usedFolders.has(oldFolder)) {
             const oldDirPath = join(directory, oldFolder);
+            if (oldFolder !== slug(oldMarker.skills[oldFolder]?.id ?? '', oldMarker.skills[oldFolder]?.title)) continue;
+            ownedPath(directory, oldDirPath);
             if (existsSync(oldDirPath)) {
               rmSync(oldDirPath, { recursive: true, force: true });
             }
@@ -224,6 +271,7 @@ export function exportSkills(store: Store, options: {
   for (const record of records) {
     const folder = join(directory, record.folder);
     const file = join(folder, 'SKILL.md');
+    ownedPath(directory, file);
     const hash = digest(record.markdown);
     inventory[record.folder] = { hash, title: record.title, id: record.id };
     if (existsSync(file) && digest(readFileSync(file, 'utf8')) === hash) { unchanged.push(file); }
@@ -235,6 +283,7 @@ export function exportSkills(store: Store, options: {
 
     for (const leaf of record.leaves) {
       const leafFile = join(folder, leaf.relPath);
+      ownedPath(directory, leafFile);
       const leafHash = digest(leaf.body);
       if (existsSync(leafFile) && digest(readFileSync(leafFile, 'utf8')) === leafHash) {
         unchanged.push(leafFile);

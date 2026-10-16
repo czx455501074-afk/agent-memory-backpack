@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DomainError, knowledgeSchema, proposalSchema, workflowSchema, type Knowledge, type KnowledgeDraft, type WorkflowDraft, type Workflow, type Scope } from './schema.js';
 import { reviewDecision, type ReviewDecision } from './policy.js';
 import { classifyCandidate } from './semantic.js';
+import { DurableJobs } from './jobs.js';
 import { MATERIAL_TTL_DAYS, expiryFrom, isLive, materialEntry, renew, type MaterialInput } from './material.js';
 
 type Row = Record<string, unknown>;
@@ -41,6 +42,49 @@ export const OUTBOX_TTL_MS = 7 * DAY;
 export const OUTBOX_MAX_ATTEMPTS = 12;
 /** Outbox rows that are no longer waiting to go out. */
 const OUTBOX_TERMINAL = ['sent', 'abandoned'];
+/**
+ * Refusal text that identifies a permanent conflict when the structured error is gone.
+ *
+ * The decision below reads `DomainError.code`/`status` first, and only falls back to
+ * these when the error crossed a boundary that dropped its identity (a re-thrown
+ * string, a bridged call). The wording is the exact wording the store throws, so a
+ * match means the same conflict and not a lookalike.
+ */
+const PERMANENT_REPLAY_MESSAGES = [
+  /idempotency_conflict/i,
+  // Covers all three throw sites of the conflict: "Event key already has different
+  // content", "Same idempotency key has different content" and "Checkpoint key
+  // already has different content".
+  /has different content/i,
+  /already queued as a different kind of item/i,
+];
+/**
+ * Whether a replay failure will fail the same way however many times it is retried.
+ *
+ * `replayOutbox` re-sends a payload the store already holds, so its request is
+ * frozen: a refusal of *that request* — any 4xx — is a property of the content, not
+ * of the moment, and resending it can only produce the same refusal. The cost of
+ * ignoring that was measurable in production: 984 rows (451 failed, 533 abandoned)
+ * all carrying the same `idempotency_conflict`, retried 9,773 times between them and
+ * delivering nothing, each attempt blocking a session's first step.
+ *
+ * A 5xx, a network fault or a full outbox (507) is the opposite case: the request was
+ * fine and the world was not, so it stays retryable and keeps its backoff. The status
+ * range rather than a list of the codes seen so far is deliberate: every 4xx is a
+ * rejection of this exact request by construction, while a list would quietly send
+ * the next code someone adds back into infinite retries.
+ */
+export function isPermanentReplayRefusal(error: unknown): boolean {
+  if (error instanceof DomainError) {
+    // `idempotency_conflict` is called out by name because it is the one production
+    // hit, and because its 409 is a fact about the content rather than the request
+    // shape; the status range then covers every other business refusal (400
+    // `invalid_request`, 403 `forbidden`/`scope_denied`, 404 `not_found`, and so on).
+    return error.code === 'idempotency_conflict' || (error.status >= 400 && error.status < 500);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return PERMANENT_REPLAY_MESSAGES.some(pattern => pattern.test(message));
+}
 /**
  * Whether a scope applies to the caller's project and task.
  *
@@ -115,6 +159,57 @@ function queryTokens(query: string): string[] {
  */
 interface Match { id: string; coverage: number; matched: string[] }
 
+// These are linguistic/action words, not domain terms. Removing them only for
+// automatic recall prevents a shared procedure template from becoming a topic.
+// Explicit full-text search deliberately retains every query token.
+const recallStopWords = new Set(['实现', '功能', '主动', '调用', '参考', '使用', '需要', '执行', '任务', '验收',
+  '进行', '完成', '工作', '现在', '已经', '继续', '确认', '这些', '这个', '怎么', '如何', '是否',
+  '可以', '帮我', '我们', '一下', '之后', '之前', '所有', '相关', '处理', '检查']);
+
+function automaticRelevance(content: Knowledge, query: string): { score: number; matched: string[]; coverage: number } {
+  if (query.trim().replace(/@\d+$/, '') === content.id) return { score: 100, matched: [content.id], coverage: 1 };
+  // Strip whole filler phrases before bigram tokenization; filtering afterwards
+  // leaves artificial cross-boundary fragments (检查功能 -> 查功).
+  const substantive = query.toLowerCase().replace(new RegExp([...recallStopWords].join('|'), 'gu'), ' ');
+  const tokens = queryTokens(substantive);
+  if (!tokens.length) return { score: 0, matched: [], coverage: 0 };
+  const description = content.kind === 'skill' ? /^description:\s*(.+)$/m.exec(content.body)?.[1] ?? '' : '';
+  const primary = `${content.title} ${description} ${content.kind === 'workflow' ? `${content.overview} ${content.triggers.join(' ')}` : ''}`.toLowerCase();
+  const body = 'body' in content ? content.body : content.kind === 'journal' ? `${content.did}\n${content.problems}` : '';
+  const match = (text: string) => tokens.filter(token => text.includes(token));
+  const weight = (token: string) => /^[a-z0-9_-]{3,}$/.test(token) ? 2 : 1;
+  const total = tokens.reduce((sum, token) => sum + weight(token), 0);
+  const coverage = (hits: string[]) => hits.reduce((sum, token) => sum + weight(token), 0) / total;
+  const primaryHits = match(primary);
+  const primaryCoverage = coverage(primaryHits);
+  // A single broad word in a long request is not a reliable topic. A named
+  // technology or several advertised-purpose fragments is stronger evidence.
+  const primaryAccepted = primaryCoverage >= 0.25 && (primaryHits.length >= 2
+    || primaryHits.some(token => /^[a-z0-9_-]{3,}$/.test(token)) || primaryCoverage >= 0.3);
+  let bestHits: string[] = [];
+  // Skills advertise their applicability in title/description. Their references
+  // remain explicitly searchable, but do not broaden automatic applicability.
+  if (content.kind !== 'skill') {
+    // A whole daily log can match every query word in unrelated entries. Demand
+    // local co-occurrence, keeping fixed windows even when a source has no lines.
+    for (const paragraph of body.toLowerCase().split(/\n|[。！？]/u)) {
+      for (let offset = 0; offset < paragraph.length; offset += 240) {
+        const hits = match(paragraph.slice(offset, offset + 480));
+        if (coverage(hits) > coverage(bestHits)) bestHits = hits;
+      }
+    }
+  }
+  const bodyCoverage = coverage(bestHits);
+  const broadShortQuery = tokens.every(token => /\p{Script=Han}/u.test(token))
+    && substantive.replace(/\s/g, '').length <= 3;
+  const bodyAccepted = !(broadShortQuery && body.length > 1000) && bodyCoverage >= 0.5 && (bestHits.length >= 2
+    || bestHits.some(token => /^[a-z0-9_-]{4,}$/.test(token)) || (tokens.length === 1 && body.length <= 1000));
+  if (!primaryAccepted && !bodyAccepted) return { score: 0, matched: [], coverage: 0 };
+  const hits = [...new Set([...primaryHits, ...bestHits])];
+  return { score: (primaryAccepted ? 3 * primaryCoverage : 0) + (bodyAccepted ? bodyCoverage : 0),
+    matched: hits, coverage: coverage(hits) };
+}
+
 function matchAll(db: DatabaseSync, tokens: string[], floor = 0.5): Match[] {
   if (!tokens.length) return [];
   const hitsFor = (token: string): Set<string> => {
@@ -170,8 +265,10 @@ function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
 /** Single SQLite authority for the P0 fixture; not a semantic auto-promotion engine. */
 export class Store {
   readonly db: DatabaseSync;
+  readonly jobs: DurableJobs;
   constructor(readonly path: string, private readonly now: () => number = Date.now) {
     this.db = new DatabaseSync(path);
+    this.jobs = new DurableJobs(this.db, this.now);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000;
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
       INSERT OR IGNORE INTO meta VALUES ('revision',0);
@@ -318,10 +415,22 @@ export class Store {
   }
   close() { this.db.close(); }
   get revision(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='revision'").get()!.value); }
+  private transactionDepth = 0;
   private transaction<T>(body: () => T): T {
-    this.db.exec('BEGIN IMMEDIATE');
-    try { const result = body(); this.db.exec('COMMIT'); return result; }
-    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    const depth = this.transactionDepth++;
+    const name = `amb_nested_${depth}`;
+    try {
+      this.db.exec(depth ? `SAVEPOINT ${name}` : 'BEGIN IMMEDIATE');
+      try {
+        const result = body();
+        this.db.exec(depth ? `RELEASE SAVEPOINT ${name}` : 'COMMIT');
+        return result;
+      } catch (error) {
+        this.db.exec(depth ? `ROLLBACK TO SAVEPOINT ${name}` : 'ROLLBACK');
+        if (depth) this.db.exec(`RELEASE SAVEPOINT ${name}`);
+        throw error;
+      }
+    } finally { this.transactionDepth--; }
   }
   private head(id: string): Entry | undefined {
     const row = this.db.prepare(`SELECT k.id,k.head,k.status,r.content FROM knowledge k
@@ -481,11 +590,13 @@ export class Store {
       if (content.kind !== 'norm') this.db.prepare('INSERT INTO workflow_search VALUES(?,?)').run(content.id, searchable(JSON.stringify(content)));
     }
     this.db.prepare("UPDATE meta SET value=value+1 WHERE key='revision'").run();
+    this.jobs.enqueue('notify', `revision:${this.revision}`, { revision: this.revision });
     return this.revision;
   }
   private validateDependencies(entry: Entry, all: Map<string, Entry>, ancestors: Set<string>): void {
     if (ancestors.has(entry.id)) throw new DomainError('dependency_cycle', `Workflow dependency cycle at ${entry.id}`, 409);
     if (entry.content.kind !== 'workflow') throw new DomainError('not_workflow', 'A workflow dependency must target a workflow', 409);
+    this.workflowSource(entry.content);
     const path = new Set(ancestors).add(entry.id);
     for (const stage of entry.content.stages) for (const dep of stage.dependencies) {
       if (dep.relationship === 'reference') continue;
@@ -498,12 +609,26 @@ export class Store {
       this.validateDependencies(child, all, path);
     }
   }
+  /** A derived procedure is pinned to its source, including all reference leaves. */
+  private workflowSource(flow: Workflow) {
+    if (!flow.derivedFrom) return undefined;
+    const source = this.head(flow.derivedFrom.skillId);
+    if (!source || source.content.kind !== 'skill' || source.revision !== flow.derivedFrom.skillRevision)
+      throw new DomainError('source_changed', 'Source skill changed or is unavailable; review the derived workflow again', 409);
+    const a = flow.scope, b = source.content.scope;
+    if (b.kind !== 'global' && (a.kind === 'global' || a.projectId !== b.projectId
+      || (b.kind === 'task' && (a.kind !== 'task' || a.taskId !== b.taskId))))
+      throw new DomainError('dependency_scope', 'Source skill belongs to a narrower scope', 409);
+    return { id: source.id, revision: source.revision, body: source.content.body,
+      leaves: source.content.leaves.map(leaf => ({ ...leaf })) };
+  }
   retire(id: string, baseRevision: number): void {
     this.transaction(() => {
       const result = this.db.prepare("UPDATE knowledge SET status='retired' WHERE id=? AND head=? AND status='active'").run(id, baseRevision);
       if (!result.changes) throw new DomainError('revision_conflict', 'Current knowledge revision not found', 409);
       this.db.prepare('DELETE FROM workflow_search WHERE id=?').run(id);
       this.db.prepare("UPDATE meta SET value=value+1 WHERE key='revision'").run();
+    this.jobs.enqueue('notify', `revision:${this.revision}`, { revision: this.revision });
     });
   }
   norms(projectId: string, options?: { taskId?: string; platform?: 'dsh' | 'codex' }) {
@@ -564,12 +689,13 @@ export class Store {
     const resolve = (flow: Workflow): unknown[] => flow.stages.flatMap(s => s.dependencies.filter(d => d.relationship !== 'reference').flatMap(d => {
       if (expanded.has(d.workflowId)) return [];
       expanded.add(d.workflowId); const child = all.get(d.workflowId)!;
-      return [{ id: child.id, revision: child.revision, workflow: child.content }, ...resolve(child.content as Workflow)];
+      return [{ id: child.id, revision: child.revision, workflow: child.content, source: this.workflowSource(child.content as Workflow) }, ...resolve(child.content as Workflow)];
     }));
     // Includes all required prerequisites of this stage and nested dependencies, never independent fragments.
     const stageFlow = { ...entry.content, stages: [stage] };
     return { workflowId: id, revision: entry.revision, title: entry.content.title, preconditions: entry.content.preconditions,
-      stage, completion: entry.content.completion, recovery: entry.content.recovery, dependencies: resolve(stageFlow), ready: true };
+      stage, completion: entry.content.completion, recovery: entry.content.recovery, dependencies: resolve(stageFlow),
+      source: this.workflowSource(entry.content), ready: true };
   }
   /**
    * Search adopted skills and memories.
@@ -585,7 +711,7 @@ export class Store {
    * characters against a 2k-4k token budget, so retrieval returns entry points
    * and expansion is explicit.
    */
-  knowledge(projectId: string, query: string, limit = 5, excerptChars = 400) {
+  knowledge(projectId: string, query: string, limit = 5, excerptChars = 400, relevanceFloor = 0.5) {
     const entries = this.liveEntries();
     const all = new Map(entries.map(x => [x.id, x]));
     const tokens = queryTokens(query);
@@ -595,7 +721,7 @@ export class Store {
     // Injection is decided elsewhere: `prepare()` skips this call entirely when
     // the query is empty, because an arbitrary slice of the library appearing in
     // every session is how an unrelated project opened with five media skills.
-    const matches = tokens.length ? matchAll(this.db, tokens) : [];
+    const matches = tokens.length ? matchAll(this.db, tokens, relevanceFloor) : [];
     const ids = tokens.length ? matches.map(match => match.id) : entries.map(entry => entry.id);
     const reasonFor = new Map(matches.map(match => [match.id, match]));
     const result: Array<{
@@ -642,6 +768,20 @@ export class Store {
     }
     return result;
   }
+  /** Automatic selection has absolute evidence thresholds; explicit search does not. */
+  private automaticMatches(projectId: string, query: string) {
+    return new Map(this.liveEntries().filter(entry => applicable(entry.content.scope, projectId))
+      .map(entry => [entry.id, automaticRelevance(entry.content, query)] as const)
+      .filter(([, reason]) => reason.score > 0));
+  }
+  autoRecall(projectId: string, query: string, kindFilter?: string, limit = 3) {
+    if (!query.trim()) return [];
+    const matches = this.automaticMatches(projectId, query);
+    return this.searchUniversal(projectId, '', kindFilter, Number.MAX_SAFE_INTEGER)
+      .filter(entry => matches.has(entry.id))
+      .sort((a, b) => matches.get(b.id)!.score - matches.get(a.id)!.score)
+      .slice(0, limit).map(entry => ({ ...entry, why: { id: entry.id, ...matches.get(entry.id)! } }));
+  }
   /**
    * Universal search across all knowledge kinds: norm, preference, memory, skill, journal, workflow, material.
    * Allows manual filtering by kind and full-text keyword retrieval.
@@ -677,6 +817,11 @@ export class Store {
       return {
         id: entry.id,
         revision: entry.revision,
+        // The lifecycle column, passed through unchanged. Callers that group or badge
+        // entries need it next to the entry rather than a second lookup: the panel's
+        // category view prints it on every row. It is the core's own `knowledge.status`
+        // value, never inferred from anything else.
+        status: entry.status,
         kind: entry.content.kind,
         title: entry.content.title,
         scope: entry.content.scope,
@@ -912,7 +1057,7 @@ export class Store {
       ? [`规范上下文预算 ${this.normBudgetChars} 字符：本条上下文省略 ${omitted.length} 条规范（${omitted.map(o => o.id).join('、')}）；省略不改变它们的约束判定，需要时按 id 展开读取。`]
       : [];
   }
-  prepare(projectId: string, query: string, options?: { sessionId?: string; taskId?: string; platform?: 'dsh' | 'codex'; knownRevision?: number }) {
+  prepare(projectId: string, query: string, options?: { sessionId?: string; taskId?: string; platform?: 'dsh' | 'codex'; knownRevision?: number; selectedIds?: string[] }) {
     if (options?.sessionId) {
       try {
         const querySnippet = query ? query.split('\n')[0]?.slice(0, 50) : '';
@@ -946,8 +1091,20 @@ export class Store {
     // whether or not anything was asked.
     const hasQuery = queryTokens(query).length > 0;
     const retrievalTokens = queryTokens(query);
-    const workflows = hasQuery ? this.search(projectId, query) : [];
-    const knowledge = hasQuery ? this.knowledge(projectId, query) : [];
+    const automaticMatches = this.automaticMatches(projectId, query);
+    if(options?.selectedIds) {
+      automaticMatches.clear();
+      options.selectedIds.forEach((id,index)=>automaticMatches.set(id,{score:100-index,matched:[],coverage:0}));
+    }
+    const rankAutomatic = <T extends { id: string }>(entries: T[], limit: number) => entries
+      .filter(entry => automaticMatches.has(entry.id))
+      .sort((a, b) => automaticMatches.get(b.id)!.score - automaticMatches.get(a.id)!.score)
+      .slice(0, limit).map(entry => ({ ...entry, why: automaticMatches.get(entry.id)! }));
+    const workflows = hasQuery ? rankAutomatic(this.search(projectId, '', Number.MAX_SAFE_INTEGER), 8) : [];
+    // Automatic injection uses the entry's advertised purpose, not matches buried
+    // in dozens of reference documents or shared procedure boilerplate. Explicit
+    // universal search and knowledge() still index the full source and leaves.
+    const knowledge = hasQuery ? rankAutomatic(this.knowledge(projectId, '', Number.MAX_SAFE_INTEGER, 400), 5) : [];
     /**
      * The record of what this retrieval did, and what it could not find.
      *
@@ -991,9 +1148,8 @@ export class Store {
         + `（正文 ${k.chars} 字符，需要时调用 amb_read_knowledge 读取）`
         + (k.kind === 'skill' && k.needsStructure ? '［尚未结构化：原文保存，未经核实为完整方法］' : '')
         + `\n摘要: ${k.excerpt}`),
-      '【AMB 经验双向闭环协议】\n'
-      + '1. 【主动读经验】：任务涉及上述领域技能或遇到排错难点时，严禁凭空臆想！必须主动调用 `amb_read_knowledge` 展开技能正文与参考文档，或调用 `amb_search_universal` 深度检索库内避坑记录与历史日记。\n'
-      + '2. 【主动落盘沉淀】：排查出问题根因、验证了新方案或获得可复用操作结论时，必须主动调用 `amb_submit_experience` 将经验落盘入库（提供因果事实、完整步骤与避坑规则），坚决杜绝经验留在临时会话中流失。Stop不表示任务已完成。',
+      '【AMB 双向记忆】Codex/DSH 各项目会话共用此库。任务开始或遇到新错误，用 `amb_search_universal` 按任务/错误签名检索知识、经验与日记，再用 `amb_read_knowledge` 读相关正文并核对适用条件。\n'
+      + '验证根因或新方案后用 `amb_submit_experience` 提交候选，附流程/步骤、修复和证据。pending=待审；queued_local=仅本机排队，均未采纳。自动捕获的失败事实待核实，不是规范。Stop不表示任务完成。',
     ].join('\n\n');
     // A caller that already received this revision gets a pointer instead of the
     // whole normative text again. The gate hook runs before every tool call, so
@@ -1090,7 +1246,7 @@ export class Store {
    * the receipt here keeps both branches in one shape for callers while leaving the
    * internals unannotated.
    */
-  submit(principal: string, payload: { idempotencyKey: string; projectId: string; workflowId?: string; stageId?: string; baseRevision?: number; discovery: string }): {
+  submit(principal: string, payload: { idempotencyKey: string; projectId: string; taskId?: string; workflowId?: string; stageId?: string; baseRevision?: number; discovery: string; evidence?: string }): {
     id: string; state: string; duplicate: boolean; duplicateOf?: string;
     /**
      * Present for a new submission; omitted on the retry branch.
@@ -1181,6 +1337,8 @@ export class Store {
       // rule below compares what the schema said it stored rather than the raw
       // argument, and so the stored record carries the declared shape.
       const submission = shape.data;
+      if (submission.taskId && !this.getTask(submission.taskId, submission.projectId))
+        throw new DomainError('not_found', 'Task is unavailable', 404);
       if (submission.stageId !== undefined && submission.workflowId === undefined) {
         // A stage cannot be located without its workflow: "step 3" is meaningless
         // until it is "step 3 of this process", and storing it alone would create the
@@ -1355,6 +1513,12 @@ export class Store {
       this.db.prepare('INSERT INTO proposals(id,principal,idem,fingerprint,payload,state,created_at,expires_at,project_id) VALUES(?,?,?,?,?,?,?,?,?)')
         .run(id, principal, payload.idempotencyKey, fingerprint, JSON.stringify(record), 'pending', this.now(),
           conflict ? Number.MAX_SAFE_INTEGER : this.now() + 30 * DAY, payload.projectId);
+      this.jobs.enqueue('model_review', `proposal:${id}`, { proposalId: id, projectId: payload.projectId });
+      if (payload.taskId) {
+        const task = this.getTask(payload.taskId, payload.projectId)!;
+        this.recordTask(payload.projectId, { id: task.id, title: task.title, status: task.status,
+          relatedProposals: [...new Set([...task.relatedProposals, id])] });
+      }
       /**
        * The receipt says the same thing the record does.
        *
@@ -1392,7 +1556,7 @@ export class Store {
    * a fact the receiving end treats as its own. The event is therefore refused
    * unless the task exists in the caller's project.
    */
-  event(principal: string, payload: { eventId: string; projectId?: string; taskId?: string; [key: string]: unknown }) {
+  event(principal: string, payload: { eventId: string; projectId?: string; taskId?: string; [key: string]: unknown }): { id: unknown; stored: boolean; duplicate: boolean; [key: string]: unknown } {
     const taskId = typeof payload.taskId === 'string' ? payload.taskId : undefined;
     const projectId = typeof payload.projectId === 'string' ? payload.projectId : undefined;
     if (taskId && projectId) {
@@ -1410,11 +1574,15 @@ export class Store {
       const fingerprint = digest(payload); const old = this.db.prepare('SELECT id,fingerprint FROM events WHERE principal=? AND event_id=?').get(principal, payload.eventId);
       if (old) {
         if (old.fingerprint !== fingerprint) throw new DomainError('idempotency_conflict', 'Event key already has different content', 409);
-        return { id: old.id, stored: true, duplicate: true };
+        return { id: old.id, stored: true, ...this.reflectionReceipt(principal, payload.eventId), duplicate: true };
       }
       const id = randomUUID();
       this.db.prepare('INSERT INTO events VALUES(?,?,?,?,?,?,?)').run(id, principal, payload.eventId, fingerprint, JSON.stringify(payload), this.now(), this.now() + 30 * DAY);
-      return { id, stored: true, duplicate: false };
+      const reflection = projectId && typeof payload.sessionId === 'string'
+        && ['turn_stopped', 'turn_ended', 'turn/end'].includes(String(payload.kind))
+        ? this.checkpointTask(principal, { projectId, sessionId: payload.sessionId,
+          taskId, idempotencyKey: payload.eventId, status: 'paused' }) : {};
+      return { id, stored: true, duplicate: false, ...reflection };
     });
   }
   /**
@@ -1629,9 +1797,13 @@ export class Store {
    * second candidate. The fake clock and backoff come from the same `now()` the
    * rest of the store uses, so a retry window is testable without sleeping.
    *
-   * Success means the item is resolved (stored or duplicate); failure schedules the
-   * next attempt with an exponential backoff capped at one hour, and a lapsed item
-   * is abandoned rather than retried again.
+   * Success means the item is resolved (stored or duplicate). Failure is split by
+   * whether retrying can change the answer: a permanent refusal of this exact request
+   * (4xx) is abandoned on the spot, while a transport or capacity fault schedules the
+   * next attempt with an exponential backoff capped at one hour, and a lapsed item is
+   * abandoned rather than retried again. `limit` bounds one call, so a caller whose
+   * session start must stay responsive can ask for a smaller batch than the default
+   * rather than waiting for fifty items to be attempted.
    */
   replayOutbox(options: { projectId?: string; limit?: number; force?: boolean } = {}): { attempted: number; delivered: Array<{ id: string; kind: string; result: string }>; failed: Array<{ id: string; kind: string; attempts: number; error: string }>; abandoned: string[] } {
     const now = this.now();
@@ -1665,7 +1837,17 @@ export class Store {
         void result;
       } catch (error) {
         const message = error instanceof Error ? error.message : 'replay failed';
-        if (attempts >= OUTBOX_MAX_ATTEMPTS) {
+        if (isPermanentReplayRefusal(error)) {
+          // A refusal of this exact request is not a transient fault, so the attempt
+          // budget and the backoff clock are the wrong tools here: the next attempt is
+          // a guaranteed repeat of this one. Spending them anyway is what produced the
+          // production zombie rows, so the item is closed now instead. `last_error`
+          // still carries what was refused, which is what a person needs to decide
+          // whether the payload itself should be fixed and re-queued.
+          this.db.prepare("UPDATE outbox SET status='abandoned', attempts=?, last_error=?, updated_at=? WHERE id=?")
+            .run(attempts, `Permanent refusal: ${message}`, now, id);
+          abandoned.push(id);
+        } else if (attempts >= OUTBOX_MAX_ATTEMPTS) {
           this.db.prepare("UPDATE outbox SET status='abandoned', attempts=?, last_error=?, updated_at=? WHERE id=?")
             .run(attempts, message, now, id);
           abandoned.push(id);
@@ -2213,6 +2395,65 @@ export class Store {
     });
     return { id: base, created: true };
   }
+  private reflectionReceipt(principal: string, key: string): Record<string, unknown> {
+    const row = this.db.prepare('SELECT value FROM meta WHERE key=?').get(`checkpoint:${digest([principal, key])}`);
+    return row ? JSON.parse(String(row.value)) : {};
+  }
+  /** Persist a task checkpoint and its factual journal in the same transaction. */
+  checkpointTask(principal: string, input: {
+    projectId: string; sessionId?: string; taskId?: string; title?: string; idempotencyKey?: string;
+    status?: TaskStatus; summary?: string; notes?: string; unfinished?: string[];
+    verified?: string; evidence?: 'observed' | 'verifiable' | 'self-reported' | 'unverifiable';
+    files?: string[]; relatedExperiences?: string[]; relatedProposals?: string[];
+  }): Record<string, unknown> {
+    return this.transaction(() => {
+      const fingerprint = digest(input);
+      const prior = input.idempotencyKey ? this.reflectionReceipt(principal, input.idempotencyKey) : {};
+      if (prior.journalId) {
+        if (prior.fingerprint !== fingerprint) throw new DomainError('idempotency_conflict', 'Checkpoint key already has different content', 409);
+        return { ...prior, duplicate: true };
+      }
+      if (!input.taskId && !input.sessionId) throw new DomainError('invalid_task', 'taskId or sessionId is required');
+      let task = input.taskId ? this.getTask(input.taskId, input.projectId)
+        : this.taskForSession(input.projectId, input.sessionId!)
+          ?? this.tasks(input.projectId).filter(task => task.sessionIds.includes(input.sessionId!)).sort((a, b) => b.updatedAt - a.updatedAt)[0];
+      if (input.taskId && !task) throw new DomainError('not_found', 'Task is unavailable', 404);
+      if (!task) {
+        const started = this.startTaskForSession(input.projectId, input.sessionId!, input.title || '会话工作任务');
+        task = this.getTask(started.id, input.projectId)!;
+      }
+      // A host stop is not a completion claim and cannot reopen a closed task.
+      const terminal = ['completed', 'failed', 'cancelled'].includes(task.status);
+      const status = terminal && (!input.status || input.status === 'paused') ? task.status : (input.status ?? 'paused');
+      if (input.status === 'completed' && (!input.verified?.trim() || !['observed', 'verifiable'].includes(input.evidence ?? '')))
+        throw new DomainError('verification_required', 'Completed checkpoints require verified text and verifiable evidence');
+      this.recordTask(input.projectId, { ...input, id: task.id, title: input.title ?? task.title, status,
+        sessionIds: input.sessionId ? [...new Set([...task.sessionIds, input.sessionId])] : task.sessionIds });
+      const journal = this.writeJournal(task.id, input.projectId);
+      const receipt = { stored: true, taskId: task.id, ...journal, duplicate: false, fingerprint };
+      if (input.idempotencyKey) this.db.prepare('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)')
+        .run(`checkpoint:${digest([principal, input.idempotencyKey])}`, JSON.stringify(receipt));
+      return receipt;
+    });
+  }
+  /** Inspect this task's actual event stream, submissions and durable journal. */
+  taskActivity(projectId: string, input: { taskId?: string; sessionId?: string }) {
+    const task = input.taskId ? this.getTask(input.taskId, projectId)
+      : input.sessionId ? this.taskForSession(projectId, input.sessionId)
+        ?? this.tasks(projectId).filter(task => task.sessionIds.includes(input.sessionId!)).sort((a, b) => b.updatedAt - a.updatedAt)[0] : undefined;
+    if (input.taskId && !task) throw new DomainError('not_found', 'Task is unavailable', 404);
+    const events = this.db.prepare('SELECT id,payload,created_at FROM events ORDER BY created_at DESC').all()
+      .map(row => ({ id: String(row.id), at: Number(row.created_at), ...JSON.parse(String(row.payload)) }))
+      .filter(event => event.projectId === projectId && (input.taskId ? event.taskId === input.taskId
+        : input.sessionId ? event.sessionId === input.sessionId : false)).slice(0, 100);
+    const proposals = this.listProposals(projectId).filter(proposal => task
+      && (proposal.payload?.taskId === task.id || task.relatedProposals.includes(proposal.id)))
+      .map(proposal => ({ id: proposal.id, state: proposal.state, createdAt: proposal.createdAt }));
+    const entry = task ? this.current().find(entry => entry.content.kind === 'journal' && entry.content.taskId === task.id) : undefined;
+    return { task: task ?? null, events, proposals,
+      journal: entry ? { id: entry.id, revision: entry.revision, outcome: entry.content.kind === 'journal' ? entry.content.outcome : 'unverified' } : null,
+      knowledgeRevision: this.revision };
+  }
   /**
    * Generate the diary for a task.
    *
@@ -2229,8 +2470,9 @@ export class Store {
     // project's diary. The write path refuses such an event, and this filter is
     // the second line of defence for rows written before that check existed.
     const events = this.db.prepare('SELECT payload, created_at FROM events ORDER BY created_at').all()
-      .map(row => { try { return JSON.parse(String(row.payload)) as { taskId?: string; kind?: string; projectId?: string; summary?: string }; } catch { return {}; } })
-      .filter(payload => payload.taskId === taskId && (payload.projectId === undefined || payload.projectId === projectId));
+      .map(row => { try { return JSON.parse(String(row.payload)) as { taskId?: string; sessionId?: string; kind?: string; projectId?: string; summary?: string }; } catch { return {}; } })
+      .filter(payload => (payload.taskId === taskId || (!payload.taskId && payload.sessionId && task.sessionIds.includes(payload.sessionId)))
+        && (payload.projectId === undefined || payload.projectId === projectId));
     const stops = events.filter(event => event.kind === 'turn_stopped').length;
     const did = task.summary
       || `任务「${task.title}」共记录 ${events.length} 个事件${stops ? `，其中 ${stops} 次中断` : ''}。`;
@@ -2273,8 +2515,8 @@ export class Store {
       evidence: 'self-reported' as const,
       platforms: [] as Array<'dsh' | 'codex'>,
       taskId: task.id,
-      did: did.slice(0, 2000),
-      problems: task.notes.slice(0, 2000),
+      did,
+      problems: task.notes,
       experienceLanded: task.relatedExperiences,
       outcome,
       /**
@@ -2613,6 +2855,9 @@ export class Store {
     evidence: string;
     /** Scope the caller acts within; the skill and the new workflow must be visible to it. */
     projectId?: string;
+    /** Keep the watched source active so later source edits invalidate this procedure. */
+    keepSource?: boolean;
+    expectedSkillRevision?: number;
   }): { workflowId: string; knowledgeRevision: number; retiredSkillRevision: number } {
     const evidence = input.evidence.trim().slice(0, 2000);
     if (!evidence) throw new DomainError('missing_evidence', 'Structuring a skill must cite what the structure is based on', 400);
@@ -2626,6 +2871,8 @@ export class Store {
       if (!skill) throw new DomainError('not_found', `Skill ${input.skillId} is unavailable`, 404);
       if (skill.content.kind !== 'skill') throw new DomainError('not_skill', 'Only an adopted skill can be structured into a workflow', 409);
       if (skill.status !== 'active') throw new DomainError('not_active', `Skill ${input.skillId} is ${skill.status}`, 409);
+      if (input.expectedSkillRevision !== undefined && skill.revision !== input.expectedSkillRevision)
+        throw new DomainError('revision_conflict', 'Source skill changed since draft generation', 409);
       // The skill must belong to the caller's scope; otherwise one project could
       // convert and retire another project's knowledge.
       if (input.projectId && skill.content.scope.kind !== 'global'
@@ -2636,6 +2883,8 @@ export class Store {
 
       const existing = this.head(authored.id);
       if (existing && existing.content.kind !== 'workflow') throw new DomainError('kind_changed', 'A workflow id must not replace another kind', 409);
+      if(existing && input.projectId && !applicable(existing.content.scope,input.projectId))
+        throw new DomainError('not_found','Target workflow is unavailable in this project',404);
       const withSource = workflowSchema.parse({
         ...authored,
         baseRevision: existing?.revision ?? 0,
@@ -2646,15 +2895,16 @@ export class Store {
       // Retire the raw skill in the same transaction: the workflow now carries
       // the method, and leaving both active would offer the same procedure twice
       // in two different shapes.
-      const retired = this.db.prepare("UPDATE knowledge SET status='retired' WHERE id=? AND head=? AND status='active'")
+      const retired = !input.keepSource && this.db.prepare("UPDATE knowledge SET status='retired' WHERE id=? AND head=? AND status='active'")
         .run(input.skillId, skill.revision);
-      if (retired.changes) this.db.prepare('DELETE FROM workflow_search WHERE id=?').run(input.skillId);
+      if (retired && retired.changes) this.db.prepare('DELETE FROM workflow_search WHERE id=?').run(input.skillId);
 
       const newRevision = (existing?.revision ?? 0) + 1;
       this.db.prepare(`INSERT INTO supersessions(old_knowledge_id,old_revision,new_knowledge_id,new_revision,action,reason,evidence,origin,replaced_local_edit,created_at)
         VALUES(?,?,?,?,?,?,?,?,0,?)`).run(input.skillId, skill.revision, authored.id, newRevision,
-          'supersede', '技能已结构化为完整流程', evidence, input.derivedBy, this.now());
+          input.keepSource ? 'supplement' : 'supersede', '技能已结构化为完整流程', evidence, input.derivedBy, this.now());
       this.db.prepare("UPDATE meta SET value=value+1 WHERE key='revision'").run();
+    this.jobs.enqueue('notify', `revision:${this.revision}`, { revision: this.revision });
       return { workflowId: authored.id, knowledgeRevision, retiredSkillRevision: skill.revision };
     });
   }
@@ -2731,6 +2981,7 @@ export class Store {
         this.db.prepare('UPDATE adoptions SET revoked_at=? WHERE id=?').run(now, record.id);
       }
       if (retired.length) this.db.prepare("UPDATE meta SET value=value+1 WHERE key='revision'").run();
+    this.jobs.enqueue('notify', `revision:${this.revision}`, { revision: this.revision });
       return { retired, skipped };
     });
   }
@@ -2840,6 +3091,7 @@ export class Store {
               'supplement', '临时资料到期清理：正文、摘要与索引已删除', 'material expiry', 'user', now);
           }
           this.db.prepare("UPDATE meta SET value=value+1 WHERE key='revision'").run();
+    this.jobs.enqueue('notify', `revision:${this.revision}`, { revision: this.revision });
         });
         purged.push(entry.id);
       } catch (error) {
@@ -3034,6 +3286,7 @@ export class Store {
       // not tell that the two entries were related — the relation existed only in a
       // table the normal read path never consults.
       this.db.prepare("UPDATE meta SET value=value+1 WHERE key='revision'").run();
+    this.jobs.enqueue('notify', `revision:${this.revision}`, { revision: this.revision });
       return {
         action: input.action,
         oldRevision: oldEntry.revision, newRevision: newEntry.revision,

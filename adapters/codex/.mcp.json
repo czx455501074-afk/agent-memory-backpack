@@ -1,5 +1,5 @@
 {
-  "description": "Codex MCP stdio transport. Project scope is bound to client credential; session cwd isolation is enforced at the hook boundary.",
+  "description": "Codex MCP transport for the shared AMB library. Credentials bind the library identity; an optional projectRoot restricts hook activation, otherwise all project sessions participate.",
   "mcpServers": {
     "amb": {
       "type": "stdio",

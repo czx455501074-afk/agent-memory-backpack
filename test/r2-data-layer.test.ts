@@ -188,18 +188,19 @@ test('F17：重放失败记录原因与尝试次数，并按退避推迟下一�
    * A payload that cannot succeed, so the replay fails for a real reason rather than
    * because of the clock.
    *
-   * This used to name a workflow that does not exist. M1 deliberately made that case
-   * succeed — an unknown workflow now keeps the candidate as unattributed instead of
-   * refusing it — so the old trigger stopped triggering and the assertions below read
-   * `undefined`. An existing workflow with a step it does not contain still fails
-   * deterministically, which was confirmed against the real store before being used
-   * here (the same run also confirmed the failure path itself was never broken).
+   * The reason has to be a transport-class one. This fixture used to point at a step
+   * the workflow does not contain, which fails with 404 `not_found` — and that is now
+   * terminal on the first attempt, because a refusal of a payload the queue cannot
+   * change can only be repeated. That terminal path is covered in
+   * `test/outbox-replay.test.ts`; what this test is about is the retry path, so an
+   * unreadable payload stands in for a core the adapter cannot reach: it fails on
+   * every attempt and stays retryable.
    */
-  store.import([workflow('flow-a')]);
-  store.enqueue('dsh', {
+  const queued = store.enqueue('dsh', {
     kind: 'candidate', projectId: PROJECT, idempotencyKey: 'will-fail',
-    payload: { idempotencyKey: 'will-fail', projectId: PROJECT, workflowId: 'flow-a', stageId: 'ghost', discovery: '指向不存在的步骤。' },
+    payload: { idempotencyKey: 'will-fail', projectId: PROJECT, discovery: '核心不可达时入队的候选。' },
   });
+  store.db.prepare('UPDATE outbox SET payload=? WHERE id=?').run('{not json', queued.id);
 
   const first = store.replayOutbox({ projectId: PROJECT });
   assert.equal(first.attempted, 1);
@@ -210,7 +211,7 @@ test('F17：重放失败记录原因与尝试次数，并按退避推迟下一�
   assert.equal(status.pending, 0);
   assert.equal(status.failed, 1, '失败条目可查询');
   assert.equal(status.due, 0, '退避期内不再是"可尝试"');
-  assert.match(String(status.items[0]?.lastError), /ghost|no stage|unavailable/, '失败原因可查询');
+  assert.match(String(status.items[0]?.lastError), /JSON|Unexpected|token/i, '失败原因可查询');
 
   // Still inside the backoff window: the item is not attempted again.
   const tooSoon = store.replayOutbox({ projectId: PROJECT });

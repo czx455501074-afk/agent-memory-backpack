@@ -288,7 +288,7 @@ test('F10: 技能导出写入 references/ 正文、跳过 ready=false 失效父�
     const skillFolder = Object.keys(marker.skills).find(k => marker.skills[k].id === 'skill-ref-test');
     assert.ok(skillFolder);
 
-    const ref1 = join(exportDir, skillFolder, 'references', 'doc1.md');
+    const ref1 = join(exportDir, skillFolder, 'doc1.md');
     const ref2 = join(exportDir, skillFolder, 'references', 'doc2.md');
     assert.equal(existsSync(ref1), true, '叶子1文件必须已写入');
     assert.equal(existsSync(ref2), true, '叶子2文件必须已写入');

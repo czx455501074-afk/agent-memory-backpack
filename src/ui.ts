@@ -44,10 +44,12 @@ export const UI_HTML = `<!DOCTYPE html>
     <button class="tab" data-view="material">临时资料</button>
     <button class="tab" data-view="history">历史追溯</button>
     <button class="tab" data-view="doctor">自检与平台能力</button>
+    <button class="tab" data-view="maintenance">后台任务</button>
+    <button class="tab" data-view="organization">Skill 整理</button>
   </nav>
   <main class="panel" id="panel"><p class="muted">正在读取核心…</p></main>
   <footer class="statusbar">
-    <span>凭据仅保存在本页内存中，不写入磁盘，也不出现在请求日志里。</span>
+    <span>凭据保存在当前标签页的会话存储（sessionStorage）中，关闭标签页时清除；不写入插件配置文件。</span>
     <button id="refresh" class="ghost">刷新</button>
   </footer>
 </div>
@@ -256,7 +258,7 @@ function renderTokenPrompt() {
     '<p class="muted" style="margin:12px 0 20px;">未检测到访问凭据，请输入凭据令牌（Token）：</p>' +
     '<input id="token-input" type="password" placeholder="粘贴 token（可在 ~/.agent-memory-backpack/*.json 查看）" style="width:100%;box-sizing:border-box;padding:8px 12px;margin-bottom:16px;border-radius:4px;border:1px solid var(--border,#333);background:var(--bg-input,#181c24);color:#fff;" />' +
     '<button id="token-save-btn" class="primary" style="padding:8px 24px;cursor:pointer;">连接并保存</button>' +
-    '<p class="muted" style="margin-top:16px;font-size:12px;">凭据仅保存在当前标签页内存中，不写入磁盘。</p>' +
+    '<p class="muted" style="margin-top:16px;font-size:12px;">凭据使用当前标签页的会话存储（sessionStorage），关闭标签页时清除。</p>' +
     '</div>';
   var btn = document.getElementById('token-save-btn');
   if (btn) {
@@ -605,6 +607,11 @@ function showProposalEditor(proposalId) {
       : '<div class="card__path">' + esc(target.reason || '无目标流程') + '</div>';
     var needsEvidence = detail.review && detail.review.constraint
       ? '<div class="card__meta">分级约束：' + esc(detail.review.constraint) + '</div>' : '';
+    var modelReview = detail.modelReview || { status: 'awaiting_model' };
+    var analysis = modelReview.analysis || {};
+    var modelLine = '<div class="card__meta">分析来源：' + esc(modelReview.mode === 'model' ? ('模型 ' + modelReview.model) : '规则分析；等待模型') +
+      '；仅供审阅参考，不代表批准。</div>' + (analysis.summary ? '<p>' + esc(analysis.summary) + '</p>' : '') +
+      (analysis.reasoning ? '<p class="muted">' + esc(analysis.reasoning) + '</p>' : '');
 
     var body = '';
     var formBody = '';
@@ -631,7 +638,7 @@ function showProposalEditor(proposalId) {
       '<span class="card__title">审阅候选：' + esc(detail.id) + '</span>' +
       '<button class="ghost btn-sm" id="pe-cancel">取消</button>' +
       '</div>' +
-      targetLine + needsEvidence +
+      targetLine + needsEvidence + modelLine +
       '<p class="card__body">' + esc(detail.discovery || '') + '</p>' +
       formBody +
       '<div class="form-group"><label>作用范围</label>' +
@@ -936,7 +943,58 @@ function reportError(error) {
     '</div>';
 }
 
+function renderOrganization() {
+  return post('/v1/workflow-drafts/list', {}).then(function(data) {
+    panel.innerHTML = '<h2>Skill 整理</h2><p class="muted">模型依据原文和参考文档生成完整流程草稿。缺少依据的步骤保留待补；批准前核对适用条件与检查项。原 skill 继续同步，来源更新后旧流程停止执行并等待复核。</p>' +
+      '<div class="card"><select id="organize-skill">' + (data.skills || []).map(function(s) { return '<option value="'+esc(s.id)+'">'+esc(s.title)+' @'+esc(s.revision)+'</option>'; }).join('') + '</select> <button id="organize-generate">生成或查看整理任务</button></div>' +
+      (data.drafts || []).map(function(d) { return '<div class="card"><strong>'+esc(d.title || d.skillId)+'</strong> <span class="pill">流程：'+esc(d.workflowStatus || d.state)+'</span> <span class="pill">摘要：'+esc(d.digestStatus || (d.digest?'ready':'pending'))+'</span><p>'+esc((d.digest&&d.digest.summary)||'尚无检索摘要')+'</p><p class="muted">摘要与流程分别整理；摘要仅用于检索，流程状态须单独复核。 '+esc(d.digestError || d.workflowError || '')+'</p><p>'+esc((d.missing || []).join('；'))+'</p><button class="draft-open" data-id="'+esc(d.id)+'">原文与草稿对照</button></div>'; }).join('');
+    panel.querySelector('#organize-generate').addEventListener('click',function() {
+      var select=panel.querySelector('#organize-skill'); if(!select.value)return;
+      post('/v1/workflow-drafts/generate',{skillId:select.value}).then(renderOrganization).catch(reportError);
+    });
+    panel.querySelectorAll('.draft-open').forEach(function(button) { button.addEventListener('click',function() {
+      post('/v1/workflow-drafts/get',{id:button.dataset.id}).then(function(d) {
+        var result=d.result || {};
+        var digest=result.digest || {};
+        var digestHtml='<section class="card"><h3>检索辅助归纳</h3><p class="muted">用于寻找相关知识，非已采纳流程；适用条件仍须核对原文。</p><p><strong>摘要：</strong>'+esc(digest.summary || '尚无归纳')+'</p>' +
+          [['适用场景',digest.whenToUse],['排除条件',digest.exclusions],['别名',digest.aliases],['适用版本',digest.versions]].map(function(row){return '<p><strong>'+esc(row[0])+'：</strong>'+esc((Array.isArray(row[1])?row[1]:[]).join('；') || '未提供')+'</p>';}).join('')+'</section>';
+        panel.innerHTML='<h2>流程草稿对照</h2><p>流程状态：'+esc(d.workflowStatus||d.state)+'；摘要状态：'+esc(d.digestStatus|| (digest.summary?'ready':'pending'))+'。'+(d.state==='approved'?'已审阅采纳，执行前仍须核对来源版本。':'模型结果尚未生效。')+'</p>'+digestHtml+'<h3>完整流程</h3><pre>'+esc(JSON.stringify(result.workflow || null,null,2))+'</pre><h3>逐项来源</h3><pre>'+esc(JSON.stringify(result.grounding || [],null,2))+'</pre><h3>缺项</h3><p>'+esc((result.missing || []).join('；'))+'</p><details><summary>源 skill 与全部参考正文</summary><pre>'+esc(JSON.stringify(d.source,null,2))+'</pre></details><button id="draft-back">返回</button> '+(d.state==='ready_for_review'?'<button class="primary" id="draft-approve">确认已审阅并采纳流程</button>':'');
+        panel.querySelector('#draft-back').addEventListener('click',renderOrganization);
+        if(d.state!=='approved' && d.state!=='stale' && d.result) {
+          var editor=document.createElement('div');
+          editor.innerHTML='<h3>修订抽取内容</h3><p class="muted">只填写有原文依据的流程与引文；缺失条件保留在 missing 中。保存后会重新校验。</p><textarea id="draft-edit" rows="18"></textarea><button id="draft-save">保存并重新校验</button>';
+          panel.appendChild(editor);
+          editor.querySelector('#draft-edit').value=JSON.stringify({workflow:result.workflow,grounding:result.grounding||[],missing:result.missing||[]},null,2);
+          editor.querySelector('#draft-save').addEventListener('click',function() {
+            try {var revised=JSON.parse(editor.querySelector('#draft-edit').value);
+              post('/v1/workflow-drafts/revise',{id:d.id,draft:revised}).then(renderOrganization).catch(reportError);
+            }catch(error){reportError(error);}
+          });
+        }
+        var approve=panel.querySelector('#draft-approve');if(approve)approve.addEventListener('click',function() {
+          post('/v1/workflow-drafts/approve',{id:d.id}).then(renderOrganization).catch(reportError);
+        });
+      }).catch(reportError);
+    }); });
+  });
+}
+function renderMaintenance() {
+  return post('/v1/maintenance/status', {}).then(function (data) {
+    var rows = (data.jobs || []).map(function (job) {
+      return '<tr><td>' + esc(job.kind) + '</td><td>' + esc(job.status) + '</td><td>' + esc(job.attempts) + '</td><td>' + esc(job.error || '—') + '</td><td><button class="job-retry" data-id="' + esc(job.id) + '">重试</button></td></tr>';
+    }).join('');
+    panel.innerHTML = '<h2>后台任务</h2><p class="muted">模型分析、文档导出与版本通知的持久记录。awaiting_model 表示模型尚未完成分析。</p>' +
+      '<table><thead><tr><th>类型</th><th>状态</th><th>尝试次数</th><th>等待或失败原因</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    panel.querySelectorAll('.job-retry').forEach(function (button) {
+      button.addEventListener('click', function () {
+        post('/v1/maintenance/retry', { id: button.dataset.id }).then(renderMaintenance).catch(reportError);
+      });
+    });
+  });
+}
 var RENDERERS = {
+  organization: renderOrganization,
+  maintenance: renderMaintenance,
   status: renderStatus,
   manage: function () { return renderManage('', 'all'); },
   norms: renderNorms,
@@ -1494,7 +1552,7 @@ panel.addEventListener('keydown', function (event) {
 });
 
 if (!token) {
-  panel.innerHTML = notice('缺少凭据。请用已安装插件的运行时执行 node runtime/cli.js ui --data-dir <数据目录>（源码目录则为 node dist/src/cli.js ui）生成带凭据的地址后打开；地址中的凭据只在本页内存中使用。') +
+  panel.innerHTML = notice('缺少凭据。请用已安装插件的运行时执行 node runtime/cli.js ui --data-dir <数据目录>（源码目录则为 node dist/src/cli.js ui）生成带凭据的地址后打开；凭据保存在当前标签页会话存储（sessionStorage）中。') +
     '<div class="card"><div class="card__head"><span class="card__title">如何取得带凭据的地址</span></div>' +
     '<p class="card__body">在插件运行时目录（例如 <code>.dsh/plugins/agent-memory-backpack-test-20261013/runtime</code>）执行：<br>' +
     '<code>node cli.js ui --data-dir &lt;数据目录&gt;</code><br>' +

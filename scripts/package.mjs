@@ -3,8 +3,38 @@ import { dirname, join, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { validateDshClient } from './validate-dsh-client.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+validateDshClient(join(root, 'adapters/dsh'));
+
+/**
+ * Record which commit and which working tree produced this artifact.
+ *
+ * The hashes written below only prove that the artifact matches its own
+ * manifest; they say nothing about the tree it came from, so a source tree that
+ * kept moving after packaging still looks verified. This identity is what makes
+ * "same build" checkable later. Git being unavailable is not a reason to refuse
+ * to pack, so every failure degrades to an explicit null plus the reason.
+ */
+const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+const gitBuildIdentity = () => {
+  const git = args => spawnSync('git', args, { cwd: root, encoding: 'utf8', windowsHide: true });
+  const head = git(['rev-parse', 'HEAD']);
+  const commit = head.status === 0 ? String(head.stdout ?? '').trim().toLowerCase() : '';
+  if (!COMMIT_PATTERN.test(commit)) {
+    const reason = head.error ? head.error.message : (String(head.stderr ?? '').trim() || `exit code ${head.status}`);
+    return { commit: null, worktreeStatus: null, clean: null, worktreeEntryCount: null, unavailable: `git rev-parse HEAD failed: ${reason}` };
+  }
+  const status = git(['status', '--porcelain=v1', '--untracked-files=all']);
+  if (status.status !== 0) {
+    const reason = status.error ? status.error.message : (String(status.stderr ?? '').trim() || `exit code ${status.status}`);
+    return { commit, worktreeStatus: null, clean: null, worktreeEntryCount: null, unavailable: `git status failed: ${reason}` };
+  }
+  const worktreeStatus = String(status.stdout ?? '').replace(/\r\n/g, '\n');
+  const lines = worktreeStatus.split('\n').filter(line => line.trim() !== '');
+  return { commit, worktreeStatus, clean: lines.length === 0, worktreeEntryCount: lines.length, unavailable: null };
+};
 const id = new Date().toISOString().replace(/[-:.TZ]/g, '');
 const out = join(root, 'artifacts', `p0-${id}`);
 if (!existsSync(join(root, 'dist/src/mcp.js'))) throw new Error('Run npm run build first');
@@ -16,17 +46,13 @@ for (const target of ['core', 'codex-plugin']) {
   cpSync(join(root, 'dist/src'), join(dir, 'runtime'), { recursive: true });
   if (target === 'codex-plugin') cpSync(join(root, 'adapters/codex'), dir, { recursive: true });
   // Scripts in the packaged copy point at the packaged layout, so a user can run
-  // the console and the diagnostics without knowing where the artifact put things.
+  // the diagnostics without knowing where the artifact put things.
   const packagedScripts = {
     start: 'node runtime/cli.js serve',
     doctor: 'node runtime/cli.js doctor',
     logs: 'node runtime/cli.js logs',
-    console: 'electron console/main.cjs',
   };
-  writeFileSync(join(dir, 'package.json'), JSON.stringify({
-    ...manifest,
-    scripts: target === 'codex-plugin' ? { ...packagedScripts, console: 'electron ../console/main.cjs' } : packagedScripts,
-  }, null, 2));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ ...manifest, scripts: packagedScripts }, null, 2));
   cpSync(join(root, 'package-lock.json'), join(dir, 'package-lock.json'));
   const npmCli = process.env.npm_execpath;
   if (!npmCli || !existsSync(npmCli) || !statSync(npmCli).isFile() || !npmCli.toLowerCase().endsWith('.js')) {
@@ -64,10 +90,11 @@ cpSync(join(root, 'dist/src'), join(out, 'dsh-plugin/runtime'), { recursive: tru
 // the way out would break that check for no gain, since Node resolves these
 // imports from `node_modules` beside them.
 cpSync(join(out, 'core', 'node_modules'), join(out, 'dsh-plugin', 'node_modules'), { recursive: true });
-// The desktop console ships as source. It is an Electron app, so its runtime is
-// the user's Electron rather than an npm dependency of the core; shipping the
-// source keeps the artifact small and lets the console be updated independently.
-cpSync(join(root, 'console'), join(out, 'console'), { recursive: true });
+// The Electron console is retired and is deliberately not an artifact input. The
+// product has exactly two surfaces: the Tauri desktop app and the DSH native
+// panel. Its source is kept, not shipped, at `console.archived-electron/`; see
+// docs/implementation/electron-deprecation.md. Re-adding a `console` tree here
+// would reinstate a third surface that no longer has an owner.
 cpSync(join(root, 'fixtures/p0-seed.json'), join(out, 'p0-seed.json'));
 const marketplace = { name: 'amb-local', interface: { displayName: 'Agent Memory Backpack P0 Local' }, plugins: [
   { name: 'agent-memory-backpack', source: { source: 'local', path: './codex-plugin' }, policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' }, category: 'Productivity' },
@@ -88,7 +115,7 @@ const addTree = (base, folder) => {
     }
   }
 };
-for (const folder of ['core', 'codex-plugin', 'dsh-plugin', 'console']) addTree(out, folder);
+for (const folder of ['core', 'codex-plugin', 'dsh-plugin']) addTree(out, folder);
 for (const path of ['.agents/plugins/marketplace.json', 'p0-seed.json']) inventory[path] = hashFile(join(out, path));
 const sourceInventory = {};
 const addSourceTree = folder => {
@@ -99,11 +126,10 @@ const addSourceTree = folder => {
     else if (entry.isFile()) sourceInventory[relative(root, child).split(sep).join('/')] = hashFile(child);
   }
 };
-for (const folder of ['dist/src', 'adapters/codex', 'adapters/dsh', 'console']) addSourceTree(folder);
+for (const folder of ['dist/src', 'adapters/codex', 'adapters/dsh']) addSourceTree(folder);
 const copiedPairs = [
   ['dist/src', 'core/runtime'], ['dist/src', 'codex-plugin/runtime'],
   ['adapters/codex', 'codex-plugin'], ['adapters/dsh', 'dsh-plugin'],
-  ['console', 'console'],
 ];
 for (const [sourceDir, artifactDir] of copiedPairs) {
   const sourceBase = join(root, sourceDir);
@@ -121,11 +147,61 @@ for (const [sourceDir, artifactDir] of copiedPairs) {
   };
   verify(sourceBase);
 }
+// Syntax check gate: verify all emitted .js and .mjs files with node --check.
+// Never ship a package containing syntax errors (e.g. invalid regex flags in client scripts).
+const syntaxCheck = dir => {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== 'node_modules') syntaxCheck(full);
+    } else if (entry.isFile() && /\.(?:c?js|mjs)$/i.test(entry.name)) {
+      const res = spawnSync(process.execPath, ['--check', full], { windowsHide: true });
+      if (res.status !== 0) {
+        const err = res.stderr?.toString() || res.stdout?.toString() || `Exit code ${res.status}`;
+        throw new Error(`Syntax verification failed for packaged script ${relative(out, full)}: ${err.trim()}`);
+      }
+    }
+  }
+};
+for (const folder of ['core', 'codex-plugin', 'dsh-plugin']) syntaxCheck(join(out, folder));
+
+// The release scripts themselves are never inside a packaged tree, so the gate
+// above cannot see them, yet they are the scripts that produce and verify a
+// release. A syntax error here escapes the artifact check entirely and is only
+// discovered when the release is already half-run, so they are parsed with the
+// same `node --check`. The list is fixed rather than globbed: it names the
+// scripts a release actually depends on, including the two that package.json
+// points at for local install and uninstall.
+const releaseScripts = [
+  'scripts/package.mjs',
+  'scripts/desktop-accept.mjs',
+  'scripts/deploy-plugin.mjs',
+  'scripts/amb-install.mjs',
+  'scripts/amb-uninstall.mjs',
+];
+for (const releaseScript of releaseScripts) {
+  const file = join(root, releaseScript);
+  if (!existsSync(file)) continue;
+  const res = spawnSync(process.execPath, ['--check', file], { windowsHide: true });
+  if (res.status !== 0) {
+    const err = res.stderr?.toString() || res.stdout?.toString() || `Exit code ${res.status}`;
+    throw new Error(`Syntax verification failed for release script ${releaseScript}: ${err.trim()}`);
+  }
+}
+
+const build = {
+  git: gitBuildIdentity(),
+  node: process.version,
+  packageVersion: manifest.version,
+  packagedAt: new Date().toISOString(),
+};
+
 writeFileSync(join(out, 'artifact-manifest.json'), JSON.stringify({
   format: 'agent-memory-backpack-artifact-hashes-v1', packageVersion: manifest.version,
   sourceFiles: sourceInventory, artifactFiles: inventory,
   copiedTreesVerified: copiedPairs.map(([source, artifact]) => ({ source, artifact })),
+  build,
 }, null, 2));
-writeFileSync(join(root, 'artifacts/latest.json'), JSON.stringify({ directory: out, phase: 'P0', desktopVerified: false }, null, 2));
+writeFileSync(join(root, 'artifacts/latest.json'), JSON.stringify({ directory: out, phase: 'P0', desktopVerified: false, build }, null, 2));
 console.log(`Local artifacts: ${out}`);
 console.log(`Relative artifact root: ${relative(root, out)}`);

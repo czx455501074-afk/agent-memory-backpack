@@ -1,0 +1,34 @@
+{
+  "meta":{"version":3,"frozenAt":"2026-10-15T10:53:00Z","purpose":"Fresh independent holdout after v2 aggregate feedback; never tune against these labels","thresholds":{"precision":0.9,"recall":0.85,"negativeRejection":0.95,"maxTimeoutRate":0.05,"p95Ms":4500,"offlineRecallMustMeetOldHttpBaseline":true}},
+  "documents":[
+    {"id":"skill:quartz-v6","kind":"skill","title":"Quartz v6 附件上传","description":"Quartz v6 使用 multipart 分片上传附件","body":"仅v6。先创建 upload session，再逐块上传最后完成合并。v5不支持此协议。"},
+    {"id":"skill:quartz-v5","kind":"skill","title":"Quartz v5 单文件上传","description":"Quartz v5 上传单个附件，禁止使用 v6 分片会话","body":"仅v5，POST /files 发送完整文件，不支持分片。"},
+    {"id":"skill:violet-clock","kind":"skill","title":"Violet 容器时钟偏差","description":"修复容器时间偏差导致的证书未生效错误","body":"证书报 NET::ERR_CERT_DATE_INVALID 时对照宿主时钟，修复时间同步，不跳过证书验证。"},
+    {"id":"skill:saffron-slide","kind":"skill","title":"Saffron 幻灯片溢出","description":"修复 PPT 文字超出文本框及遮挡图表","body":"按最小可读字号调整排版，逐页渲染查看边界。"},
+    {"id":"memory:pearl-dns","kind":"memory","title":"Pearl DNS 缓存过期问题","body":"Pearl 服务换了IP，浏览器仍去旧机器。确认权威解析正确后，清理本地DNS缓存，核对新地址再访问。"},
+    {"id":"skill:indigo-mask","kind":"skill","title":"Indigo 图像透明蒙版","description":"移除产品照背景生成透明 PNG","body":"精修主体边缘蒙版，输出含alpha通道的PNG，不把白底称为透明。"},
+    {"id":"skill:opal-formula","kind":"skill","title":"Opal 表格绝对引用","description":"修复电子表格公式拖动后固定参数单元格改变","body":"为固定参数使用美元符号锁定行列，再填充公式。"},
+    {"id":"memory:coral-mic","kind":"memory","title":"Coral 麦克风无输入","body":"系统录音无波形。核对应用麦克风权限、设备选择和硬件静音后恢复。"},
+    {"id":"skill:jade-merge","kind":"skill","title":"Jade 表格合并单元格","description":"取消合并单元格后向下填充原值","body":"保留原文件，取消合并，选中空单元格引用上一行并转换为值。"},
+    {"id":"skill:cobalt-cron","kind":"skill","title":"Cobalt 定时任务时区","description":"修正 cron 定时任务因时区不同偏移八小时","body":"明确调度器时区并记录UTC时间，不按本地显示猜测。"},
+    {"id":"skill:ruby-page","kind":"skill","title":"Ruby 长表分页","description":"打印表格时每页重复显示表头","body":"设置打印标题行，检查分页预览。"},
+    {"id":"skill:topaz-image","kind":"skill","title":"Topaz 容器镜像架构","description":"解决 exec format error 的 amd64 和 arm64 架构不匹配","body":"核对宿主与镜像platform，构建相应架构镜像。"},
+    {"id":"memory:weekday-noise","kind":"memory","title":"周末闲记","body":"今天聊天提到了时间、表格、证书、附件、麦克风，这只是词汇登记，不构成任何操作方法。","repeat":150}
+  ],
+  "cases":[
+    {"id":"v3-01","dimension":"version","query":"Quartz v6 的附件上传要怎样建立分片会话","relevant":["skill:quartz-v6"]},
+    {"id":"v3-02","dimension":"unsupported-version","query":"Quartz v9 的分片上传接口","relevant":[]},
+    {"id":"v3-03","dimension":"synonym","query":"Saffron 演示稿里几段字跑到框外压住了统计图，帮我修版面","relevant":["skill:saffron-slide"]},
+    {"id":"v3-04","dimension":"signature","query":"Topaz 容器启动 exec format error，arm64 机器拉了 amd64 镜像","relevant":["skill:topaz-image"]},
+    {"id":"v3-05","dimension":"negation","query":"不要修 DNS 缓存，当前要做 Indigo 产品照背景透明化","relevant":["skill:indigo-mask"]},
+    {"id":"v3-06","dimension":"synonym","query":"Opal 计算表向下复制算式时，税率那个格子的坐标也跟着变了","relevant":["skill:opal-formula"]},
+    {"id":"v3-07","dimension":"multi-positive","query":"检查 Coral 麦克风无输入，并修正 Cobalt cron 时区偏移八小时","relevant":["memory:coral-mic","skill:cobalt-cron"]},
+    {"id":"v3-08","dimension":"confirmation","query":"嗯，这次已经处理妥当了","relevant":[]},
+    {"id":"v3-09","dimension":"negation","query":"附件、时钟和表格都不要处理，我只是列个词表","relevant":[]},
+    {"id":"v3-10","dimension":"exact-id","query":"skill:ruby-page@1","relevant":["skill:ruby-page"]},
+    {"id":"v3-11","dimension":"stale-exact-id","query":"skill:ruby-page@7","relevant":[]},
+    {"id":"v3-12","dimension":"long-diary","query":"周末日记提过证书和麦克风，这里没有故障要排查","relevant":[]},
+    {"id":"v3-13","dimension":"positive","query":"Violet 容器时间偏差使证书报 NET::ERR_CERT_DATE_INVALID","relevant":["skill:violet-clock"]},
+    {"id":"v3-14","dimension":"unrelated","query":"怎么挑选适合阳台种植的草莓品种","relevant":[]}
+  ]
+}

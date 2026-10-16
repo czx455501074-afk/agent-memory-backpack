@@ -1,0 +1,33 @@
+{
+  "protocol": "Labels and cases were written before first evaluation against the frozen automaticRelevance rules. No rule tuning is permitted from these results. Synthetic content only; negatives mean no helpful in-scope guidance, not no shared keywords.",
+  "documents": [
+    {"id":"blind-compose-v1","kind":"skill","title":"Docker Compose 旧版 v1 运维","description":"仅支持 docker-compose 1.x 的容器编排和服务重建；不适用于 Compose v2","body":"在 v1 中使用旧版独立命令。"},
+    {"id":"blind-compose-v2","kind":"skill","title":"Docker Compose v2 运维","description":"适用 Docker Compose v2，使用 docker compose 子命令更新容器服务","body":"先备份卷，再检查 compose config，执行服务更新并验证。"},
+    {"id":"blind-permission","kind":"memory","title":"Linux 文件写入 EACCES","body":"EACCES: permission denied 出现在目标目录归属或权限不正确时。检查运行用户和父目录权限，最小范围修改权限。"},
+    {"id":"blind-unicode","kind":"memory","title":"Windows URL 编码路径 ENOENT","body":"ENOENT 可能由 file URL 直接取 pathname 导致百分号编码未还原。必须使用 fileURLToPath，覆盖中文和空格路径。"},
+    {"id":"blind-keyboard","kind":"skill","title":"网页键盘无障碍","description":"网页界面焦点顺序、键盘导航和屏幕阅读器标签","body":"检查 Tab 顺序，焦点可见性和可访问名称。"},
+    {"id":"blind-backup","kind":"skill","title":"PostgreSQL 备份恢复","description":"PostgreSQL 数据库 pg_dump 备份及恢复演练","body":"记录备份时间，在隔离环境用 pg_restore 验证恢复数据。"},
+    {"id":"blind-dialogue","kind":"skill","title":"人物对白润色","description":"小说人物语言个性、对白潜台词和口语节奏","body":"根据人物动机改写台词。"},
+    {"id":"blind-noisy-diary","kind":"memory","title":"2026-08-16 混合工作日志","body":"完善功能并主动检索，读取参考文件后完成验收。\nDocker Compose v1 与 v2 的词出现在产品选型闲聊里，没有操作结论。\n今天讨论过数据库备份，尚未执行。\nWindows 文件名出现在剧本角色对白里。\n继续确认工作任务完成。\n界面焦点是叙事焦点，不是键盘可访问性。\n","repeat":160}
+  ],
+  "cases": [
+    {"id":"version-v2","query":"Docker Compose v2 更新服务","relevant":["blind-compose-v2"],"dimension":"version applicability"},
+    {"id":"version-v1","query":"docker-compose 1.x 容器服务重建","relevant":["blind-compose-v1"],"dimension":"version applicability"},
+    {"id":"negated-compose","query":"不要查询 Docker Compose，解释量子自旋","relevant":[],"dimension":"negation"},
+    {"id":"negated-backup","query":"这次不做 PostgreSQL 备份，只讨论花卉浇水","relevant":[],"dimension":"negation"},
+    {"id":"synonym-permission","query":"程序没有权限把文件保存到 Linux 目录","relevant":["blind-permission"],"dimension":"paraphrase"},
+    {"id":"synonym-accessibility","query":"让不用鼠标的访客也能顺畅操作页面","relevant":["blind-keyboard"],"dimension":"paraphrase"},
+    {"id":"synonym-dialogue","query":"角色说话太书面，改得自然一点","relevant":["blind-dialogue"],"dimension":"paraphrase"},
+    {"id":"signature-permission","query":"EACCES: permission denied","relevant":["blind-permission"],"dimension":"error signature"},
+    {"id":"signature-unicode","query":"ENOENT fileURLToPath 中文路径","relevant":["blind-unicode"],"dimension":"error signature"},
+    {"id":"exact-keyboard","query":"网页键盘导航 焦点顺序","relevant":["blind-keyboard"],"dimension":"direct purpose"},
+    {"id":"exact-backup","query":"PostgreSQL pg_dump 备份恢复演练","relevant":["blind-backup"],"dimension":"direct purpose"},
+    {"id":"query-unsupported","query":"Rust async Send trait 编译错误","relevant":[],"dimension":"unknown domain"},
+    {"id":"query-filler","query":"完善功能 主动检索 读取参考 完成验收","relevant":[],"dimension":"long diary boilerplate"},
+    {"id":"query-scattered","query":"Docker 数据库 Windows 键盘","relevant":[],"dimension":"scattered domains without task intent"},
+    {"id":"query-confirmation","query":"已经确认，可以继续工作","relevant":[],"dimension":"confirmation"},
+    {"id":"version-unsupported","query":"Docker Compose v3 服务重建","relevant":[],"dimension":"unsupported version"},
+    {"id":"backup-rephrase","query":"数据库灾备演练，要验证 PostgreSQL 数据能还原","relevant":["blind-backup"],"dimension":"paraphrase with domain anchor"},
+    {"id":"leaf-id","query":"blind-unicode@1","relevant":["blind-unicode"],"dimension":"explicit ID"}
+  ]
+}

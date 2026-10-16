@@ -65,11 +65,10 @@ const DESIGNED: Record<'dsh' | 'codex', AdapterCapability['capabilities']> = {
   codex: {
     readNorms: 'yes', autoRetrieve: 'yes', submitCandidate: 'yes',
     collectEvents: 'yes', blockOperations: 'yes', notifyRuleChange: 'yes',
-    // Codex has no session-scoped task association: its hooks are one process per
-    // event, so there is no place to hold "which task is this session doing". The
-    // honest value is `no`, with the workaround named — not `yes` because the API
-    // exists on the core.
-    linkTask: 'no',
+    // Short-lived hooks persist session state on disk; prepare also associates the
+    // session with a task in the shared core. This is a designed capability, not
+    // evidence that the current desktop has loaded and exercised these hooks.
+    linkTask: 'yes',
   },
 };
 
@@ -79,7 +78,7 @@ const NOTES: Record<'dsh' | 'codex', string[]> = {
     'cwd 不在配置项目范围内时，注入与门禁都会被跳过，这是刻意的范围隔离。',
   ],
   codex: [
-    'hook 每个事件是一个短进程，因此无法保存"本会话属于哪个任务"；任务关联需要在会话开始时显式调用。',
+    '任务关联由核心任务记录和 hook 的持久会话状态保存；需要宿主提供 sessionId。此处是代码能力，当前会话是否启用须检查实际 hook 与任务回执。',
     '未信任的 hooks 不会执行：桌面信任状态必须人工确认，插件无法代劳也无法探测。',
     '注入文本由宿主标记为 developer，来源标识以文本前缀 [agent-memory-backpack] 呈现。',
   ],

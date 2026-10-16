@@ -29,6 +29,7 @@ let previousConfig
 let activeFiber
 let activeToolsFiber
 let activeToolsAccessFiber
+let activeWebFiber
 
 function json(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json' })
@@ -118,6 +119,7 @@ async function waitFor(predicate) {
 
 after(async () => {
   if (activeFiber) await activeFiber.dispose()
+  if (activeWebFiber) await activeWebFiber.dispose()
   if (activeToolsAccessFiber) await activeToolsAccessFiber.dispose()
   if (activeToolsFiber) await activeToolsFiber.dispose()
   if (server?.listening) {
@@ -163,16 +165,63 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
   const toolsFiber = base.plugin({ name: 'p0-test-tools', apply(ctx) { ctx.provide('tools', tools) } })
   await toolsFiber
   activeToolsFiber = toolsFiber
+  // Provided before the adapter loads, so ctx.inject(['webServer']) resolves while
+  // apply runs and the route test does not depend on late-arrival semantics.
+  const webServer = { registrations: [], register(options) { this.registrations.push(options); return () => {} } }
+  const webFiber = base.plugin({ name: 'p0-test-web-server', apply(ctx) { ctx.provide('webServer', webServer) } })
+  await webFiber
+  activeWebFiber = webFiber
   const ctx = base
   const fiber = ctx.plugin(adapter.default)
   await fiber
   activeFiber = fiber
 
   assert.deepEqual([...registeredTools.keys()].sort(), [
-    'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
-    'amb_read_stage', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
-    'amb_submit_experience', 'amb_supersede_experience', 'amb_unstructured_skills',
+    'amb_checkpoint_task', 'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
+    'amb_read_stage', 'amb_save_material', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
+    'amb_submit_experience', 'amb_supersede_experience', 'amb_task_activity', 'amb_unstructured_skills',
   ])
+
+  // /amb/ui-url and /amb/config are gone: they existed to hand an embedded
+  // document the core address plus its credential, and the native panel replaced
+  // that document. The upstream half is asserted here, and the consumer half in
+  // dsh-client-syntax.test.mjs, which fails if client.js ever asks for an address
+  // again. A route that no longer exists must not be answered, and the prefix must
+  // not fall back to something that still hands out the credential.
+  const route = webServer.registrations.find(entry => entry.path === '/amb')
+  assert.ok(route, '适配器必须注册 /amb 前缀路由')
+  assert.equal(route.kind, 'prefix')
+  const callRoute = (url) => {
+    const captured = {}
+    route.handler({ url }, {
+      writeHead(status, headers) { captured.status = status; captured.headers = headers },
+      end(body) { captured.body = body },
+    })
+    return captured
+  }
+  for (const retired of ['/amb/ui-url', '/amb/config']) {
+    const gone = callRoute(retired)
+    assert.equal(gone.status, 404, `${retired} 已随内嵌页面下线，不得再被应答`)
+    assert.equal(gone.body, undefined, `${retired} 不得返回任何响应体`)
+  }
+  // The prefix is a token boundary: no response it serves may carry a wildcard
+  // CORS grant, because a wildcard would let any page read whatever the route
+  // answers. The retired address routes were the only ones that ever returned the
+  // credential, so this also pins down that nothing took their place.
+  const retired = callRoute('/amb/ui-url')
+  assert.equal(retired.headers['Access-Control-Allow-Origin'], undefined, 'CORS 不得回落为通配')
+  const unmapped = callRoute('/amb/other')
+  assert.equal(unmapped.status, 404)
+  assert.equal(unmapped.body, undefined)
+  assert.equal(unmapped.headers['Access-Control-Allow-Origin'], undefined, '未映射路径同样不得携带通配 CORS')
+  // The three data routes the native panel reads are not this test's subject (its
+  // own suite covers them end to end), but the one property that belongs to this
+  // prefix's boundary is checked here: a panel response must never carry a CORS
+  // grant either. The assertion is intentionally weak about the body so a change
+  // to the data payload cannot make this boundary check fail for the wrong reason.
+  const panelRoute = callRoute('/amb/summary')
+  assert.notEqual(panelRoute.status, 404, '面板数据路由必须存在')
+  assert.equal(panelRoute.headers['Access-Control-Allow-Origin'], undefined, '面板数据响应不得携带通配 CORS')
 
   const injected = []
   const agent = {

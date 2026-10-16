@@ -147,6 +147,7 @@ test("prepare accepts a managed response with an empty context", async () => {
 
 test("UserPromptSubmit sends the configured project and returns official hook context output", async () => {
   const service = await startServer((request, response) => {
+    if (request.url === '/v1/knowledge/search-universal') return json(response, 200, { results: [], knowledgeRevision: 7 });
     assert.equal(request.url, "/v1/prepare");
     json(response, 200, {
       protocolVersion: 1,
@@ -178,7 +179,7 @@ test("UserPromptSubmit sends the configured project and returns official hook co
       additionalContext: "[agent-memory-backpack]\nUse workflow alpha.",
     },
   });
-  assert.equal(service.requests.length, 1);
+  assert.equal(service.requests.length, 2);
   assert.equal(service.requests[0].headers["x-amb-protocol"], "1");
   assert.equal(service.requests[0].authorization, `Bearer ${TEST_TOKEN}`);
   assert.deepEqual(service.requests[0].body, {
@@ -188,6 +189,64 @@ test("UserPromptSubmit sends the configured project and returns official hook co
     query: "Find the right workflow",
   });
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(TEST_TOKEN));
+});
+
+test('Codex real core: prompt automatically reads body and Stop saves one unverified journal with a retrievable receipt', async () => {
+  const { Store } = await import('../dist/src/store.js');
+  const { createCoreServer } = await import('../dist/src/server.js');
+  const store = new Store(':memory:');
+  const body = 'Resolve foobar by checking its installed path before retrying.';
+  store.import([{ id: 'recall-fixture', kind: 'memory', title: 'foobar recovery', scope: { kind: 'global' },
+    baseRevision: 0, provenance: 'user', body }]);
+  const server = createCoreServer(store, { protocolVersion: 1, port: 47631,
+    clients: [{ id: 'codex', token: TEST_TOKEN, projectId: 'project-fixture' }] });
+  await new Promise(done => server.listen(0, '127.0.0.1', done));
+  servers.add(server);
+  const config = await createConfig(`http://127.0.0.1:${server.address().port}`, { projectRoot: null });
+  const env = { AMB_LOG_DIR: dirname(config) };
+  const prompt = await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'automatic-loop', prompt: 'foobar' }, config, env);
+  assert.match(parseStdout(prompt).hookSpecificOutput.additionalContext, new RegExp(body.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const continued = await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'automatic-loop', prompt: '继续' }, config, env);
+  assert.match(parseStdout(continued).hookSpecificOutput.additionalContext, /checking its installed path/,
+    'A short continuation recalls the previous meaningful task query');
+  const unbound = await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'fresh-unbound', prompt: '好的' }, config, env);
+  assert.doesNotMatch(parseStdout(unbound).hookSpecificOutput.additionalContext, /recall-fixture|checking its installed path|AMB 自动检索并读取/,
+    'An unbound confirmation must inject only standing norms, never arbitrary library contents');
+  const stop = { hook_event_name: 'Stop', session_id: 'automatic-loop' };
+  assert.equal((await runHook(stop, config, env)).status, 0);
+  const first = store.searchUniversal('project-fixture', '', 'journal');
+  assert.equal(first.length, 1);
+  assert.equal(store.readKnowledge('project-fixture', first[0].id).outcome, 'unverified');
+  const revision = store.revision;
+  assert.equal((await runHook(stop, config, env)).status, 0);
+  assert.equal(store.revision, revision, 'Repeated Stop of one turn must not create new journal revisions');
+  const log = readFileSync(join(dirname(config), 'amb-plugin.log.jsonl'), 'utf8');
+  assert.match(log, /knowledge.auto_recall/);
+  assert.match(log, /readIds.*recall-fixture/);
+  assert.match(log, /journal.persisted/);
+  assert.doesNotMatch(log, new RegExp(TEST_TOKEN));
+  store.close();
+});
+
+test('Codex retries queued delivery in the same session after the initial startup replay', async () => {
+  let replayed = 0;
+  const service = await startServer((request, response) => {
+    if (request.url === '/health') return json(response, 200, { status: 'ok', protocolVersion: 1 });
+    if (request.url === '/v1/outbox/replay') { replayed++; return json(response, 200, { attempted: replayed === 1 ? 0 : 1, delivered: [], failed: [] }); }
+    if (request.url === '/v1/prepare') return json(response, 200, { protocolVersion: 1, knowledgeRevision: 1,
+      mode: 'Managed', norms: [], workflows: [], context: '' });
+    if (request.url === '/v1/events') return json(response, 503, { message: 'transient' });
+    if (request.url === '/v1/outbox/enqueue') return json(response, 200, { id: 'outbox-1', queued: true });
+    if (request.url === '/v1/knowledge/search-universal') return json(response, 200, { results: [] });
+    json(response, 404, { message: 'missing' });
+  });
+  const config = await createConfig(service.endpoint);
+  const session_id = 'same-session-recovery';
+  assert.equal((await runHook({ hook_event_name: 'SessionStart', session_id }, config)).status, 0);
+  assert.equal(replayed, 1);
+  assert.equal((await runHook({ hook_event_name: 'PostToolUse', session_id, tool_name: 'read' }, config)).status, 0);
+  assert.equal((await runHook({ hook_event_name: 'UserPromptSubmit', session_id, prompt: 'continue' }, config)).status, 0);
+  assert.equal(replayed, 2, 'A completed startup replay must not permanently suppress future retries');
 });
 
 test("prepare truncates retrieval text to 4000 characters while preserving session identity", async () => {
@@ -361,6 +420,25 @@ test("PostToolUse records a short event without forwarding tool input or output"
   assert.doesNotMatch(service.requests[0].bodyText, new RegExp(TEST_TOKEN));
 });
 
+test('global Codex hook captures structured failure, with stable retry key and no raw output', async () => {
+  const service = await startServer((request, response) => {
+    if (request.url === '/v1/proposals') return json(response, 200, { id: 'captured', state: 'pending', duplicate: false });
+    return json(response, 200, { id: 'event', stored: true, duplicate: false });
+  });
+  const config = await createConfig(service.endpoint, { projectRoot: null });
+  const input = { hook_event_name: 'PostToolUse', cwd: tmpdir(), session_id: 'outside-project',
+    tool_name: 'Bash', tool_response: { exit_code: 2, output: 'PRIVATE OUTPUT' } };
+  for (let i = 0; i < 2; i++) {
+    const result = await runHook(input, config);
+    assert.equal(result.status, 0, result.stderr);
+  }
+  const proposals = service.requests.filter(r => r.url === '/v1/proposals');
+  assert.equal(proposals.length, 2);
+  assert.equal(proposals[0].body.idempotencyKey, proposals[1].body.idempotencyKey);
+  assert.match(proposals[0].body.discovery, /exit_code=2/);
+  assert.doesNotMatch(proposals[0].body.discovery, /PRIVATE OUTPUT/);
+});
+
 test("Stop records only turn_stopped and returns no task completion claim", async () => {
   const service = await startServer((request, response) => {
     json(response, 200, { id: "event-fixture", stored: true, duplicate: false });
@@ -490,13 +568,21 @@ test("non-loopback endpoints are rejected before any request", async () => {
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(TEST_TOKEN));
 });
 
-test("F06: Codex hook 透传核心结构化错误（code/message），不再只剩 HTTP 409", async () => {
+test("F06: Codex hook 透传核心结构化错误（code + 业务 message），并剥离凭据类内容", async () => {
   // F06 covered the DSH adapter and the Codex hook alike; the hook change was
-  // otherwise untested. A structured 4xx must reach the adapter log with the code
-  // and message intact, not as a bare status, so a later diagnosis can tell a
+  // otherwise untested. A structured 4xx must reach the adapter log with its
+  // controlled code and its actionable message, so a later diagnosis can tell a
   // missing dependency from a transient fault.
+  //
+  // The message survives only after sanitizing: credential-shaped content (the
+  // configured token, a Bearer header, `password=`/`token=` pairs, long base64 or
+  // hex blobs) is replaced with [redacted], because the log and the host's stderr
+  // are read by people and by later agents.
   const service = await startServer((_request, response) =>
-    json(response, 409, { code: "dependency_unavailable", message: "Required dependency realistic-prerequisite@1 is not current" }),
+    json(response, 409, {
+      code: "dependency_unavailable",
+      message: `Required dependency realistic-prerequisite@1 is not current; Bearer ${"c".repeat(48)} token=${TEST_TOKEN}`,
+    }),
   );
   const config = await createConfig(service.endpoint);
   const result = await runHook(
@@ -510,6 +596,10 @@ test("F06: Codex hook 透传核心结构化错误（code/message），不再只�
   const logPath = join(dirname(config), "amb-plugin.log.jsonl");
   assert.ok(existsSync(logPath), "适配器必须写出日志文件");
   const logText = readFileSync(logPath, "utf8");
-  assert.match(logText, /dependency_unavailable/, "错误日志必须保留核心错误码");
+  assert.match(logText, /dependency_unavailable/, "错误日志必须保留受控的核心错误码");
   assert.match(logText, /realistic-prerequisite@1/, "错误日志必须保留可执行的缺失依赖信息");
+  assert.match(logText, /\[redacted\]/, "凭据类内容必须替换为占位符");
+  assert.doesNotMatch(logText, /c{40}/, "长 base64 串严禁写入日志");
+  assert.doesNotMatch(logText, new RegExp(TEST_TOKEN), "配置 token 严禁写入日志");
+  assert.doesNotMatch(result.stdout + result.stderr, /c{40}/, "长 base64 串严禁回显到宿主输出");
 });

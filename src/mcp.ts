@@ -2,7 +2,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { CoreClient, assertGateResponse, assertPrepareResponse } from './client.js';
-import { readClientConfig } from './config.js';
+import { readClientConfig, resolveConfigPath } from './config.js';
+import { dirname } from 'node:path';
+import { Logger } from './log.js';
 import { identifier, workflowSchema } from './schema.js';
 import { pluginVersion } from './doctor.js';
 
@@ -11,15 +13,21 @@ import { pluginVersion } from './doctor.js';
  * Extends `identifier` to allow an optional `@<digits>` revision suffix
  * while preserving character set restrictions (no slashes, whitespace, or path traversal).
  */
-const referenceId = z.string().min(1).max(140).regex(/^[\p{L}\p{N}_.:-]+(@\d{1,9})?$/u);
+const referenceId = z.string().min(1).max(140).regex(/^[^\s]+(@\d{1,9})?$/);
 
-export function createMcp(client: CoreClient) {
+export function createMcp(client: CoreClient, logger?: Logger) {
   const server = new McpServer({ name: 'agent-memory-backpack', version: '0.1.0-p0.1' });
   const call = async (path: string, args: Record<string, unknown>, validate?: (value: unknown) => Record<string, unknown>) => {
     try {
       const result = await client.post(path, args);
+      logger?.info('knowledge.call', { adapter: 'codex', path, projectId: client.projectId,
+        ...(path === '/v1/proposals' ? { proposalId: result.id, state: result.state } : {}),
+        ...(path === '/v1/knowledge/read' ? { knowledgeId: args.knowledgeId } : {}) });
       return { content: [{ type: 'text' as const, text: JSON.stringify(validate ? validate(result) : result) }] };
-    } catch (error) { return { isError: true, content: [{ type: 'text' as const, text: (error as Error).message }] }; }
+    } catch (error) {
+      logger?.warn('knowledge.failed', { adapter: 'codex', path, projectId: client.projectId });
+      return { isError: true, content: [{ type: 'text' as const, text: (error as Error).message }] };
+    }
   };
   /**
    * Self-check, so the agent can explain a failure instead of guessing.
@@ -72,6 +80,7 @@ export function createMcp(client: CoreClient) {
   server.registerTool('amb_search_universal', {
     description: 'Search across all knowledge entries (skills, norms, workflows, memories, journals) by free-text query with optional kind and limit filters.',
     inputSchema: {
+      literal: z.boolean().optional().describe('Use literal full-text search instead of model relevance selection.'),
       query: z.string().max(4000).default(''),
       kind: z.string().max(100).optional(),
       limit: z.number().int().positive().max(200).optional(),
@@ -115,6 +124,29 @@ export function createMcp(client: CoreClient) {
     description: 'List adopted skills that still hold their original text and have not been structured into a workflow.',
     inputSchema: {}, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/unstructured', args));
+  server.registerTool('amb_checkpoint_task', {
+    description: 'Persist task progress and a factual journal. Use paused for an interrupted turn. Completed requires verified text and verifiable evidence. Return the durable journal receipt.',
+    inputSchema: { taskId: identifier.optional(), sessionId: z.string().min(1).max(256).optional(),
+      title: z.string().min(1).max(2000).optional(), idempotencyKey: identifier.optional(),
+      status: z.enum(['in_progress', 'paused', 'completed', 'failed', 'cancelled']).default('paused'),
+      summary: z.string().max(2000).optional(), notes: z.string().max(4000).optional(),
+      unfinished: z.array(z.string().min(1).max(2000)).max(50).optional(),
+      verified: z.string().max(2000).optional(), evidence: z.enum(['verifiable', 'self-reported', 'unverifiable']).optional(),
+      files: z.array(z.string().min(1).max(2000)).max(100).optional(),
+      relatedExperiences: z.array(identifier).max(100).optional(), relatedProposals: z.array(identifier).max(100).optional(),
+    }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, args => call('/v1/tasks/checkpoint', args));
+  server.registerTool('amb_task_activity', {
+    description: 'Inspect the task, recorded events, proposal receipts and persisted journal for a task or session.',
+    inputSchema: { taskId: identifier.optional(), sessionId: z.string().min(1).max(256).optional() },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, args => call('/v1/tasks/activity', args));
+  server.registerTool('amb_save_material', {
+    description: 'Save an external reference as expiring material, with its source URL and optional task. Material never becomes a behavioral rule.',
+    inputSchema: { id: identifier, title: z.string().min(1).max(2000), url: z.string().min(1).max(2000),
+      summary: z.string().min(1).max(2000), body: z.string().max(60000).optional(), taskId: identifier.optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, args => call('/v1/material/save', args));
   server.registerTool('amb_submit_experience', {
     description: 'Submit a candidate experience with its parent workflow and observed revision. Provide verbatim discovery insight text without conversational framing or platform prefixes to preserve cross-client deduplication. Reuse idempotencyKey only for an identical retry.',
     inputSchema: {
@@ -123,6 +155,7 @@ export function createMcp(client: CoreClient) {
       workflowId: identifier.optional(),
       baseRevision: z.number().int().positive().optional(),
       taskId: identifier.optional(),
+      evidence: z.string().trim().max(4000).optional().describe('Observed verification evidence such as test pass output, command exit code, or verified facts'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, args => call('/v1/proposals', args));
@@ -167,7 +200,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // per-request scope enforcement is complete without it. See `CoreClient.post`.
   try {
     assertSupportedNodeVersion();
-    await createMcp(new CoreClient(readClientConfig(undefined, 'codex'))).connect(new StdioServerTransport());
+    const logger = new Logger(dirname(resolveConfigPath('codex').path), { fileName: 'amb-plugin.log.jsonl' });
+    await createMcp(new CoreClient(readClientConfig(undefined, 'codex')), logger).connect(new StdioServerTransport());
   }
   catch (error) { console.error((error as Error).message); process.exitCode = 1; }
 }

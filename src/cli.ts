@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +22,7 @@ import {
 } from './service.js';
 import { exportSkills } from './export-skills.js';
 import { defaultArchiveName, exportArchive, importArchive, inspectArchive } from './archive.js';
+import { createMaintenanceWorker } from './maintenance.js';
 
 /**
  * Command help.
@@ -808,12 +810,15 @@ try {
       process.once('exit', releaseOnExit);
 
       const server = createCoreServer(store, config);
+      const maintenance = createMaintenanceWorker(store, dir, config.clients.map(client=>client.projectId));
+      const maintenanceTimer = setInterval(() => { void maintenance.tick().catch(() => {}); }, 10000);
+      maintenanceTimer.unref();
       const cleanup = setInterval(() => store.cleanup(), 60000); cleanup.unref();
       // Persisted scan roots let a timer-driven rescan know what to walk; without
       // them the periodic job has nothing to do and stays a no-op.
       const configuredRoots = values.roots
         ? store.setScanRoots(String(values.roots).split(',').map(root => root.trim()).filter(Boolean))
-        : store.scanRoots();
+        : store.scanRoots().length ? store.scanRoots() : store.setScanRoots(defaultScanRoots());
       if (values['rescan-interval'] !== undefined) store.setRescanInterval(Number(values['rescan-interval']));
 
       // Run log: version stamps make an old log interpretable after an update,
@@ -842,7 +847,6 @@ try {
       // and failures are reported without killing the core.
       const rescanTimer = setInterval(() => {
         if (!store.rescanDue()) return;
-        if (configuredRoots.length === 0) { store.markRescanned(); return; }
         try {
           const outcome = applyRescan(store, configuredRoots);
           logger.info('rescan.done', {
@@ -861,12 +865,14 @@ try {
       }, 60000); rescanTimer.unref();
 
       server.once('error', (error: Error) => {
+        maintenance.stop(); clearInterval(maintenanceTimer);
         clearInterval(cleanup); clearInterval(rescanTimer); store.close();
         logger.error('core.listen_failed', { code: (error as NodeJS.ErrnoException).code, message: error.message });
         console.error('Cannot start core. Check whether this configured port is already in use.');
         process.exitCode = 1;
       });
       server.listen(config.port, '127.0.0.1', () => {
+        void maintenance.tick().catch(() => {});
         logger.info('core.listening', { port: config.port, knowledgeRevision: store.revision, rescanRoots: configuredRoots.length });
         console.log(`P0 core listening on http://127.0.0.1:${config.port}; desktop integration remains unverified.`);
         if (configuredRoots.length) {
@@ -876,6 +882,7 @@ try {
         console.log(`Run log: ${logger.file}`);
       });
       const stop = () => {
+        maintenance.stop(); clearInterval(maintenanceTimer);
         logger.info('core.stopping', { knowledgeRevision: store.revision });
         clearInterval(cleanup); clearInterval(rescanTimer);
         // The lock goes with the process, in the order a restart expects: released

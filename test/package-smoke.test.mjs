@@ -144,3 +144,41 @@ test('packaged core CLI and MCP run from a Chinese whitespace fixture directory'
     await stopChild(serve.child);
   }
 });
+
+/**
+ * The artifact hashes only prove the artifact matches its own manifest. Without
+ * a recorded build identity an artifact produced from a tree that kept changing
+ * afterwards is still "verified", so these are asserted on the source text: the
+ * packaging script must record the commit and the worktree state, and it must
+ * syntax-check the release scripts that never appear inside a packaged tree.
+ */
+test('打包脚本记录 git 构建身份，并对发布脚本执行语法门', () => {
+  const source = readFileSync(resolve('scripts', 'package.mjs'), 'utf8');
+
+  // A commit is recorded as a 40-hex digest; anything else is treated as absent.
+  assert.ok(source.includes('[0-9a-f]{40}'), '必须把 commit 约束为 40 位十六进制');
+  assert.ok(source.includes("'rev-parse'") && source.includes("'HEAD'"), '必须用 git rev-parse HEAD 采集提交');
+  assert.ok(source.includes('--porcelain=v1') && source.includes('--untracked-files=all'),
+    '必须采集完整工作树状态（含未跟踪文件）');
+  assert.ok(source.includes('worktreeStatus'), '必须记录工作树状态字段');
+  assert.ok(/clean:\s/.test(source), '必须派生 clean 布尔值');
+  assert.ok(source.includes('unavailable'), 'git 不可用时必须降级为可读原因，而不是中断打包');
+
+  // Both files a later verification reads carry the same identity.
+  assert.match(source, /artifact-manifest\.json[\s\S]{0,400}\bbuild,/, '产物清单必须写入 build 身份');
+  assert.match(source, /latest\.json[\s\S]{0,300}\bbuild\b/, 'latest.json 必须写入 build 身份');
+  for (const field of ['node: process.version', 'packageVersion: manifest.version', 'packagedAt: new Date().toISOString()']) {
+    assert.ok(source.includes(field), `build 身份必须包含 ${field}`);
+  }
+
+  // The packaged-tree gate must stay exactly as strong as it was.
+  assert.ok(source.includes("for (const folder of ['core', 'codex-plugin', 'dsh-plugin', 'console']) syntaxCheck(join(out, folder));"),
+    '产物 node --check 门不得被削弱');
+
+  // Release scripts live outside every packaged tree, so they need their own gate.
+  for (const script of ['scripts/package.mjs', 'scripts/desktop-accept.mjs', 'scripts/deploy-plugin.mjs', 'scripts/amb-install.mjs', 'scripts/amb-uninstall.mjs']) {
+    assert.ok(source.includes(`'${script}'`), `发布脚本清单必须包含 ${script}`);
+  }
+  assert.match(source, /releaseScripts[\s\S]{0,800}\['--check', file\]/, '发布脚本必须逐个通过 node --check');
+});
+

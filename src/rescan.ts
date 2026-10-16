@@ -44,7 +44,7 @@ export function candidateToKnowledge(candidate: AdoptedCandidate): Knowledge {
   if (candidate.kind === 'journal') {
     return {
       ...base, kind: 'journal',
-      did: candidate.body.slice(0, 2000),
+      did: candidate.body,
       problems: '', experienceLanded: [], outcome: 'unverified' as const, unfinished: [],
     };
   }

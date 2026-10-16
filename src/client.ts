@@ -28,6 +28,29 @@ export function isWithinProject(projectRoot: string, cwd: string): boolean {
  */
 const CORE_PATH = /^\/v1\/[a-z]+(?:\/[a-z-]+)*$/;
 
+export type CoreClientErrorKind =
+  | 'timeout'
+  | 'cancelled'
+  | 'network'
+  | 'transport'
+  | 'protocol'
+  | 'http4xx'
+  | 'http5xx'
+  | 'capacity';
+
+export class CoreClientError extends Error {
+  constructor(
+    message: string,
+    readonly kind: CoreClientErrorKind,
+    readonly code: string,
+    readonly status?: number,
+    cause?: unknown,
+  ) {
+    super(message, { cause });
+    this.name = 'CoreClientError';
+  }
+}
+
 export class CoreClient {
   private readonly config: ClientConfig;
   constructor(config: ClientConfig, readonly adapter: 'codex' | 'dsh' | 'admin' = 'codex') { this.config = clientSchema.parse(config); }
@@ -42,7 +65,7 @@ export class CoreClient {
    * enough to tell a configured token from an empty or truncated one.
    */
   get tokenShape() { return `${this.config.token.length} characters; value not printed`; }
-  async post(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async post(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
     if (!CORE_PATH.test(path)) throw new Error('Unsupported core path');
     /**
      * No `cwd ⊆ projectRoot` check here, and the absence is deliberate.
@@ -62,29 +85,41 @@ export class CoreClient {
      * the working directory comes from the tool-invocation payload and is meaningful.
      * DSH likewise checks its session cwd. Those are not affected by this change.
      */
+    const timeoutSignal = AbortSignal.timeout(4500);
+    const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     let response: Response;
     try {
       response = await fetch(`${this.config.endpoint.replace(/\/$/, '')}${path}`, {
-        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(4500),
+        method: 'POST', redirect: 'error', signal: requestSignal,
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.config.token}`, 'x-amb-protocol': '1' },
         body: JSON.stringify({
           ...body,
           projectId: this.config.projectId,
         }),
       });
-    } catch {
-      throw new Error('Agent Memory Backpack core unavailable. Governance could not be checked.');
+    } catch (cause) {
+      const name = cause instanceof Error ? cause.name : '';
+      const kind: CoreClientErrorKind = name === 'TimeoutError' && timeoutSignal.aborted && timeoutSignal.reason === cause
+        ? 'timeout'
+        : name === 'AbortError' && signal?.aborted
+          ? 'cancelled'
+          : cause instanceof TypeError ? 'network' : 'transport';
+      const code = kind === 'timeout' ? 'request_timeout'
+        : kind === 'cancelled' ? 'request_cancelled'
+          : kind === 'network' ? 'network_error' : 'transport_error';
+      throw new CoreClientError('Agent Memory Backpack core unavailable. Governance could not be checked.', kind, code, undefined, cause);
     }
     let result: Record<string, unknown>;
-    try { result = await response.json() as Record<string, unknown>; } catch { throw new Error('Agent Memory Backpack core returned an invalid response'); }
+    try { result = await response.json() as Record<string, unknown>; } catch (cause) {
+      throw new CoreClientError(`Agent Memory Backpack core returned an invalid response (${response.status}, invalid_response)`, 'protocol', 'invalid_response', response.status, cause);
+    }
     if (!response.ok) {
-      // The core's message is carried through when present. A bare status code
-      // leaves an agent with nothing to act on, and for a refusal such as
-      // "this needs the admin credential, submit a candidate instead" the message
-      // *is* the guidance.
-      const code = String(result.code ?? 'unknown');
-      const detail = typeof result.message === 'string' && result.message ? `: ${result.message}` : '';
-      throw new Error(`Agent Memory Backpack request rejected (${response.status}, ${code})${detail}`);
+      const structuredCode = typeof result.code === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(result.code)
+        ? result.code : undefined;
+      const code = structuredCode ?? (response.status === 507 ? 'capacity_exhausted' : response.status >= 500 ? 'http5xx' : 'http4xx');
+      const kind: CoreClientErrorKind = response.status === 507
+        ? 'capacity' : response.status >= 500 ? 'http5xx' : 'http4xx';
+      throw new CoreClientError(`Agent Memory Backpack request rejected (${response.status}, ${code})`, kind, code, response.status);
     }
     return result;
   }

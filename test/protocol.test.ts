@@ -10,7 +10,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { Store } from '../src/store.js';
 import { createCoreServer } from '../src/server.js';
 import { normSchema, workflowSchema } from '../src/schema.js';
-import { CoreClient } from '../src/client.js';
+import { CoreClient, CoreClientError } from '../src/client.js';
 
 const token = 'a'.repeat(64), dshToken = 'b'.repeat(64), adminToken = 'c'.repeat(64);
 async function fixture() {
@@ -101,9 +101,9 @@ test('built stdio MCP connects using official SDK and exposes read/candidate too
     await client.connect(transport);
     const names = (await client.listTools()).tools.map(t => t.name).sort();
     assert.deepEqual(names, [
-      'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
-      'amb_read_stage', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
-      'amb_submit_experience', 'amb_supersede_experience', 'amb_unstructured_skills',
+      'amb_checkpoint_task', 'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
+      'amb_read_stage', 'amb_save_material', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
+      'amb_submit_experience', 'amb_supersede_experience', 'amb_task_activity', 'amb_unstructured_skills',
     ]);
     const result = await client.callTool({ name: 'amb_prepare', arguments: { query: 'P0' } });
     assert.equal(result.isError, undefined);
@@ -156,6 +156,9 @@ test('every exposed MCP tool actually works end to end', async () => {
     await invoke('amb_search_universal', { query: 'audit' }, t => t.includes('results'));
     await invoke('amb_read_stage', { workflowId: 'audit-wf', stageId: 'step' }, t => t.includes('audit-wf'));
     await invoke('amb_submit_experience', { idempotencyKey: 'mcp1', discovery: 'Only a candidate' }, t => t.includes('pending'));
+    await invoke('amb_checkpoint_task', { sessionId: 'mcp-loop', title: 'MCP闭环验收', status: 'paused', summary: '已记录进展，尚未宣称完成', idempotencyKey: 'mcp-checkpoint-1' }, t => t.includes('journalId') && t.includes('stored'));
+    await invoke('amb_task_activity', { sessionId: 'mcp-loop' }, t => t.includes('MCP闭环验收') && t.includes('journal'));
+    await invoke('amb_save_material', { id: 'mcp-material', title: '测试参考资料', url: 'https://example.org/reference', summary: '仅用于隔离验收的合成资料' }, t => t.includes('mcp-material'));
 
     // These use nested paths: the exact set the whitelist used to reject. Each
     // asserts the specific business rejection, so a parameter or routing error
@@ -166,7 +169,7 @@ test('every exposed MCP tool actually works end to end', async () => {
     // Supersede changes the effective library, so an adapter credential must be
     // refused and pointed at the candidate flow instead of writing directly.
     await invoke('amb_supersede_experience', { oldId: 'a', newId: 'b', reason: 'r', evidence: 'e' },
-      t => t.includes('admin credential') && t.includes('candidate'));
+      t => t.includes('403, forbidden'));
 
     // Self-check must work end to end and must not leak the credential.
     const selfCheck = await invoke('amb_self_check', {}, t => t.includes('\\"ok\\":true'));
@@ -179,6 +182,107 @@ test('every exposed MCP tool actually works end to end', async () => {
 
     assert.deepEqual([...failures], [], '所有工具都必须真实可用，不能只在名字上存在');
   } finally { await client.close(); await f.close(); }
+});
+
+test('CoreClient distinguishes internal timeout, caller cancellation, network and transport failures', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalTimeout = AbortSignal.timeout;
+  const client = new CoreClient({ endpoint: 'http://127.0.0.1:1', token, projectId: 'p0', role: 'adapter' });
+  const timeoutController = new AbortController();
+  const timeoutCause = new DOMException('internal timeout', 'TimeoutError');
+  timeoutController.abort(timeoutCause);
+  try {
+    AbortSignal.timeout = () => timeoutController.signal;
+    globalThis.fetch = async (_input, init) => { throw (init?.signal as AbortSignal).reason; };
+    await assert.rejects(client.post('/v1/search', {}), error => {
+      assert(error instanceof CoreClientError);
+      assert.equal(error.kind, 'timeout');
+      assert.equal(error.code, 'request_timeout');
+      assert.equal(error.cause, timeoutCause);
+      return true;
+    });
+
+    const callerController = new AbortController();
+    const callerAbort = new DOMException('caller cancelled', 'AbortError');
+    callerController.abort(callerAbort);
+    AbortSignal.timeout = originalTimeout;
+    globalThis.fetch = async (_input, init) => { throw (init?.signal as AbortSignal).reason; };
+    await assert.rejects(client.post('/v1/search', {}, callerController.signal), error => {
+      assert(error instanceof CoreClientError);
+      assert.equal(error.kind, 'cancelled');
+      assert.equal(error.code, 'request_cancelled');
+      assert.equal(error.cause, callerAbort);
+      return true;
+    });
+
+    for (const item of [
+      { cause: new TypeError('fetch failed'), kind: 'network', code: 'network_error' },
+      { cause: new Error('dispatcher failed'), kind: 'transport', code: 'transport_error' },
+    ] as const) {
+      globalThis.fetch = async () => { throw item.cause; };
+      await assert.rejects(client.post('/v1/search', {}), error => {
+        assert(error instanceof CoreClientError);
+        assert.equal(error.kind, item.kind);
+        assert.equal(error.code, item.code);
+        assert.equal(error.cause, item.cause);
+        return true;
+      });
+    }
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('CoreClient reports malformed JSON as protocol error with status and cause', async () => {
+  const originalFetch = globalThis.fetch;
+  const client = new CoreClient({ endpoint: 'http://127.0.0.1:1', token, projectId: 'p0', role: 'adapter' });
+  try {
+    globalThis.fetch = async () => new Response('SENSITIVE_SERVER_PAYLOAD', { status: 502 });
+    await assert.rejects(client.post('/v1/search', {}), error => {
+      assert(error instanceof CoreClientError);
+      assert.equal(error.kind, 'protocol');
+      assert.equal(error.code, 'invalid_response');
+      assert.equal(error.status, 502);
+      assert(error.cause instanceof SyntaxError);
+      assert.match(error.message, /502, invalid_response/);
+      assert.equal(error.message.includes('SENSITIVE_SERVER_PAYLOAD'), false);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('CoreClient classifies 4xx, 5xx and 507 without exposing server messages', async () => {
+  const originalFetch = globalThis.fetch;
+  const client = new CoreClient({ endpoint: 'http://127.0.0.1:1', token, projectId: 'p0', role: 'adapter' });
+  let seenProtocol: string | null = null;
+  const cases = [
+    { status: 400, kind: 'http4xx', code: 'invalid_request' },
+    { status: 426, kind: 'http4xx', code: 'http4xx' },
+    { status: 500, kind: 'http5xx', code: 'internal_error' },
+    { status: 507, kind: 'capacity', code: 'outbox_full' },
+  ] as const;
+  try {
+    for (const item of cases) {
+      globalThis.fetch = async (_input, init) => {
+        seenProtocol = new Headers(init?.headers).get('x-amb-protocol');
+        return new Response(JSON.stringify({ code: item.status === 426 ? { secret: 'BAD_CODE' } : item.code, message: 'SENSITIVE_SERVER_MESSAGE' }), {
+          status: item.status, headers: { 'content-type': 'application/json' },
+        });
+      };
+      await assert.rejects(client.post('/v1/outbox/enqueue', {}), error => {
+        assert(error instanceof CoreClientError);
+        assert.equal(error.kind, item.kind);
+        assert.equal(error.code, item.code);
+        assert.equal(error.status, item.status);
+        assert.match(error.message, new RegExp(`${item.status}, ${item.code}`));
+        assert.equal(error.message.includes('SENSITIVE_SERVER_MESSAGE'), false);
+        assert.equal(error.message.includes('BAD_CODE'), false);
+        return true;
+      });
+    }
+    assert.equal(seenProtocol, '1');
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test('MCP rejects a malformed core response instead of reporting success', async () => {

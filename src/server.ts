@@ -8,6 +8,10 @@ import { coreSchema, type CoreConfig } from './config.js';
 import { exportArchive, importArchive, inspectArchive } from './archive.js';
 import { capabilityManifest, operatingModeFromDisk } from './capabilities.js';
 import { UI_CSS, UI_HTML, UI_JS } from './ui.js';
+import { maintenanceStatus, initializeMaintenance } from './maintenance.js';
+import { enqueueWorkflowDraft, listWorkflowDrafts, readWorkflowDraft, approveWorkflowDraft, reviseWorkflowDraft } from './workflow-organization.js';
+import { createRetrievalService } from './retrieval-service.js';
+import { relevantPassages } from './retrieval-excerpt.js';
 
 /**
  * Static responses the core serves for its own management interface.
@@ -81,6 +85,10 @@ const ADMIN_ONLY = new Set([
   // management decision, and the replay only re-sends what the adapter already
   // tried to send.
   '/v1/outbox/list', '/v1/outbox/purge',
+  '/v1/maintenance/status',
+  '/v1/maintenance/retry',
+  '/v1/workflow-drafts/list', '/v1/workflow-drafts/get', '/v1/workflow-drafts/generate', '/v1/workflow-drafts/approve',
+  '/v1/workflow-drafts/revise',
 ]);
 
 /**
@@ -94,6 +102,8 @@ const ADMIN_ONLY_HINT = 'This operation changes the effective knowledge base and
   + 'Submit a candidate instead (amb_submit_experience) and let a human review it.';
 
 export function createCoreServer(store: Store, config: CoreConfig) {
+  initializeMaintenance(store);
+  const selectKnowledge=createRetrievalService(store,dirname(store.path));
   const validated = coreSchema.parse(config);
   if (new Set(validated.clients.map(c => c.token)).size !== validated.clients.length)
     throw new Error('Adapter credentials must be distinct');
@@ -116,7 +126,13 @@ export function createCoreServer(store: Store, config: CoreConfig) {
        * resolves to 127.0.0.1 is turned away for two independent reasons.
        */
       const origin = req.headers.origin;
-      if (origin && !selfOrigin.includes(origin))
+      // The management page is also embedded in the DSH desktop, whose page lives
+      // on a different loopback port. A browser then sends that port as Origin on
+      // every POST, and refusing it blanks every tab. Only a loopback origin is
+      // added to the page's own origin; any other site is still refused, and the
+      // Host check below still rejects a non-loopback host.
+      const loopbackOrigin = origin !== undefined && /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin);
+      if (origin && !selfOrigin.includes(origin) && !loopbackOrigin)
         throw new DomainError('origin_denied', 'Browser requests from another origin are refused', 403);
       if (![`127.0.0.1:${port}`, `localhost:${port}`].includes(req.headers.host ?? ''))
         throw new DomainError('host_denied', 'Invalid host', 403);
@@ -170,11 +186,42 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         throw new DomainError('forbidden', ADMIN_ONLY_HINT, 403);
       store.cleanup();
       switch (req.url) {
+        case '/v1/workflow-drafts/list': return reply(res,200,{drafts:listWorkflowDrafts(store,envelope.projectId),
+          skills:store.scopedEntries(envelope.projectId).filter(e=>e.content.kind==='skill').map(e=>({id:e.id,title:e.content.title,revision:e.revision}))});
+        case '/v1/workflow-drafts/get': {
+          const p=z.object({id:z.string().min(1)}).parse(body); return reply(res,200,readWorkflowDraft(store,envelope.projectId,p.id));
+        }
+        case '/v1/workflow-drafts/generate': {
+          const p=z.object({skillId:z.string().min(1)}).parse(body); return reply(res,200,enqueueWorkflowDraft(store,envelope.projectId,p.skillId,true));
+        }
+        case '/v1/workflow-drafts/approve': {
+          const p=z.object({id:z.string().min(1)}).parse(body); return reply(res,200,approveWorkflowDraft(store,envelope.projectId,p.id));
+        }
+        case '/v1/workflow-drafts/revise': {
+          const p=z.object({id:z.string().min(1),draft:z.unknown()}).parse(body);
+          return reply(res,200,reviseWorkflowDraft(store,envelope.projectId,p.id,p.draft));
+        }
+        case '/v1/maintenance/status': {
+          return reply(res, 200, maintenanceStatus(store, envelope.projectId));
+        }
+        case '/v1/maintenance/retry': {
+          const p = z.object({ id: z.string().min(1), projectId: z.string() }).parse(body);
+          const jobs = initializeMaintenance(store);
+          const job = jobs.list(200).find(item => item.id === p.id);
+          if (!job || (job.payload.projectId && job.payload.projectId !== p.projectId)) throw new DomainError('not_found', 'Job unavailable', 404);
+          return reply(res, 200, { requeued: jobs.requeue(p.id) });
+        }
         case '/v1/prepare': {
           const p = contextSchema.parse(body);
-          return reply(res, 200, store.prepare(p.projectId, p.query, {
+          const selection=await selectKnowledge(p.projectId,p.query);
+          const prepared = store.prepare(p.projectId, p.query, {
             sessionId: p.sessionId, taskId: p.taskId, platform: p.adapter,
-          }));
+            ...(selection.mode==='model'||selection.mode==='index'||selection.reason!=='not_configured'?{selectedIds:selection.selectedIds}:{}),
+          });
+          // Organize the skill currently being used, asynchronously and once per source version.
+          const selected=prepared.knowledge.find(item=>item.kind==='skill');
+          if(selected) enqueueWorkflowDraft(store,p.projectId,selected.id);
+          return reply(res,200,{...prepared,retrieval:{...prepared.retrieval,selection}});
         }
         case '/v1/search': { const p = contextSchema.parse(body); return reply(res, 200, { workflows: store.search(p.projectId, p.query), knowledgeRevision: store.revision }); }
         case '/v1/expand': { const p = expandSchema.parse(body); return reply(res, 200, store.expand(p.projectId, p.workflowId, p.stageId)); }
@@ -251,7 +298,9 @@ export function createCoreServer(store: Store, config: CoreConfig) {
          */
         case '/v1/proposals/get': {
           const p = z.object({ projectId: z.string(), id: z.string().min(1) }).parse(body);
-          return reply(res, 200, store.getProposal(p.id, p.projectId));
+          const proposal = store.getProposal(p.id, p.projectId);
+          const review = store.db.prepare('SELECT result FROM model_reviews WHERE proposal_id=? AND project_id=?').get(p.id, p.projectId);
+          return reply(res, 200, { ...proposal, modelReview: review ? JSON.parse(String(review.result)) : { status: 'awaiting_model', authority: 'advisory' } });
         }
         /**
          * Reopen an archived, rejected or expired candidate.
@@ -337,7 +386,11 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           // replacements — precisely the material scope exists to protect.
           return reply(res, 200, { history: store.supersessions(undefined, p.projectId).slice(0, p.limit ?? 50) });
         }
-        case '/v1/knowledge/read': { const p = z.object({ projectId: z.string(), knowledgeId: z.string(), includeLeaves: z.boolean().optional() }).parse(body); return reply(res, 200, store.readKnowledge(p.projectId, p.knowledgeId, p.includeLeaves ?? false)); }
+        case '/v1/knowledge/read': {
+          const p = z.object({ projectId: z.string(), knowledgeId: z.string(), includeLeaves: z.boolean().optional(), query:z.string().max(4000).optional() }).parse(body);
+          const knowledge=store.readKnowledge(p.projectId,p.knowledgeId,p.includeLeaves??false);
+          return reply(res,200,{...knowledge,...(p.query?{passages:relevantPassages(knowledge.body,p.query)}:{})});
+        }
         // The caller's own projectId is echoed back so a UI can label what it is
         // showing. It is not a disclosure: the request already had to name it, and
         // it is the credential's own project rather than anyone else's. `role` is
@@ -389,8 +442,12 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         }
         case '/v1/knowledge/unstructured': { const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body); return reply(res, 200, { skills: store.unstructuredSkills(p.projectId, p.limit) }); }
         case '/v1/knowledge/search-universal': {
-          const p = z.object({ projectId: z.string(), query: z.string().optional().default(''), kind: z.string().optional(), limit: z.number().int().positive().max(200).optional() }).parse(body);
-          return reply(res, 200, { results: store.searchUniversal(p.projectId, p.query, p.kind, p.limit), knowledgeRevision: store.revision });
+          const p = z.object({ projectId: z.string(), query: z.string().optional().default(''), kind: z.string().optional(), limit: z.number().int().positive().max(200).optional(), autoRecall: z.boolean().optional(),literal:z.boolean().optional() }).parse(body);
+          const selection=p.kind!=='norm'&&!p.literal&&p.query.trim()?await selectKnowledge(p.projectId,p.query):{mode:'lexical_fallback' as const,selectedIds:[],reason:'explicit_full_text'};
+          const catalog=store.searchUniversal(p.projectId,'',p.kind,Number.MAX_SAFE_INTEGER);
+          const results=p.kind==='norm'?store.searchUniversal(p.projectId,p.query,p.kind,p.limit):selection.mode==='model'||selection.mode==='index'||(p.autoRecall&&selection.reason!=='not_configured')?selection.selectedIds.flatMap(id=>catalog.filter(e=>e.id===id)).slice(0,p.limit??(p.autoRecall?3:100))
+            :p.autoRecall?store.autoRecall(p.projectId,p.query,p.kind,p.limit):store.searchUniversal(p.projectId,p.query,p.kind,p.limit);
+          return reply(res,200,{results,selection,knowledgeRevision:store.revision});
         }
         case '/v1/knowledge/get': {
           const p = z.object({ projectId: z.string(), id: z.string().min(1) }).parse(body);
@@ -434,7 +491,11 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             summary: z.string().min(1).max(2000), body: z.string().max(60000).optional(),
             taskId: z.string().min(1).max(120).optional(),
             provenance: z.enum(['user', 'external', 'agent']).optional(),
+            capturedAt: z.number().int().nonnegative().optional(),
           }).parse(body);
+          const captureNow = Date.now();
+          if (p.capturedAt !== undefined && (p.capturedAt > captureNow || p.capturedAt + 90 * 86_400_000 <= captureNow))
+            throw new DomainError('invalid_capture_time', 'Material capture time is future or expired', 400);
           const isAdmin = principal.role === 'admin';
           /**
            * The linked task must belong to the recording project.
@@ -456,6 +517,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             throw new DomainError('not_found', `Task ${p.taskId} is unavailable`, 404);
           const result = store.saveMaterial({
             ...p,
+            ...(p.capturedAt !== undefined ? { savedAt: p.capturedAt, expiresAt: p.capturedAt + 90 * 86_400_000 } : {}),
             // Scope and provenance are decided by the caller's *identity*, never by
             // the request body. An adapter records material for its own project —
             // a project's short-lived reference must not become readable by every
@@ -498,6 +560,39 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         // without the adapter inventing an id. A task-scoped entry also becomes
         // applicable once this is known, which is what keeps "this time only" from
         // leaking into every later task.
+        case '/v1/sessions/reflect': {
+          const p = z.object({ projectId: z.string(), adapter: z.enum(['codex', 'dsh']),
+            sessionId: z.string().min(1).max(256), eventId: z.string().min(1).max(120).optional(),
+            taskId: z.string().min(1).max(120).optional(), reason: z.enum(['turn-ended', 'stopped']),
+            summary: z.string().max(2000).optional() }).parse(body);
+          return reply(res, 200, store.event(principal.id, {
+            projectId: p.projectId, adapter: p.adapter, sessionId: p.sessionId,
+            ...(p.taskId ? { taskId: p.taskId } : {}),
+            eventId: p.eventId ?? `reflect-${crypto.randomUUID()}`,
+            kind: p.reason === 'stopped' ? 'turn_stopped' : 'turn_ended', summary: p.summary ?? '',
+          }));
+        }
+        case '/v1/tasks/checkpoint': {
+          const p = z.object({ projectId: z.string(), sessionId: z.string().min(1).max(256).optional(),
+            taskId: z.string().min(1).max(120).optional(), title: z.string().min(1).max(2000).optional(),
+            idempotencyKey: z.string().min(1).max(120).optional(), status: taskStatus.optional(),
+            summary: z.string().max(2000).optional(), notes: z.string().max(4000).optional(),
+            unfinished: z.array(z.string().min(1).max(2000)).max(50).optional(),
+            verified: z.string().max(2000).optional(),
+            evidence: z.enum(['observed', 'verifiable', 'self-reported', 'unverifiable']).optional(),
+            files: z.array(z.string().min(1).max(2000)).max(100).optional(),
+            relatedExperiences: z.array(z.string().min(1).max(120)).max(100).optional(),
+            relatedProposals: z.array(z.string().min(1).max(120)).max(100).optional(),
+          }).parse(body);
+          if (principal.role !== 'admin' && p.evidence === 'observed')
+            throw new DomainError('invalid_evidence', 'Adapters may record verifiable evidence, not claim plugin observations');
+          return reply(res, 200, store.checkpointTask(principal.id, p));
+        }
+        case '/v1/tasks/activity': {
+          const p = z.object({ projectId: z.string(), taskId: z.string().min(1).max(120).optional(),
+            sessionId: z.string().min(1).max(256).optional() }).parse(body);
+          return reply(res, 200, store.taskActivity(p.projectId, p));
+        }
         case '/v1/tasks/start': {
           const p = z.object({ projectId: z.string(), sessionId: z.string().min(1).max(256), title: z.string().min(1).max(2000) }).parse(body);
           const result = store.startTaskForSession(p.projectId, p.sessionId, p.title);

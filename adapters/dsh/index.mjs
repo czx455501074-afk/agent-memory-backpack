@@ -1,12 +1,17 @@
-import { randomUUID } from 'node:crypto'
-import { existsSync, realpathSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { DEFAULT_DATA_DIR } from './resolve-config.mjs'
+import { hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { dirname, isAbsolute, join, relative, sep } from 'node:path'
-import { createClient, isExplicitClientRejection, isRecordValue, isWithinProject, loadClientConfig } from './core-client.mjs'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { CoreClientError, clientFailureMeta, createClient, isCancelledClientError, isExplicitClientRejection, isRecordValue, isWithinProject, loadClientConfig, sanitizeServerMessage } from './core-client.mjs'
 import { createAdapterLogger } from './log.mjs'
 import { ensureCoreRunning } from './ensure-core.mjs'
 import { checkShellWriteBypass, decideFromSnapshot, loadSnapshot, operatingMode, saveSnapshot } from './gate-cache.mjs'
 import { loadSpool, spoolEnqueue, spoolReplay } from './spool.mjs'
+import { captureFailure, failureCandidate } from './failure-capture.mjs'
+import { captureMaterial, replayMaterials } from './material-capture.mjs'
+import { isContinuationQuery, recallKnowledge } from './recall.mjs'
 
 /** The packaged core entry point, resolved beside this adapter. */
 const ADAPTER_DIR = dirname(fileURLToPath(import.meta.url))
@@ -284,6 +289,680 @@ function lastSessionProgress(events) {
   return ''
 }
 
+/**
+ * The read-only data routes the native DSH panel reads.
+ *
+ * The panel used to be an embedded page and asked this server for its own address;
+ * it is now a React view inside the harness document, so it asks for data instead.
+ * These three routes are the whole of that contract, and every field they return is
+ * read from the real core through the same `client` - and therefore the same
+ * credential and the same project scope - that the rest of the adapter uses.
+ */
+
+/**
+ * How many entries the flat `knowledge` sample carries.
+ *
+ * This is the core's own per-request ceiling: the panel's "all entries" view is
+ * a plain list of the library this credential can see, and a shorter page would
+ * silently decide which entries exist for the reader. Categories use
+ * `PANEL_KIND_FETCH_LIMIT`, one call per category.
+ */
+const PANEL_KNOWLEDGE_LIMIT = 200
+/**
+ * How many entries one knowledge category may carry in `facets`.
+ *
+ * The panel groups by category, and a group needs both a name and a truthful
+ * size: asking the core for one page per category returns every entry of that
+ * category up to this ceiling, so the panel can print what the core actually
+ * holds instead of a count derived from a truncated page. The core's own ceiling
+ * is 200 per call, so a category larger than this reports the ceiling it reached
+ * and the panel says so; `counts.knowledge` remains the library-wide number.
+ */
+const PANEL_KIND_FETCH_LIMIT = 200
+/**
+ * The core's own ceilings, mirrored here so a bad parameter is refused with a
+ * readable reason instead of surfacing as a zod "Request fields are invalid".
+ * `/v1/knowledge/search-universal` takes `limit` up to 200, and `/v1/tasks/activity`
+ * takes `taskId` up to 120 characters.
+ */
+const PANEL_SEARCH_MAX_LIMIT = 200
+const PANEL_TASK_ID_MAX_CHARS = 120
+const PANEL_QUERY_MAX_CHARS = 4000
+/**
+ * The knowledge categories the panel navigates, in the order it lists them.
+ *
+ * The names are the core's own `kind` values, read from `knowledge(id, kind,
+ * head, status)`; nothing here invents a category or a count. `labelKey` and
+ * `guideKey` are panel copy keys the browser half resolves, so a category the
+ * core adds later simply does not appear until both halves agree on it.
+ */
+const KNOWLEDGE_KIND_GUIDES = [
+  { kind: 'skill', labelKey: 'kind.skill.label', guideKey: 'kind.skill.guide' },
+  { kind: 'journal', labelKey: 'kind.journal.label', guideKey: 'kind.journal.guide' },
+  { kind: 'material', labelKey: 'kind.material.label', guideKey: 'kind.material.guide' },
+  { kind: 'memory', labelKey: 'kind.memory.label', guideKey: 'kind.memory.guide' },
+  { kind: 'norm', labelKey: 'kind.norm.label', guideKey: 'kind.norm.guide' },
+]
+/**
+ * The data paths this file serves, matched exactly - never as a prefix. The task
+ * states the panel groups by are the core's own `status` values; the browser half
+ * holds their labels, since nothing on this side branches on them.
+ */
+const PANEL_DATA_PATHS = new Set(['/amb/summary', '/amb/search', '/amb/task'])
+
+/**
+ * The panel's management surface, allow-listed by action name.
+ *
+ * The browser half never names a core path. It names an *action*, and this table
+ * decides which core endpoint that action may reach. A path passthrough would hand
+ * a caller every endpoint the admin credential can reach, which is the whole
+ * library - so the mapping is the security boundary, not a convenience.
+ *
+ * Every target here is one the core itself marks admin-only (`ADMIN_ONLY` in
+ * src/server.ts), because each one changes the effective library or reviews a
+ * change to it. The core's reasoning is exactly why the human's credential is
+ * needed: an agent that could approve would be able to clear its own queue.
+ *
+ * `/v1/backup/inspect` is deliberately absent, matching the core's own note: it
+ * reports only counts, file names and a timestamp, so it is not admin-only there
+ * and it is not exposed here either. Import always follows an inspect, and both are
+ * driven from the panel's backup section.
+ *
+ * `/v1/proposals/batch` is deliberately absent for now: it can act on many
+ * proposals at once, and a single mis-click should not be able to clear the queue.
+ * The per-proposal actions below cover the same ground one review at a time.
+ */
+const PANEL_ADMIN_ACTIONS = Object.freeze({
+  'proposals-list': '/v1/proposals/list',
+  'proposal-get': '/v1/proposals/get',
+  'proposal-approve': '/v1/proposals/approve',
+  'proposal-reject': '/v1/proposals/reject',
+  'proposal-archive': '/v1/proposals/archive',
+  'proposal-reopen': '/v1/proposals/reopen',
+  'proposal-request-evidence': '/v1/proposals/request-evidence',
+  'backup-export': '/v1/backup/export',
+  'backup-import': '/v1/backup/import',
+  'knowledge-delete': '/v1/knowledge/delete',
+  'knowledge-supersede': '/v1/knowledge/supersede',
+  'material-renew': '/v1/material/renew',
+  'material-purge': '/v1/material/purge',
+  'outbox-list': '/v1/outbox/list',
+  'outbox-purge': '/v1/outbox/purge',
+  'maintenance-status': '/v1/maintenance/status',
+  'maintenance-retry': '/v1/maintenance/retry',
+  'rescan-mark': '/v1/rescan/mark',
+  'workflow-drafts-list': '/v1/workflow-drafts/list',
+  'workflow-draft-get': '/v1/workflow-drafts/get',
+  'workflow-draft-approve': '/v1/workflow-drafts/approve',
+  'workflow-draft-revise': '/v1/workflow-drafts/revise',
+})
+
+/**
+ * Actions that change the library rather than read it.
+ *
+ * The browser half asks for confirmation before sending these; this side records
+ * them on the plugin log so a surprising change can be traced to the panel, the
+ * action and the moment. Reads are not logged - a log full of reads hides the
+ * writes, which are the only entries worth keeping.
+ */
+const PANEL_ADMIN_WRITES = new Set([
+  'proposal-approve', 'proposal-reject', 'proposal-archive', 'proposal-reopen',
+  'proposal-request-evidence', 'backup-import', 'knowledge-delete', 'knowledge-supersede',
+  'material-renew', 'material-purge', 'outbox-purge', 'maintenance-retry',
+  'rescan-mark', 'workflow-draft-approve', 'workflow-draft-revise',
+])
+
+function panelJson(res, status, value) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    // Counts and lists move as work is recorded, so a cached copy would be stale.
+    'Cache-Control': 'no-store',
+  })
+  res.end(JSON.stringify(value))
+}
+
+/**
+ * A failure reason that is safe to put in a response body.
+ *
+ * The core client already reduces a core failure to a fixed template plus a
+ * sanitized detail, but this body is rendered inside the harness document, so the
+ * text is passed through the same sanitizer once more: the credential must never be
+ * able to reach a page, a log, or a screenshot.
+ */
+function panelReason(error, token) {
+  const raw = error instanceof Error ? error.message : String(error ?? '')
+  const safe = sanitizeServerMessage(raw, token).replace(/\s+/g, ' ').trim()
+  return safe || 'AMB 核心请求失败。'
+}
+
+/** A count the panel can print, or null when the core did not report one. */
+function panelCount(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * One knowledge entry as the panel shows it.
+ *
+ * `scope` is flattened from the core's discriminated union to its `kind`, which is
+ * what the row's origin badge prints: `global` means the entry applies to every
+ * project, `project` and `session` mean the reader's own scope. An entry whose
+ * scope is absent or unknown is reported as `unknown` rather than assumed global -
+ * the two would disagree the moment the core adds a scope.
+ *
+ * `status` is the core's own column (`knowledge.status`), passed through unchanged;
+ * it is never inferred from anything else. `proposalState` has no source on this
+ * path, so it stays null and the panel prints "not provided" rather than claiming a
+ * candidate state it cannot read: `/v1/proposals/list` is admin-only.
+ *
+ * `updatedAt` has no source on this path either: the core's retrieval endpoint
+ * returns id, revision, kind, title, scope, provenance and excerpt per entry, and no
+ * timestamp. The field is present and empty rather than filled with a plausible
+ * number, so the panel prints "not provided" instead of a date that would be wrong
+ * next to real knowledge.
+ */
+function panelEntry(raw) {
+  if (!isRecordValue(raw) || typeof raw.id !== 'string' || raw.id === '') return null
+  const scope = isRecordValue(raw.scope) && typeof raw.scope.kind === 'string' ? raw.scope.kind : ''
+  return {
+    id: raw.id,
+    kind: typeof raw.kind === 'string' ? raw.kind : '',
+    title: typeof raw.title === 'string' && raw.title ? raw.title : raw.id,
+    status: typeof raw.status === 'string' ? raw.status : '',
+    scope,
+    source: scope === 'global' || scope === 'project' || scope === 'session' ? scope : 'unknown',
+    proposalState: null,
+    updatedAt: null,
+    excerpt: typeof raw.excerpt === 'string' ? raw.excerpt : '',
+  }
+}
+
+/** Map `/v1/knowledge/search-universal` results; a missing array is a fault. */
+function panelEntries(payload) {
+  const results = isRecordValue(payload) && Array.isArray(payload.results) ? payload.results : null
+  if (!results) throw new Error('AMB 核心返回的知识列表缺少 results 数组。')
+  return results.map(panelEntry).filter(entry => entry !== null)
+}
+
+/**
+ * One task record as the panel lists it.
+ *
+ * `projectId` travels with the record because the panel labels a task with the
+ * project it belongs to; the core stores it per row, so the badge is the row's own
+ * value and not the credential's project repeated. `evidence` is the core's own
+ * column and is the only truthfulness marker the panel has for a task, so it is
+ * passed through rather than summarized.
+ */
+function panelTask(raw) {
+  if (!isRecordValue(raw) || typeof raw.id !== 'string' || raw.id === '') return null
+  return {
+    id: raw.id,
+    title: typeof raw.title === 'string' && raw.title ? raw.title : raw.id,
+    status: typeof raw.status === 'string' ? raw.status : '',
+    projectId: typeof raw.projectId === 'string' ? raw.projectId : '',
+    summary: typeof raw.summary === 'string' ? raw.summary.slice(0, 400) : '',
+    evidence: typeof raw.evidence === 'string' ? raw.evidence : '',
+    updatedAt: panelCount(raw.updatedAt),
+  }
+}
+
+/** Whether this request names one of the panel's data routes, query aside. */
+function isPanelDataRequest(rawUrl) {
+  if (typeof rawUrl !== 'string') return false
+  const query = rawUrl.indexOf('?')
+  return PANEL_DATA_PATHS.has(query === -1 ? rawUrl : rawUrl.slice(0, query))
+}
+
+/** The panel's own management prefix, as opposed to the data routes above. */
+const PANEL_ADMIN_PREFIX = '/amb/admin/'
+
+/**
+ * The admin credential, read on this side only.
+ *
+ * Holding the admin token inside the host process is the whole reason the panel's
+ * management section can exist: the browser half names an *action*, and this side
+ * checks it against the allow-list and performs it with a credential the page never
+ * sees, stores or forwards. Nothing in a response body is ever built from the token.
+ *
+ * Resolution mirrors what the CLI does: the file is `<data dir>/admin-client.json`
+ * and it must carry a token. A missing or unusable file is a capability the panel
+ * reports as unavailable, not a stack trace the user has to decode.
+ *
+ * The returned client deliberately reuses this adapter's endpoint and project. The
+ * admin credential authorises *reviews*; it does not move the panel to a different
+ * library. Were the two allowed to disagree, the panel would be managing a core the
+ * rest of the plugin is not talking to.
+ */
+function readPanelAdminClient(config) {
+  try {
+    const path = join(DEFAULT_DATA_DIR(), 'admin-client.json')
+    if (!existsSync(path)) return null
+    const raw = JSON.parse(readFileSync(path, 'utf8'))
+    if (!isRecordValue(raw) || typeof raw.token !== 'string' || !raw.token.trim()) return null
+    return createClient({
+      endpoint: config.endpoint,
+      token: raw.token,
+      projectId: config.projectId,
+      projectRoot: config.projectRoot,
+    })
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Read a bounded JSON request body.
+ *
+ * The cap exists because this route is reachable from a page: without it a single
+ * request could make the host buffer an unbounded amount of text. Oversized bodies
+ * are refused rather than truncated, since a truncated JSON object is not a payload
+ * anyone meant to send.
+ */
+async function readPanelAdminBody(req, maxBytes = 65_536) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > maxBytes) return { tooLarge: true }
+    chunks.push(chunk)
+  }
+  const text = Buffer.concat(chunks).toString('utf8')
+  if (!text.trim()) return { body: {} }
+  try {
+    const parsed = JSON.parse(text)
+    if (!isRecordValue(parsed)) return { invalid: true }
+    return { body: parsed }
+  } catch {
+    return { invalid: true }
+  }
+}
+
+/**
+ * Fill in what the panel cannot know.
+ *
+ * Every admin route is scoped: the core's own schemas require a `projectId`, and
+ * that is *this adapter's* project rather than something a page should be able to
+ * pick. So the panel names the action and its subject, and this side supplies the
+ * scope. This was learned from the first run against a live host, where every
+ * action that carried an empty body came back `HTTP 400 invalid_request` - the
+ * page was answering a question it had no business being asked.
+ *
+ * Two actions need more than a scope, and both are composed here rather than
+ * pushed onto the page:
+ *
+ *   - `backup-export` writes to a path. The panel may pass one; when it does not,
+ *     a default under the data directory keeps "export" a single click.
+ *   - `proposal-approve` needs the candidate's *entry*, not just its id, because
+ *     the core approves a knowledge object. The entry is read back from the
+ *     candidate first, so the page never has to hold it.
+ */
+async function buildPanelAdminParams(action, body, config, admin) {
+  const params = { ...body }
+  if (typeof params.projectId !== 'string' || params.projectId === '') params.projectId = config.projectId
+
+  if (action === 'backup-export' && (typeof params.file !== 'string' || params.file === '')) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const dir = join(DEFAULT_DATA_DIR(), 'exports')
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch {
+      // A directory that cannot be created surfaces as the core's own write error,
+      // which names the path. Inventing a second error here would only hide it.
+    }
+    params.file = join(dir, `amb-${stamp}.ambpack`)
+  }
+
+  if (action === 'proposal-approve' && !params.entry) {
+    const got = await admin.post('/v1/proposals/get', { projectId: params.projectId, id: params.id })
+    // `proposals/get` answers with the candidate itself, not a wrapper object.
+    const payload = got && isRecordValue(got.payload) ? got.payload : null
+    if (payload && isRecordValue(payload.entry)) {
+      params.entry = payload.entry
+    } else {
+      // A captured candidate carries *text* (`payload.discovery`), not a knowledge
+      // object: the core's approve verb wants a full entry, because a human review
+      // is precisely the act of deciding what that text should become. Refusing is
+      // the honest answer here - inventing a kind, title and scope on the reviewer's
+      // behalf would write an entry nobody chose, and a wrong guess would look like
+      // a successful review.
+      throw new Error(
+        '该候选只有待核实的文本，还没有知识条目形态，无法一键采纳。'
+        + '请在评审流程里选定它要成为的类别与标题后再采纳。',
+      )
+    }
+  }
+  return params
+}
+
+/**
+ * `POST /amb/admin/<action>`.
+ *
+ * The action name is resolved through PANEL_ADMIN_ACTIONS, so an unknown name is a
+ * bare 404 and never reaches the core - the allow-list is the boundary, and there is
+ * no path that forwards a caller-supplied core path.
+ *
+ * The body is completed by `buildPanelAdminParams` (scope, defaults, and the one
+ * composed read-then-write) and then forwarded as the core's own parameters. The
+ * core still validates its own schema: this side only supplies values the panel has
+ * no way to know, and it never guesses a value the core would reject.
+ *
+ * Write actions are recorded on the plugin log so a surprising change can be traced
+ * to the panel, the action and the moment. Reads are not logged: a log full of reads
+ * hides the writes, which are the only entries worth keeping.
+ */
+async function handlePanelAdminRequest(req, res, { config, logger }) {
+  let url
+  try {
+    url = new URL(typeof req.url === 'string' ? req.url : '', 'http://127.0.0.1')
+  } catch {
+    url = null
+  }
+  const action = url && url.pathname.startsWith(PANEL_ADMIN_PREFIX)
+    ? url.pathname.slice(PANEL_ADMIN_PREFIX.length)
+    : ''
+  if (!action || !Object.prototype.hasOwnProperty.call(PANEL_ADMIN_ACTIONS, action)) {
+    // Unlisted action: a bare 404 with no body, matching the rest of this prefix.
+    res.writeHead(404, {})
+    res.end()
+    return
+  }
+  const target = PANEL_ADMIN_ACTIONS[action]
+  if (req.method !== 'POST') {
+    panelJson(res, 405, { ok: false, error: '该端点只接受 POST 请求。' })
+    return
+  }
+  const admin = readPanelAdminClient(config)
+  if (!admin) {
+    panelJson(res, 200, {
+      ok: false,
+      action,
+      admin: { available: false },
+      error: '管理凭据不可用：未找到 admin-client.json。管理与导出导入需要管理员凭据。',
+    })
+    return
+  }
+  const read = await readPanelAdminBody(req)
+  if (read.tooLarge) {
+    panelJson(res, 200, { ok: false, action, error: '请求体超过 64 KB 上限。' })
+    return
+  }
+  if (read.invalid) {
+    panelJson(res, 200, { ok: false, action, error: '请求体必须是合法的 JSON 对象。' })
+    return
+  }
+  try {
+    if (PANEL_ADMIN_WRITES.has(action)) {
+      logger.info('panel.admin_write', { action, target })
+    }
+    const params = await buildPanelAdminParams(action, read.body, config, admin)
+    const payload = await admin.post(target, params)
+    panelJson(res, 200, { ok: true, action, target, data: payload })
+  } catch (error) {
+    // Same treatment as the data routes: status stays 200, the reason is sanitized,
+    // and neither the credential nor raw server text travels with it.
+    panelJson(res, 200, { ok: false, action, target, error: panelReason(error, undefined) })
+  }
+}
+
+/**
+ * `GET /amb/summary`.
+ *
+ * Every field has a real source, and the two whose semantics need stating are stated
+ * here rather than quietly relabelled:
+ *
+ *   - `counts.knowledge` is `/v1/stats`'s `entries`: every currently effective entry
+ *     in the shared library. The core does not filter that number by project, while
+ *     the `knowledge` list below is scoped to the credential's own project, so on a
+ *     library holding several projects the count is the larger one. That is the
+ *     number the core reports; nothing here recomputes or approximates it.
+ *   - `counts.pendingProposals` is `/v1/stats`'s `pendingProposals`, and
+ *     `counts.outbox.{pending,failed,abandoned}` are `/v1/stats`'s `outbox` counters:
+ *     exact fields, unchanged. They come from `/v1/stats` rather than
+ *     `/v1/outbox/list` deliberately - listing the queue is admin-only, because the
+ *     core keeps undelivered text for the human, so an adapter credential asking for
+ *     it would be refused.
+ *
+ * `revision` is `/v1/stats`'s `knowledgeRevision`. The list comes from
+ * `/v1/knowledge/search-universal` with `literal: true`, which keeps it a pure
+ * synchronous full-text lookup inside the core; without that flag a non-empty query
+ * may be routed through model selection, which a read-only panel has no reason to
+ * trigger.
+ *
+ * Three grouped views are built on top of the same two calls, and each is explicit
+ * about what it could not read:
+ *
+ *   - `facets` is one page per knowledge category, fetched from the core by `kind`,
+ *     so each group's `total` is what the credential can actually see of that
+ *     category rather than a count inferred from one mixed page. A category the core
+ *     refuses is reported as its own failed group - empty entries, null total, and
+ *     the sanitized reason - while the rest of the summary still answers, so one bad
+ *     category cannot blank the panel.
+ *   - `tasks` is `/v1/tasks/list`, which the core answers for an adapter credential
+ *     and scopes to `projectId`. The panel groups these by `status` and labels each
+ *     with the row's own `projectId`. `counts.tasks` from `/v1/stats` is a
+ *     library-wide row count while this list is project-scoped, so the two are
+ *     reported separately rather than forced to agree.
+ *   - `proposals` carries only what an adapter credential may read. `pending` is
+ *     `/v1/stats`'s `pendingProposals`; `approved` and `archived` are unreadable on
+ *     this credential (`/v1/proposals/list` is admin-only), so both stay null and
+ *     `reviewAvailable` is false. The panel prints "not provided" for them instead
+ *     of a zero it cannot verify, and states that accepting or rejecting a candidate
+ *     happens on the DSH/CLI side.
+ */
+async function readPanelSummary({ config, client }) {
+  const core = { endpoint: config.endpoint, projectId: config.projectId }
+  let stats
+  try {
+    stats = await client.post('/v1/stats', { projectId: config.projectId })
+  } catch (error) {
+    return { ok: false, core: { ...core, reachable: false }, error: panelReason(error, config.token) }
+  }
+  if (!isRecordValue(stats)) {
+    return { ok: false, core: { ...core, reachable: true }, error: 'AMB 核心返回的概览数据不是 JSON 对象。' }
+  }
+  const outbox = isRecordValue(stats.outbox) ? stats.outbox : {}
+  let knowledge
+  try {
+    knowledge = panelEntries(await client.post('/v1/knowledge/search-universal', {
+      projectId: config.projectId, query: '', limit: PANEL_KNOWLEDGE_LIMIT, literal: true,
+    }))
+  } catch (error) {
+    return { ok: false, core: { ...core, reachable: true }, error: panelReason(error, config.token) }
+  }
+  const facets = []
+  for (const guide of KNOWLEDGE_KIND_GUIDES) {
+    try {
+      const payload = await client.post('/v1/knowledge/search-universal', {
+        projectId: config.projectId, query: '', kind: guide.kind, limit: PANEL_KIND_FETCH_LIMIT, literal: true,
+      })
+      const entries = panelEntries(payload)
+      facets.push({
+        kind: guide.kind,
+        labelKey: guide.labelKey,
+        guideKey: guide.guideKey,
+        total: entries.length,
+        limit: PANEL_KIND_FETCH_LIMIT,
+        entries,
+        error: null,
+      })
+    } catch (error) {
+      facets.push({
+        kind: guide.kind,
+        labelKey: guide.labelKey,
+        guideKey: guide.guideKey,
+        total: null,
+        limit: PANEL_KIND_FETCH_LIMIT,
+        entries: [],
+        error: panelReason(error, config.token),
+      })
+    }
+  }
+  let tasks = null
+  try {
+    const payload = await client.post('/v1/tasks/list', { projectId: config.projectId })
+    const rows = Array.isArray(payload?.tasks) ? payload.tasks : []
+    tasks = rows.map(panelTask).filter(task => task !== null)
+  } catch {
+    // The task view is optional: the summary's own counts already answered, so a
+    // refused task list is reported as unavailable instead of failing the endpoint.
+    tasks = null
+  }
+  return {
+    ok: true,
+    core: { ...core, reachable: true },
+    revision: panelCount(stats.knowledgeRevision),
+    counts: {
+      knowledge: panelCount(stats.entries),
+      pendingProposals: panelCount(stats.pendingProposals),
+      tasks: panelCount(stats.tasks),
+      outbox: {
+        pending: panelCount(outbox.pending),
+        failed: panelCount(outbox.failed),
+        abandoned: panelCount(outbox.abandoned),
+      },
+    },
+    facets,
+    tasks,
+    proposals: {
+      pending: panelCount(stats.pendingProposals),
+      approved: null,
+      archived: null,
+      reviewAvailable: false,
+    },
+    knowledge,
+  }
+}
+
+/** `GET /amb/search`: full-text lookup inside the credential's own project scope. */
+async function readPanelSearch({ config, client }, query, limit) {
+  const payload = await client.post('/v1/knowledge/search-universal', {
+    projectId: config.projectId, query, limit, literal: true,
+  })
+  return { ok: true, results: panelEntries(payload) }
+}
+
+/** `GET /amb/task`: one task record, read from the core's own task activity view. */
+async function readPanelTask({ config, client }, taskId) {
+  let payload
+  try {
+    payload = await client.post('/v1/tasks/activity', { projectId: config.projectId, taskId })
+  } catch (error) {
+    // The core answers 404 for an id it does not hold. That is an answer, not a
+    // fault: the contract reserves `task: null` for exactly this case and the panel
+    // renders "no such task record" for it, so a missing record is translated here
+    // instead of being reported as a failure with a retry button.
+    if (error?.code === 'not_found' || error?.status === 404) return { ok: true, task: null }
+    throw error
+  }
+  const raw = isRecordValue(payload) && isRecordValue(payload.task) ? payload.task : null
+  if (!raw) return { ok: true, task: null }
+  return {
+    ok: true,
+    task: {
+      id: typeof raw.id === 'string' && raw.id ? raw.id : taskId,
+      title: typeof raw.title === 'string' && raw.title ? raw.title : taskId,
+      status: typeof raw.status === 'string' ? raw.status : '',
+      summary: typeof raw.summary === 'string' ? raw.summary : '',
+      updatedAt: panelCount(raw.updatedAt),
+    },
+  }
+}
+
+/**
+ * `limit` for `/amb/search`.
+ *
+ * Absent or empty means the panel's own page size. A value above the core's ceiling
+ * is clamped rather than refused: the caller gets the largest page the core will
+ * answer instead of an error it would have to guess about. Anything that is not a
+ * positive integer is refused, because guessing there would silently change what was
+ * asked for.
+ */
+function panelLimit(raw) {
+  if (raw === null || raw === '') return PANEL_KNOWLEDGE_LIMIT
+  if (!/^\d+$/.test(raw)) return null
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1) return null
+  return Math.min(value, PANEL_SEARCH_MAX_LIMIT)
+}
+
+/**
+ * Dispatch the three panel data routes.
+ *
+ * The path is compared exactly, never as a prefix, so no crafted path can alias its
+ * way onto a route it did not name, and only GET is answered: none of these routes
+ * changes anything, and a write method is refused rather than treated as a read.
+ * Every body is JSON with HTTP 200 even when the core is unreachable, because the
+ * panel's own error state - with the reason and a retry control - is what the user
+ * should see, not a status the renderer cannot describe.
+ */
+async function handlePanelRequest(req, res, { config, client, logger }) {
+  let url
+  try {
+    url = new URL(typeof req.url === 'string' ? req.url : '', 'http://127.0.0.1')
+  } catch {
+    url = null
+  }
+  if (!url || !PANEL_DATA_PATHS.has(url.pathname)) {
+    // Unchanged from the address routes: an unmapped /amb path is a bare 404.
+    res.writeHead(404)
+    res.end()
+    return
+  }
+  if (req.method !== 'GET') {
+    panelJson(res, 405, { ok: false, error: '该端点只接受 GET 请求。' })
+    return
+  }
+  const deps = { config, client }
+  try {
+    if (url.pathname === '/amb/summary') {
+      panelJson(res, 200, await readPanelSummary(deps))
+      return
+    }
+    if (url.pathname === '/amb/search') {
+      const query = url.searchParams.get('q')
+      if (query === null || !query.trim()) {
+        panelJson(res, 200, { ok: false, error: '缺少必填参数 q。' })
+        return
+      }
+      if (query.length > PANEL_QUERY_MAX_CHARS) {
+        panelJson(res, 200, { ok: false, error: `参数 q 超过 ${PANEL_QUERY_MAX_CHARS} 字符上限。` })
+        return
+      }
+      const limit = panelLimit(url.searchParams.get('limit'))
+      if (limit === null) {
+        panelJson(res, 200, { ok: false, error: '参数 limit 必须是正整数。' })
+        return
+      }
+      panelJson(res, 200, await readPanelSearch(deps, query, limit))
+      return
+    }
+    const rawTaskId = url.searchParams.get('taskId')
+    const taskId = rawTaskId === null ? '' : rawTaskId.trim()
+    if (!taskId) {
+      panelJson(res, 200, { ok: false, error: '缺少必填参数 taskId。' })
+      return
+    }
+    if (taskId.length > PANEL_TASK_ID_MAX_CHARS) {
+      panelJson(res, 200, { ok: false, error: `参数 taskId 超过 ${PANEL_TASK_ID_MAX_CHARS} 字符上限。` })
+      return
+    }
+    panelJson(res, 200, await readPanelTask(deps, taskId))
+  } catch (error) {
+    // Reached when the core could not be asked at all, or answered in a shape this
+    // adapter cannot use. The status stays 200 and the reason is sanitized: the panel
+    // shows its error state, and neither the credential nor raw server text travels
+    // with it.
+    logger.warn('panel.request_failed', {
+      path: url.pathname, failureKind: error?.kind, code: error?.code, status: error?.status,
+    })
+    const reachable = !(error?.kind === 'network' || error?.kind === 'transport' || error?.kind === 'timeout')
+    panelJson(res, 200, {
+      ok: false,
+      core: { reachable, endpoint: config.endpoint, projectId: config.projectId },
+      error: panelReason(error, config.token),
+    })
+  }
+}
+
 export async function apply(ctx) {
   const logger = createAdapterLogger()
   // Stamped at load so a later failure can be tied to a specific plugin build and
@@ -378,6 +1057,8 @@ export async function apply(ctx) {
         lastProgress: '',
         files: '', proposals: '', notes: '', handoffKeys: new Set(),
         submittedProposalIds: [], registeredProposalIds: new Set(),
+        recallKey: '', recallContext: '',
+        businessSinceCheckpoint: false, reflectionTurn: null,
       }
       sessionStates.set(id, state)
     }
@@ -389,6 +1070,27 @@ export async function apply(ctx) {
     if (!config.projectRoot) return Boolean(owner)
     return isWithinProject(config.projectRoot, owner?.session?.header?.cwd)
   }
+  ctx.on('tools/post-execute', async (exec, result, next) => {
+    const decision = await next()
+    if (!inProject(exec.agent)) return decision
+    await captureMaterial({ adapter: 'dsh', sessionId: exec.agent?.id, tool: exec.name, result,
+      taskId: exec.agent?.id ? getSessionState(exec.agent.id).currentTaskId || undefined : undefined }, { config, client, logger })
+    if (exec.agent?.id && !exec.name.startsWith('amb_') && !exec.name.includes('__amb__')) {
+      getSessionState(exec.agent.id).businessSinceCheckpoint = true
+    }
+    const receipt = await captureFailure({ adapter: 'dsh', sessionId: exec.agent?.id,
+      tool: exec.name, result }, { config, client, logger })
+    const failure = failureCandidate({ adapter: 'dsh', projectId: config.projectId,
+      sessionId: exec.agent?.id, tool: exec.name, result, secret: config.token })
+    if (failure && !receipt?.duplicate) {
+      const recalled = await recallKnowledge({ client, config, logger, adapter: 'dsh',
+        sessionId: exec.agent.id, query: failure.discovery.match(/观察：(.*)/)?.[1] ?? exec.name, trigger: 'failure' })
+      if (recalled.context) injectCurrentContext(exec.agent, recalled.context)
+    }
+    if (receipt && !receipt.duplicate) injectCurrentContext(exec.agent,
+      `AMB 已记录工具失败事实（${receipt.state}，${receipt.id ?? receipt.key}）。请用 amb_search_universal 检索该错误的已有经验，读取相关正文；验证修复后提交包含根因、步骤和证据的经验候选。`)
+    return decision
+  })
   // The waterfall is reorderable; enforce its verified result again at the final guard.
   ctx.effect(() => ctx.tools.guard((exec) => {
     if (!inProject(exec.agent)) return
@@ -417,6 +1119,19 @@ export async function apply(ctx) {
     contextIdsFor(agent).add(message.id)
     agent.inject(message)
   }
+
+  // Verified against dsh-agent-loop: this serial hook runs only at a natural
+  // stop boundary. steer() schedules one more step; an aborted user turn never
+  // reaches it. At most one reflection request per turn, never an endless gate.
+  ctx.on('agent/turn-stopping', ({ agent, turn, signal }) => {
+    if (!config.autoReflect || signal?.aborted || !inProject(agent) || typeof agent?.steer !== 'function') return
+    const state = getSessionState(agent.id)
+    if (!state.businessSinceCheckpoint || state.reflectionTurn === turn) return
+    state.reflectionTurn = turn
+    state.businessSinceCheckpoint = false
+    logger.info('reflection.requested', { adapter: 'dsh', sessionId: agent.id, turn })
+    agent.steer(knowledgeMessage('AMB 收尾记录：本轮执行了业务工具。请调用 amb_checkpoint_task 保存实际进展、未完成项与验证证据；若有经过验证的可复用经验，再用 amb_submit_experience 提交候选并说明所属流程和步骤。没有新经验就明确无新增经验，不要编造。回合结束不表示任务完成；尚未验证时用 paused 或 in_progress。保存后报告回执。此收尾请求每轮最多一次。'))
+  })
 
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
@@ -460,16 +1175,23 @@ export async function apply(ctx) {
           abandoned: Array.isArray(replayRes?.abandoned) ? replayRes.abandoned : [],
         })
       } catch (replayError) {
-        if (replayError?.name === 'AbortError') throw replayError
+        if (isCancelledClientError(replayError)) throw replayError
         logger.warn('outbox.replay_failed', {
           sessionId: currentSessionId, trigger,
+          failureKind: replayError?.kind, code: replayError?.code, status: replayError?.status,
           message: replayError instanceof Error ? replayError.message : String(replayError),
         })
       }
       try {
         const spoolOutcome = await spoolReplay(config.dataDir, client, logger)
-        if (spoolOutcome.replayed > 0) {
-          logger.info('spool.replay', { sessionId: currentSessionId, trigger, replayed: spoolOutcome.replayed, remaining: spoolOutcome.remaining })
+        await replayMaterials({ config, client, logger })
+        if (spoolOutcome.replayed > 0 || spoolOutcome.rejected > 0) {
+          // Logged by category, never by payload: a replayed item was delivered, a
+          // rejected one was refused permanently and dropped.
+          logger.info('spool.replay', {
+            sessionId: currentSessionId, trigger,
+            replayed: spoolOutcome.replayed, rejected: spoolOutcome.rejected ?? 0, remaining: spoolOutcome.remaining,
+          })
         }
       } catch (spoolError) {
         logger.warn('spool.replay_failed', {
@@ -506,7 +1228,9 @@ export async function apply(ctx) {
     })
     if (userMessages.length === 0) return decision
 
-    const query = userMessages.map(textOfMessage).filter(Boolean).join('\n').slice(0, 4_000)
+    const userQuery = textOfMessage(userMessages.at(-1)).slice(0, 4_000)
+    let query = isContinuationQuery(userQuery) ? (sessionState.lastMeaningfulQuery || '') : userQuery
+    if (query && !isContinuationQuery(userQuery)) sessionState.lastMeaningfulQuery = query
     let rawTaskId = payload?.agent?.session?.header?.taskId
       ?? payload?.agent?.session?.header?.task_id
       ?? payload?.agent?.session?.taskId
@@ -515,7 +1239,7 @@ export async function apply(ctx) {
       ?? payload?.taskId
       ?? (payload?.agent?.id ? sessionTasks.get(payload.agent.id) : undefined)
 
-    const isContinuation = /继续|接续|恢复.*任务|继续.*工作|接上次|接着上次|resume.*task|continue.*task/i.test(query)
+    const isContinuation = isContinuationQuery(userQuery) || /继续|接续|恢复.*任务|继续.*工作|接上次|接着上次|resume.*task|continue.*task/i.test(userQuery)
     let handoffContext = ''
     if (rawTaskId || isContinuation) {
       try {
@@ -523,10 +1247,14 @@ export async function apply(ctx) {
         const tasks = Array.isArray(listRes?.tasks) ? listRes.tasks : []
         let targetTask = rawTaskId ? tasks.find(t => t.id === rawTaskId) : undefined
         if (!targetTask && isContinuation) {
-          const candidates = tasks.filter(t => t.status === 'in_progress' || t.status === 'paused')
+          // A shared library has many unrelated projects. A bare "continue" may
+          // resume only a task already linked to this session.
+          const candidates = tasks.filter(t => (t.status === 'in_progress' || t.status === 'paused')
+            && (config.projectRoot || (Array.isArray(t.sessionIds) && t.sessionIds.includes(currentSessionId))))
           targetTask = candidates[0]
         }
         if (targetTask) {
+          if (!query && !isContinuationQuery(targetTask.title)) query = [targetTask.title, targetTask.summary].filter(Boolean).join(' ').slice(0, 4000)
           rawTaskId = targetTask.id
           if (payload?.agent?.id) sessionTasks.set(payload.agent.id, targetTask.id)
           /**
@@ -695,7 +1423,7 @@ export async function apply(ctx) {
         await REPLAY_ONCE('core-recovered')
       }
     } catch (error) {
-      if (error?.name === 'AbortError') throw error
+      if (isCancelledClientError(error)) throw error
       // Mark the session degraded so the next successful prepare is recognised as
       // the recovery transition that triggers a replay.
       if (currentSessionId) sessionReplayState.degraded = true
@@ -707,14 +1435,24 @@ export async function apply(ctx) {
       return decision
     }
     revisions.set(payload.agent, prepared.knowledgeRevision)
-
-    const context = [handoffContext, prepared.context.trim()].filter(Boolean).join('\n\n')
+    const latestUser = userMessages.at(-1)
+    const recallKey = `${rawTaskId ?? ''}:${latestUser?.id ?? textOfMessage(latestUser)}:${prepared.knowledgeRevision}`
+    if (sessionState.recallKey !== recallKey) {
+      const recalled = await recallKnowledge({ client, config, logger, adapter: 'dsh',
+        sessionId: currentSessionId, query, trigger: 'task' })
+      sessionState.recallKey = recallKey
+      sessionState.recallContext = recalled.context
+    }
+    const context = [handoffContext, prepared.context.trim(), sessionState.recallContext].filter(Boolean).join('\n\n')
     if (!context) return decision
     const userIds = new Set(userMessages.map((message) => message.id))
     const index = decision.messages.findLastIndex((message) => userIds.has(message?.id))
     if (index < 0) return decision
     const messages = [...decision.messages]
     messages.splice(index + 1, 0, knowledgeMessage(context))
+    logger.info('context.injected', { adapter: 'dsh', sessionId: currentSessionId,
+      knowledgeRevision: prepared.knowledgeRevision, chars: context.length,
+      knowledgeIds: (prepared.knowledge ?? []).map(item => item.id) })
     return { ...decision, messages }
   })
 
@@ -733,7 +1471,7 @@ export async function apply(ctx) {
         ...(exec.agent && revisions.has(exec.agent) ? { knowledgeRevision: revisions.get(exec.agent) } : {}),
       }, { signal: exec.signal }))
     } catch (error) {
-      if (error?.message?.includes('protocol version mismatch') || error?.message?.includes('426')) {
+      if (error?.status === 426 || error?.code === 'protocol_mismatch' || error?.message?.includes('HTTP 426')) {
         checkedExecutions.set(exec, { decision: 'deny', reason: 'Agent Memory Backpack 协议版本不匹配（HTTP 426），已拒绝工具执行。' })
         return { kind: 'deny', reason: 'Agent Memory Backpack 协议版本不匹配（HTTP 426），已拒绝工具执行。' }
       }
@@ -827,7 +1565,8 @@ export async function apply(ctx) {
       }
       try {
         const result = await tool.execute(args, exec)
-        logger.debug('tool.ok', { tool: tool.name, ms: Date.now() - started })
+        logger.info('tool.ok', { adapter: 'dsh', sessionId: exec?.agent?.id, tool: tool.name, ms: Date.now() - started,
+          ...(tool.name === 'amb_submit_experience' ? { proposalId: result?.id, state: result?.state } : {}) })
         return result
       } catch (error) {
         logger.error('tool.failed', {
@@ -839,6 +1578,51 @@ export async function apply(ctx) {
       }
     },
   }), `agent-memory-backpack: ${tool.name}`)
+  registerTool(jsonTool({
+    name: 'amb_save_material',
+    description: 'Save a useful external reference with its source URL and summary for later retrieval. This records external material, not an adopted rule.',
+    parameters: { type: 'object', additionalProperties: false,
+      properties: { id: { type: 'string' }, title: { type: 'string' }, url: { type: 'string' },
+        summary: { type: 'string' }, body: { type: 'string' }, taskId: { type: 'string' } },
+      required: ['id', 'title', 'url', 'summary'] },
+    async execute(args, exec) {
+      return await client.post('/v1/material/save', { ...args, projectId: config.projectId }, { signal: exec.signal })
+    },
+  }))
+  registerTool(jsonTool({
+    name: 'amb_checkpoint_task',
+    description: 'Persist task progress, unfinished work, and a journal. Completion needs explicit verification evidence. A turn ending does not mean the task is complete.',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        taskId: { type: 'string' }, title: { type: 'string' },
+        status: { type: 'string', enum: ['in_progress', 'paused', 'completed', 'failed', 'cancelled'] },
+        summary: { type: 'string' }, notes: { type: 'string' },
+        unfinished: { type: 'array', items: { type: 'string' } },
+        verified: { type: 'string' }, evidence: { type: 'string', enum: ['unverifiable', 'self-reported', 'verifiable'] },
+        idempotencyKey: { type: 'string' },
+      },
+    },
+    async execute(args, exec) {
+      const receipt = await client.post('/v1/tasks/checkpoint', {
+        ...args, projectId: config.projectId, sessionId: exec.agent.id,
+      }, { signal: exec.signal })
+      if (receipt?.taskId) sessionTasks.set(exec.agent.id, receipt.taskId)
+      getSessionState(exec.agent.id).businessSinceCheckpoint = false
+      logger.info('journal.persisted', { adapter: 'dsh', sessionId: exec.agent.id,
+        taskId: receipt.taskId, journalId: receipt.journalId, revision: receipt.revision, outcome: receipt.outcome })
+      return receipt
+    },
+  }))
+  registerTool(jsonTool({
+    name: 'amb_task_activity',
+    description: 'Read the current session task and persisted event, proposal and journal receipts. Use to verify what was actually saved.',
+    parameters: { type: 'object', additionalProperties: false, properties: { taskId: { type: 'string' } } },
+    async execute(args, exec) {
+      return await client.post('/v1/tasks/activity', { projectId: config.projectId,
+        sessionId: exec.agent.id, ...(args?.taskId ? { taskId: args.taskId } : {}) }, { signal: exec.signal })
+    },
+  }))
   registerTool(jsonTool({
     name: 'amb_prepare',
     description: 'Prepare project knowledge context before starting or changing a task. Pass the task text as `query` to retrieve the workflows, skills and memories that match it; without a query only the standing rules are returned. Read-only: it grants no permission for extra actions.',
@@ -885,6 +1669,7 @@ export async function apply(ctx) {
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
+        literal: { type: 'boolean', description: 'Literal full-text search; bypass model relevance selection.' },
         query: { type: 'string' },
         kind: { type: 'string' },
         limit: { type: 'integer', minimum: 1, maximum: 200 },
@@ -895,6 +1680,7 @@ export async function apply(ctx) {
         projectId: config.projectId,
         query: typeof args?.query === 'string' ? args.query : '',
         ...(args?.kind ? { kind: String(args.kind) } : {}),
+        ...(typeof args?.literal==='boolean' ? { literal:args.literal } : {}),
         ...(Number.isInteger(args?.limit) ? { limit: args.limit } : {}),
       }, { signal: exec.signal })
     },
@@ -1091,11 +1877,15 @@ export async function apply(ctx) {
         // arbitrary characters here while the core accepts at most 120 from a
         // restricted character set, so the tool advertised inputs the core must
         // reject. The schema is the model's contract, so it must not overstate.
-        idempotencyKey: { type: 'string', minLength: 1, maxLength: 120, pattern: '^[\\p{L}\\p{N}_.:-]+$' },
+        // ASCII-only on purpose. \p{L}/\p{N} is legal in JS but not in the JSON
+        // Schema dialect Grok's sampler accepts, and one unsupported pattern
+        // fails the entire request before any tool is called.
+        idempotencyKey: { type: 'string', minLength: 1, maxLength: 120, pattern: '^[^\\s]+$' },
         discovery: { type: 'string', minLength: 1, maxLength: 12_000 },
         workflowId: { type: 'string', minLength: 1, maxLength: 120 },
         baseRevision: { type: 'integer', minimum: 1 },
         taskId: { type: 'string', minLength: 1, maxLength: 120 },
+        evidence: { type: 'string', maxLength: 4000 },
       }, required: ['idempotencyKey', 'discovery'],
     },
     async execute(args, exec) {
@@ -1105,6 +1895,7 @@ export async function apply(ctx) {
         ...(typeof args?.workflowId === 'string' ? { workflowId: args.workflowId } : {}),
         ...(Number.isSafeInteger(args?.baseRevision) && args.baseRevision >= 1 ? { baseRevision: args.baseRevision } : {}),
         ...(typeof args?.taskId === 'string' ? { taskId: args.taskId } : {}),
+        ...(typeof args?.evidence === 'string' && args.evidence.trim() ? { evidence: args.evidence.trim() } : {}),
         discovery: requireString(args?.discovery, 'discovery'),
       }
       try {
@@ -1119,8 +1910,9 @@ export async function apply(ctx) {
         }
         return { ...validatedReceipt, receiptSource: 'core', deliveryState: 'delivered', clientSubmissionId: proposalPayload.idempotencyKey, serverProposalId: validatedReceipt.id }
       } catch (error) {
-        if (error?.name === 'AbortError') throw error
-        // Deterministic 4xx rejections (400, 403, 409, 426) must not be queued
+        if (isCancelledClientError(error)) throw error
+        // `http4xx` (400, 403, 409, 426), `protocol` and `cancelled` are decisions,
+        // not faults: queueing one would only replay a guaranteed failure.
         if (isExplicitClientRejection(error)) {
           throw error
         }
@@ -1148,11 +1940,12 @@ export async function apply(ctx) {
             note: '核心当前不可达或暂态失败：候选已进入服务器持久队列，尚未正式受理；核心恢复后重放，重放按原幂等键不会重复写入。',
           }
         } catch (enqueueErr) {
-          if (enqueueErr?.name === 'AbortError') throw enqueueErr
+          if (isCancelledClientError(enqueueErr)) throw enqueueErr
           // When enqueue itself fails (e.g. core is completely down), do not break the host
           logger.warn('outbox.enqueue_failed', {
             kind: 'candidate',
             idempotencyKey: proposalPayload.idempotencyKey,
+            failureKind: enqueueErr?.kind, code: enqueueErr?.code, status: enqueueErr?.status,
             message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
           })
           let spooled = false
@@ -1163,6 +1956,10 @@ export async function apply(ctx) {
               projectId: config.projectId,
               payload: proposalPayload,
               error: (enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)).slice(0, 2000),
+              // Structured kind/code/status/reason: replay must tell a transient
+              // fault (worth another attempt) from a permanent refusal (drop)
+              // without parsing text.
+              failure: clientFailureMeta(enqueueErr),
             })
             spooled = outcome.enqueued === true
             if (outcome.enqueued) {
@@ -1257,23 +2054,32 @@ export async function apply(ctx) {
       ?? (session?.id ? sessionTasks.get(session.id) : undefined)
     const taskId = typeof rawTaskId === 'string' && rawTaskId.trim() ? rawTaskId.trim() : undefined
     const eventPayload = {
-      eventId: randomUUID(), adapter: 'dsh', projectId: config.projectId,
+      eventId: event.type === 'turn/end' && (event.id !== undefined || event.data?.turn !== undefined)
+        ? `dsh-end:${createHash('sha256').update(JSON.stringify([session.id, event.id ?? event.data.turn])).digest('hex')}`
+        : randomUUID(), adapter: 'dsh', projectId: config.projectId,
       sessionId: session.id,
       ...(taskId ? { taskId } : {}),
       kind, summary,
     }
-    void client.post('/v1/events', eventPayload).catch(async (error) => {
+    void client.post('/v1/events', eventPayload).then(receipt => {
+      if (receipt?.journalId) {
+        logger.info('journal.persisted', { adapter: 'dsh', sessionId: session.id,
+          taskId: receipt.taskId, journalId: receipt.journalId, revision: receipt.revision, outcome: receipt.outcome })
+      }
+    }).catch(async (error) => {
       // Event delivery must never break the turn, but a silent failure would
       // leave the diary incomplete with no way to find out why.
       if (client.isDisposed()) return
-      if (error?.name === 'AbortError') return
+      if (isCancelledClientError(error)) return
       logger.error('event.delivery_failed', {
         kind, sessionId: session.id,
+        failureKind: error?.kind, code: error?.code, status: error?.status,
         message: error instanceof Error ? error.message : 'unknown error',
       })
       client.warnEventFailure()
 
-      // 4xx semantic rejections should not be queued
+      // `http4xx` (including 426), `protocol` and `cancelled` are decisions, not
+      // faults: queueing one would only replay a guaranteed failure.
       if (isExplicitClientRejection(error)) return
 
       // Transport, timeout or 5xx: enqueue full event into outbox
@@ -1292,6 +2098,7 @@ export async function apply(ctx) {
         logger.warn('outbox.enqueue_failed', {
           kind: 'event',
           idempotencyKey: eventPayload.eventId,
+          failureKind: enqueueErr?.kind, code: enqueueErr?.code, status: enqueueErr?.status,
           message: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
         })
         try {
@@ -1301,6 +2108,10 @@ export async function apply(ctx) {
             projectId: config.projectId,
             payload: eventPayload,
             error: (enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)).slice(0, 2000),
+            // Structured kind/code/status/reason: replay must tell a transient
+            // fault (worth another attempt) from a permanent refusal (drop)
+            // without parsing text.
+            failure: clientFailureMeta(enqueueErr),
           })
           if (outcome.enqueued) {
             logger.info('spool.enqueued', { kind: 'event', idempotencyKey: eventPayload.eventId })
@@ -1318,26 +2129,45 @@ export async function apply(ctx) {
     })
   })
 
-  // Serve the UI access link to the DSH client-side tab if webServer service is available
+  // Serve the panel's data routes to the DSH client-side tab when webServer is available.
+  //
+  // The earlier revision served `/amb/ui-url` and `/amb/config` from this same
+  // prefix: both answered with the core endpoint, the page address and the
+  // credential, so an embedded document could pick them up. The native panel
+  // reads JSON only and never asked for an address (`client.js` fetches
+  // `/amb/summary`, `/amb/search`, `/amb/task`), so both routes were removed with
+  // the embedded page they existed for. Removing them also removes the only
+  // token-bearing response this prefix ever produced; the data routes below
+  // report counts, entries and one task record, and never the credential.
   ctx.inject(['webServer'], (host) => {
     if (host.webServer && typeof host.webServer.register === 'function') {
       host.webServer.register({
         kind: 'prefix',
         path: '/amb',
         handler: (req, res) => {
-          if (req.url === '/amb/ui-url' || req.url === '/amb/config') {
-            res.writeHead(200, {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
+          if (isPanelDataRequest(req.url)) {
+            // The native panel's three data routes, served from this same /amb
+            // prefix so the panel's whole surface stays on one loopback route. The
+            // handler reports every outcome itself, so it is not awaited here.
+            void handlePanelRequest(req, res, { config, client, logger }).catch(() => {
+              // handlePanelRequest answers its own failures; this only stops a
+              // broken response stream from surfacing as an unhandled rejection.
             })
-            res.end(JSON.stringify({
-              endpoint: config.endpoint,
-              url: `${config.endpoint}/ui#${encodeURIComponent(config.token)}`,
-              projectId: config.projectId,
-            }))
             return
           }
-          res.writeHead(404)
+          if (typeof req.url === 'string' && req.url.startsWith(PANEL_ADMIN_PREFIX)) {
+            // The management surface. Every action is allow-listed by name on this
+            // side and performed with the admin credential, which the browser half
+            // never receives; see handlePanelAdminRequest.
+            void handlePanelAdminRequest(req, res, { config, logger }).catch(() => {
+              // Same contract as above: the handler answers its own failures.
+            })
+            return
+          }
+          // An explicit, empty header set: this prefix answers 404 with no body and
+          // no CORS grant, and a caller must be able to tell "no grant" from "no
+          // header object at all" when it checks that boundary.
+          res.writeHead(404, {})
           res.end()
         },
       })

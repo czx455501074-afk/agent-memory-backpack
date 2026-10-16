@@ -21,6 +21,81 @@ export const SPOOL_MAX_BYTES = 4 * 1024 * 1024; // 4 MiB
 export const SPOOL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 export const SPOOL_MAX_ATTEMPTS = 12;
 
+/**
+ * Failure kinds a later attempt may still survive.
+ *
+ * The distinction is the whole point of keeping structured metadata: a refusal
+ * the core repeated on purpose (4xx, 426, a protocol mismatch, a cancellation)
+ * can never succeed by being sent again, so replaying it only burns the retry
+ * budget and hides a real error behind an ever-growing queue. Only a transient
+ * fault is worth another attempt. `unknown` stays retryable because an item
+ * written by an earlier build carries no kind, and discarding user work on a
+ * guess is worse than one wasted attempt.
+ */
+const RETRYABLE_FAILURE_KINDS = new Set(['timeout', 'network', 'transport', 'http5xx', 'capacity', 'unknown']);
+
+function statusToKind(status) {
+  if (status === 507) return 'capacity';
+  return status >= 500 ? 'http5xx' : 'http4xx';
+}
+
+/**
+ * The failure kind of a queued item, from its structured record or, for entries
+ * written by an earlier build, from the legacy `lastError` string.
+ */
+export function failureKindOf(item) {
+  const structured = typeof item?.failure?.kind === 'string' && item.failure.kind;
+  if (structured) return item.failure.kind;
+  const status = Number(item?.failure?.status);
+  if (Number.isFinite(status)) return statusToKind(status);
+  const text = typeof item?.lastError === 'string' ? item.lastError : '';
+  const match = /\bHTTP\s*(\d{3})\b/.exec(text);
+  if (match) return statusToKind(Number(match[1]));
+  if (/protocol version mismatch|invalid_response|invalid response/i.test(text)) return 'protocol';
+  return 'unknown';
+}
+
+/** Whether replaying this item is worth another attempt. */
+export function isRetryableItem(item) {
+  return RETRYABLE_FAILURE_KINDS.has(failureKindOf(item));
+}
+
+/** Normalize the failure metadata an enqueue caller supplied. */
+function normalizeFailure(entry) {
+  const source = entry.failure && typeof entry.failure === 'object' ? entry.failure : undefined;
+  const reason = String(source?.reason ?? entry.error ?? '').slice(0, 2000);
+  if (!source && !reason) return undefined;
+  const failure = {
+    kind: typeof source?.kind === 'string' && source.kind ? source.kind : 'unknown',
+    at: Number.isFinite(source?.at) ? Number(source.at) : Date.now(),
+  };
+  if (typeof source?.code === 'string' && source.code) failure.code = source.code;
+  if (Number.isFinite(source?.status)) failure.status = Number(source.status);
+  if (reason) failure.reason = reason;
+  return failure;
+}
+
+/** Structured failure metadata for an error raised while replaying. */
+function failureMetaFromError(error, message) {
+  const failure = { at: Date.now() };
+  const reason = String(message ?? '').slice(0, 1000);
+  const status = Number(error?.status ?? error?.statusCode);
+  // The kind comes from the error when it has one. An error raised by an older
+  // build carries neither kind nor status, so its `HTTP <n>` message is read
+  // instead - otherwise a legacy 4xx would look transient and be replayed until
+  // the attempt cap.
+  const fromMessage = /\bHTTP\s*(\d{3})\b/.exec(reason);
+  failure.kind = typeof error?.kind === 'string' && error.kind
+    ? error.kind
+    : Number.isFinite(status) ? statusToKind(status)
+      : fromMessage ? statusToKind(Number(fromMessage[1])) : 'unknown';
+  if (typeof error?.code === 'string' && error.code) failure.code = error.code;
+  if (Number.isFinite(status)) failure.status = status;
+  else if (fromMessage) failure.status = Number(fromMessage[1]);
+  if (reason) failure.reason = reason;
+  return failure;
+}
+
 export function spoolFilePath(dataDir) {
   return join(dataDir, 'adapter-spool.json');
 }
@@ -74,12 +149,21 @@ export function spoolEnqueue(dataDir, entry) {
     return { enqueued: false, reason: 'missing_idempotency_key', error: 'Spool entry requires idempotencyKey or eventId' };
   }
 
+  const failure = normalizeFailure(entry);
+  const lastError = failure?.reason ?? (entry.error ? String(entry.error).slice(0, 2000) : '');
+
   const existingIndex = items.findIndex(item => item.idempotencyKey === key);
   if (existingIndex >= 0) {
+    const existing = items[existingIndex];
     items[existingIndex] = {
-      ...items[existingIndex],
+      ...existing,
       payload: entry.payload,
-      lastError: entry.error ? String(entry.error).slice(0, 2000) : items[existingIndex].lastError,
+      // `createdAt` and `attempts` are carried over on purpose: a duplicate
+      // arrival is the same pending work seen twice, not a fresh item, and
+      // resetting them would restart the TTL and hand back a retry budget this
+      // item already spent.
+      ...(failure ? { failure } : {}),
+      lastError: lastError || existing.lastError,
     };
     saveSpool(dataDir, items);
     return { enqueued: true, key, updated: true };
@@ -101,9 +185,12 @@ export function spoolEnqueue(dataDir, entry) {
     projectId: entry.projectId,
     payload: entry.payload,
     createdAt: Date.now(),
+    // A first failure is recorded, never counted: `attempts` is the budget replay
+    // spends, so it starts at zero even though delivery already failed once.
     attempts: 0,
     lastAttempt: 0,
-    lastError: entry.error ? String(entry.error).slice(0, 2000) : '',
+    lastError,
+    ...(failure ? { failure } : {}),
   });
 
   saveSpool(dataDir, items);
@@ -117,6 +204,7 @@ export async function spoolReplay(dataDir, client, logger) {
 
   const remaining = [];
   let deliveredCount = 0;
+  let rejectedCount = 0;
 
   for (const item of items) {
     let delivered = false;
@@ -131,11 +219,25 @@ export async function spoolReplay(dataDir, client, logger) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('duplicate') || msg.includes('idempotency_conflict')) {
+        // The core already has it: the write succeeded on an earlier attempt.
         delivered = true;
       } else {
-        item.attempts = (item.attempts ?? 0) + 1;
+        const failure = failureMetaFromError(err, msg);
+        item.failure = failure;
         item.lastAttempt = Date.now();
-        item.lastError = msg.slice(0, 1000);
+        item.lastError = failure.reason ?? msg.slice(0, 1000);
+        if (!isRetryableItem(item)) {
+          // A permanent refusal: another attempt can only fail the same way, so the
+          // item leaves the queue instead of being retried up to the cap. Only the
+          // key, kind and controlled code are logged - never the payload.
+          rejectedCount += 1;
+          if (logger) logger.warn('spool.rejected', {
+            key: item.idempotencyKey, kind: item.kind,
+            failureKind: failure.kind, code: failure.code, status: failure.status,
+          });
+          continue;
+        }
+        item.attempts = (item.attempts ?? 0) + 1;
       }
     }
 
@@ -152,5 +254,5 @@ export async function spoolReplay(dataDir, client, logger) {
   }
 
   saveSpool(dataDir, remaining);
-  return { replayed: deliveredCount, remaining: remaining.length };
+  return { replayed: deliveredCount, remaining: remaining.length, rejected: rejectedCount };
 }

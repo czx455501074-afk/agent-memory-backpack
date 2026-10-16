@@ -22,6 +22,9 @@ export const clientSchema = z.object({
       && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/';
   }, 'Core endpoint must be a loopback HTTP origin'),
   token: z.string().min(32).max(256), projectId: identifier, projectRoot: z.string().min(1).optional(),
+  autoCaptureFailures: z.boolean().optional(),
+  autoCaptureMaterial: z.boolean().optional(),
+  autoReflect: z.boolean().optional(),
   role: roleSchema.default('adapter'),
 }).strict();
 export const coreSchema = z.object({

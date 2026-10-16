@@ -89,11 +89,11 @@ test('real DSH ToolRuntime loads, executes and disposes the adapter with a real 
   } });
   const fiber = await plugin(adapter);
   const ambToolNames = tools.schemas().filter(x => x.name.startsWith('amb_')).map(x => x.name).sort();
-  assert.equal(ambToolNames.length, 12);
+  assert.equal(ambToolNames.length, 15);
   assert.deepEqual(ambToolNames, [
-    'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
-    'amb_read_stage', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
-    'amb_submit_experience', 'amb_supersede_experience', 'amb_unstructured_skills',
+    'amb_checkpoint_task', 'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
+    'amb_read_stage', 'amb_save_material', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
+    'amb_submit_experience', 'amb_supersede_experience', 'amb_task_activity', 'amb_unstructured_skills',
   ]);
   const injected = [];
   const agent = { id: 'real-tool-session', session: { header: { cwd: process.cwd() } }, inject(message) { injected.push(message); } };
@@ -165,4 +165,99 @@ test('DSH project scope follows real paths and excludes a junction escaping the 
   assert.equal(isWithinProject(project, join(project, 'inside')), true);
   assert.equal(isWithinProject(project, join(project, 'escape')), false);
   assert.equal(isWithinProject(project, join(project, 'missing')), false);
+});
+
+test('shared DSH sessions read one library and capture failed tools as one pending candidate', { skip }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'amb-shared-runtime-'));
+  const previous = process.env.AMB_DSH_CONFIG;
+  const previousLog = process.env.AMB_LOG_DIR;
+  process.env.AMB_DSH_CONFIG = join(dir, 'client.json');
+  process.env.AMB_LOG_DIR = dir;
+  const store = new Store(join(dir, 'knowledge.sqlite'));
+  store.import([{ id: 'shared-memory', kind: 'memory', title: 'Shared failure recovery journal',
+    scope: { kind: 'global' }, baseRevision: 0, body: 'Look up the missing binary before retrying.', provenance: 'user' }]);
+  const token = 'd'.repeat(64);
+  const server = createCoreServer(store, { protocolVersion: 1, port: 47631,
+    clients: [{ id: 'dsh', token, projectId: 'shared' }, { id: 'codex', token: 'c'.repeat(64), projectId: 'shared' }] });
+  await new Promise(done => server.listen(0, '127.0.0.1', done));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  await writeFile(process.env.AMB_DSH_CONFIG, JSON.stringify({ endpoint, token, projectId: 'shared' }));
+  const root = new Context();
+  const fibers = [];
+  t.after(async () => {
+    for (const fiber of fibers.reverse()) await fiber.dispose();
+    server.closeAllConnections(); await new Promise(done => server.close(done)); store.close();
+    if (previous === undefined) delete process.env.AMB_DSH_CONFIG; else process.env.AMB_DSH_CONFIG = previous;
+    if (previousLog === undefined) delete process.env.AMB_LOG_DIR; else process.env.AMB_LOG_DIR = previousLog;
+    await rm(dir, { recursive: true, force: true });
+  });
+  const mount = async (plugin, config = {}) => { const fiber = root.plugin(plugin, config); fibers.push(fiber); await fiber; };
+  await mount(SystemPrompt);
+  await mount(ToolRuntime, { mode: 'native' });
+  let tools;
+  await mount({ name: 'shared-observer', inject: ['tools'], apply(ctx) { tools = ctx.tools; } });
+  await mount(adapter);
+  await mount({ name: 'failure-fixture', inject: ['tools'], apply(ctx) {
+    ctx.tools.register({ name: 'missing_binary', description: 'Failure fixture', parameters: { type: 'object', properties: {} },
+      output: { schema: { type: 'object' }, render: () => [] }, execute() { throw new Error('ENOENT token=private-value'); } });
+  } });
+  const reflections = [];
+  const agent = { id: 'project-a-session', session: { header: { cwd: tmpdir() } }, inject() {}, steer(message) { reflections.push(message); } };
+  const execute = (name, args = {}, owner = agent) => tools.execute({ callId: randomUUID(), name,
+    arguments: args, agent: owner, signal: new AbortController().signal });
+  const readA = await execute('amb_read_knowledge', { knowledgeId: 'shared-memory' });
+  const readB = await execute('amb_read_knowledge', { knowledgeId: 'shared-memory' },
+    { ...agent, id: 'project-b-session', session: { header: { cwd: process.cwd() } } });
+  assert.equal(readA.isError, false, JSON.stringify(readA));
+  assert.equal(readB.isError, false, JSON.stringify(readB));
+  store.recordTask('shared', { id: 'unrelated-task', title: 'Other project task', status: 'paused', sessionIds: ['unrelated-session'] });
+  const message = { id: randomUUID(), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] };
+  const preStep = await root.waterfall('agent/pre-step', { agent, messages: [message], signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [message] }));
+  assert.doesNotMatch(JSON.stringify(preStep), /\[Task Handoff\]|Other project task/,
+    'A shared library must not bind a bare continue request to an unrelated session');
+  const recallMessage = { ...message, id: randomUUID(), content: [{ type: 'text', text: 'missing binary' }] };
+  const autoRead = await root.waterfall('agent/pre-step', { agent, messages: [recallMessage], signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [recallMessage] }));
+  assert.match(JSON.stringify(autoRead.messages), /AMB 自动检索并读取/);
+  assert.match(JSON.stringify(autoRead.messages), /Look up the missing binary before retrying/,
+    'Actual host pre-step must read and inject body, not merely tell the model to search');
+  await root.serial('agent/turn-stopping', { agent, turn: 1, signal: new AbortController().signal });
+  assert.equal(reflections.length, 0, 'Only querying the plugin must not trigger an extra reflection step');
+  for (let i = 0; i < 2; i++) assert.equal((await execute('missing_binary')).isError, true);
+  await root.serial('agent/turn-stopping', { agent, turn: 2, signal: AbortSignal.abort() });
+  assert.equal(reflections.length, 0, 'Aborted user turns must never be revived');
+  await root.serial('agent/turn-stopping', { agent, turn: 2, signal: new AbortController().signal });
+  await root.serial('agent/turn-stopping', { agent, turn: 2, signal: new AbortController().signal });
+  assert.equal(reflections.length, 1, 'Business tools trigger at most one reflection request per natural turn');
+  assert.match(JSON.stringify(reflections), /amb_checkpoint_task/);
+  assert.match(JSON.stringify(reflections), /不要编造/);
+  const checkpoint = await execute('amb_checkpoint_task', { status: 'paused', summary: 'Missing binary still unresolved',
+    unfinished: ['Locate binary'], idempotencyKey: 'runtime-progress-checkpoint' });
+  assert.equal(checkpoint.isError, false, JSON.stringify(checkpoint));
+  const activity = await execute('amb_task_activity');
+  assert.equal(activity.isError, false, JSON.stringify(activity));
+  assert.match(JSON.stringify(activity), /journal/);
+  const proposals = store.listProposals('shared', 'pending');
+  assert.equal(proposals.length, 1);
+  assert.match(proposals[0].payload.discovery, /ENOENT/);
+  assert.doesNotMatch(JSON.stringify(proposals), /private-value/);
+  const { CoreClient } = await import('../dist/src/client.js');
+  const codex = new CoreClient({ endpoint, token: 'c'.repeat(64), projectId: 'shared', role: 'adapter' });
+  const shared = await codex.post('/v1/knowledge/read', { knowledgeId: 'shared-memory' });
+  assert.match(JSON.stringify(shared), /missing binary/);
+  const log = readFileSync(join(dir, 'amb-plugin.log.jsonl'), 'utf8');
+  assert.match(log, /experience.captured/);
+  assert.match(log, /tool.ok/);
+  assert.doesNotMatch(log, /private-value/);
+  assert.match(log, /knowledge.auto_recall/);
+  assert.match(log, /readIds.*shared-memory/);
+  await root.emit('session/event', { id: agent.id, header: { cwd: tmpdir() } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'stop' } } });
+  for (let i = 0; i < 30 && !store.searchUniversal('shared', '', 'journal').length; i++) {
+    await new Promise(done => setTimeout(done, 20));
+  }
+  const journals = store.searchUniversal('shared', '', 'journal');
+  assert.equal(journals.length, 1, 'Natural turn-end persists a journal without an explicit task id');
+  assert.equal(store.readKnowledge('shared', journals[0].id).outcome, 'unverified');
 });

@@ -1,6 +1,10 @@
 import { z } from 'zod';
 
-export const identifier = z.string().min(1).max(120).regex(/^[\p{L}\p{N}_.:-]+$/u);
+// No Unicode property escapes. A tool schema that carries \p{...} makes strict
+// upstreams (xAI/Grok) reject the whole request with invalid_client_tool_schema
+// before any tool runs. A negated whitespace class keeps "no spaces" without
+// leaving the ASCII class that JSON Schema actually understands.
+export const identifier = z.string().min(1).max(120).regex(/^[^\s]+$/);
 const shortText = z.string().trim().min(1).max(2000);
 /**
  * Where an entry applies.
@@ -169,8 +173,8 @@ export const journalSchema = z.object({
    * user's own daily record never arrives.
    */
   taskId: identifier.optional(),
-  did: z.string().trim().min(1).max(2000),
-  problems: z.string().trim().max(2000).default(''),
+  did: z.string().min(1).max(1000000),
+  problems: z.string().max(1000000).default(''),
   /** Where this task's experience landed, if any: entry ids or file paths. */
   experienceLanded: z.array(shortText).max(30).default([]),
   outcome: z.enum(['success', 'failure', 'unverified']),
@@ -249,6 +253,7 @@ export const proposalSchema = z.object({
   workflowId: identifier.optional(), stageId: identifier.optional(),
   baseRevision: z.number().int().positive().optional(),
   discovery: z.string().trim().min(1).max(12000),
+  evidence: z.string().trim().max(4000).optional(),
 }).strict();
 export const eventSchema = z.object({
   eventId: identifier, adapter: z.enum(['codex', 'dsh']), projectId: identifier,
