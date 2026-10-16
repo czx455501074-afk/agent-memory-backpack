@@ -223,6 +223,13 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           if(selected) enqueueWorkflowDraft(store,p.projectId,selected.id);
           return reply(res,200,{...prepared,retrieval:{...prepared.retrieval,selection}});
         }
+        // Workflow search, not knowledge search - the response carries `workflows`, and
+        // this only looks up workflow stages. Knowledge retrieval lives at
+        // `/v1/knowledge/search-universal`, which is almost always the endpoint a caller
+        // wants. The name here reads like general search and has been mistaken for it in
+        // practice (including by whoever wrote this comment: querying it for knowledge
+        // returned nothing eight times in a row before the distinction was noticed).
+        // Kept as-is rather than renamed, because callers already depend on the path.
         case '/v1/search': { const p = contextSchema.parse(body); return reply(res, 200, { workflows: store.search(p.projectId, p.query), knowledgeRevision: store.revision }); }
         case '/v1/expand': { const p = expandSchema.parse(body); return reply(res, 200, store.expand(p.projectId, p.workflowId, p.stageId)); }
         case '/v1/gate': {
