@@ -112,7 +112,7 @@
 - 路径：`desktop-tauri/src-tauri/target/release/bundle/{msi,nsis}/`
 - 构建：`tauri build` exit=0；release profile 优化（`opt-level="s"` + LTO）；release 10.93MB vs debug 22.09MB
 - 打包工具链由 Tauri 自动下载并**哈希校验**：WiX 3.14、NSIS 3.13
-- 标识：identifier `ai.amb.desktop`、productName `Agent Memory Backpack`、version `0.1.0`
+- 标识：identifier `ai.amb.desktop`、productName `Agent Memory Backpack`、version `1.0.0`
 - 主窗 `visible: false`（启动只驻留托盘，由托盘菜单唤出）
 
 ### DSH 插件包
@@ -152,8 +152,8 @@ Start-Process -FilePath 'node' -ArgumentList @("$base\agent-memory-backpack\runt
 
 ### 2. 回滚 Tauri 桌面
 
-- **NSIS**：运行 `Agent Memory Backpack_0.1.0_x64-setup.exe` 产生的卸载项，或从"设置 → 应用"卸载。
-- **MSI**：`msiexec /x "Agent Memory Backpack_0.1.0_x64_en-US.msi"`。
+- **NSIS**：运行 `Agent Memory Backpack_1.0.0_x64-setup.exe` 产生的卸载项，或从"设置 → 应用"卸载。
+- **MSI**：`msiexec /x "Agent Memory Backpack_1.0.0_x64_en-US.msi"`。
 
 **卸载后需检查的残留点**：
 1. 开始菜单项与桌面快捷方式
@@ -162,7 +162,7 @@ Start-Process -FilePath 'node' -ArgumentList @("$base\agent-memory-backpack\runt
 
 > **已补做（2026-10-16，实测）**：实际执行了 NSIS 静默安装（exit 0）与静默卸载（exit 0）。
 >
-> 安装后产生：安装目录 `%LOCALAPPDATA%\Agent Memory Backpack`；卸载注册项（DisplayName `Agent Memory Backpack`、DisplayVersion `0.1.0`、Publisher `amb`、UninstallString 指向该目录下 `uninstall.exe`、InstallLocation 同目录）；开始菜单快捷方式 `Agent Memory Backpack.lnk`。**安装器未写任何自启项**（HKCU Run 保持为空，符合"自启由托盘菜单控制"的设计，不是缺陷）。
+> 安装后产生：安装目录 `%LOCALAPPDATA%\Agent Memory Backpack`；卸载注册项（DisplayName `Agent Memory Backpack`、DisplayVersion `1.0.0`、Publisher `amb`、UninstallString 指向该目录下 `uninstall.exe`、InstallLocation 同目录）；开始菜单快捷方式 `Agent Memory Backpack.lnk`。**安装器未写任何自启项**（HKCU Run 保持为空，符合"自启由托盘菜单控制"的设计，不是缺陷）。
 >
 > 卸载后：安装目录、卸载注册项、开始菜单快捷方式**全部清理**，HKCU Run 无残留，`amb-desktop` 进程为 0。仅 `%LOCALAPPDATA%\ai.amb.desktop`（284 个文件，WebView2 与应用数据）保留 —— 这属**正常**，该目录是按 identifier 落的**用户数据**，卸载本就不应删除它；把它计入"卸载不干净"会得出错误结论。
 >
