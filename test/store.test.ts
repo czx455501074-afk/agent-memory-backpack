@@ -393,3 +393,29 @@ test('asOf reads the library as it stood at a moment, not its current value', as
   assert.equal(store.allEntries().find(e => e.id === norm.id)?.revision, 2,
     'asOf 不得改变当前视图');
 });
+
+test('the injection receipt names a revision for every entry it selected', async () => {
+  const store = await openStore();
+  const entries = await fixtureEntries();
+  store.import(entries);
+
+  // Ask with words the fixture entry actually contains. The norm is visible in every
+  // project but does not enter `selected` - norms are injected by a separate path - so
+  // asking with a norm's words yields nothing and the assertions below would have
+  // nothing to check.
+  assert.ok(entries.some(e => e.scope?.kind === 'project' && e.scope.projectId === 'project-demo'),
+    '夹具里应当有 project-demo 的条目');
+  const out = store.prepare('project-demo', '检索与核对');
+
+  const selected = out.retrieval.selected;
+  assert.ok(Array.isArray(selected), '回执必须带 selected 列表');
+  assert.ok(selected.length > 0, '用夹具里的词提问应当至少选中一条');
+
+  for (const item of selected) {
+    // The revision is what identifies the exact content. Without it the receipt says
+    // which entry was used but not what it said at the time, and an injection cannot be
+    // reconstructed from it - which is the whole point of keeping the receipt.
+    assert.equal(typeof item.revision, 'number', `条目 ${item.id} 的回执没有修订号`);
+    assert.ok(item.revision >= 1, `条目 ${item.id} 的修订号应为正整数`);
+  }
+});
