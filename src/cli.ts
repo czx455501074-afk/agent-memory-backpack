@@ -295,10 +295,11 @@ try {
         compared = diff(report.candidates, store.allEntries().map(entry => ({ id: entry.id, title: entry.content.title })));
       } finally { store.close(); }
     }
-    console.log(JSON.stringify({
+    const payload = {
       summary: summarize(report),
       scannedRoots: report.scannedRoots,
-      candidates: (compared ?? report.candidates.map(candidate => ({ ...candidate, change: 'new' as const }))).map(candidate => ({
+      candidates: (compared ?? report.candidates.map(candidate => ({ ...candidate, change: 'new' as const })))
+        .map(candidate => ({
         id: candidate.id, kind: candidate.kind, title: candidate.title,
         change: candidate.change, source: candidate.source, rationale: candidate.rationale,
         leafCount: candidate.leaves?.length ?? 0,
@@ -308,8 +309,30 @@ try {
       })),
       excluded: report.excluded,
       wrote: report.wrote,
-      note: 'Discovery is read-only. Nothing was written to the knowledge base or to any host file.',
-    }, null, 2));
+      note: 'Discovery is read-only. Nothing was written to the knowledge base or to any host file.'
+    };
+    if (values.json === true) {
+      console.log(JSON.stringify(payload, null, 2));
+    } else {
+      // Read-only scan: what a user needs is "what did you find, and what do I do next".
+      console.log('扫描现有知识（只读）');
+      console.log('  扫描目录  ' + report.scannedRoots.join(', '));
+      console.log('  ' + payload.summary);
+      const found = payload.candidates;
+      if (!found.length) {
+        console.log('  没有发现可采纳的知识。');
+      } else {
+        console.log('  可采纳 ' + found.length + ' 个：');
+        for (const c of found) {
+          const label = String(c.title ?? c.id);
+          const mark = c.change === 'new' ? '' : '（' + c.change + '）';
+          console.log('    [' + c.kind + '] ' + label.slice(0, 58) + mark);
+        }
+      }
+      if (payload.excluded.length) console.log('  跳过 ' + payload.excluded.length + ' 个（不是知识文档）');
+      console.log('');
+      console.log('  下一步：amb adopt --yes 采纳；或 amb rescan --roots <目录> 先看会改什么。');
+    }
   } else if (command === 'adopt') {
     // Promotion is explicit and reversible. Without --yes this only reports what
     // would change; it never writes, and it never touches a host file.
