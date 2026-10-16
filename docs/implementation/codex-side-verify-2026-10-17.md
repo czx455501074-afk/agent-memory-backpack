@@ -1,47 +1,132 @@
-# Codex 端复验原始观察（2026-10-17）
+# agent-memory-backpack Codex 端复验记录
 
-## 范围与约束
+复验日期：2026-10-17（Asia/Shanghai）
 
-- 目标：复验 agent-memory-backpack 在 Codex 新会话中的上下文注入，以及插件停用后注入是否消失。
-- 用户要求：仅做注入复验、停用复验、复验后重新启用；不修改代码、不重启 DSH。
-- 本次遵守：未修改代码；未重启 DSH；未停用插件（因无法访问插件设置 UI），因此未执行停用态会话或重新启用动作。
+## 1. 实际执行的命令或动作（含原文）
 
-## 观察记录
+### 本地只读检查
 
-### 1. 启用态注入复验
+在 `D:\huange-skill` 中执行：
 
-- 新建 Codex 会话标题：`AMB 注入复验（启用态）`
-- 会话 ID：`01a14614-b502-7520-8a89-32a5aee6d9b9`
-- 新会话收到的测试提示：`请只回复“收到”。`
-- 随后询问该新会话是否看到了启动上下文中的 AMB 注入，并要求原样给出首行。
-- 新会话原始回答：`有。首行是：[agent-memory-backpack]`
-- 记录的注入首行原文：`[agent-memory-backpack]`
-- 结论：启用态的新 Codex 会话确认收到注入。
+```powershell
+Get-ChildItem -Force | Select-Object Mode,Name; rg --files -g AGENTS.md -g '*plugin*' -g '*memory*' docs .
+```
 
-### 2. 停用态复验（未执行）
+读取 computer-use 操作规范：
 
-- 没有在插件设置 UI 中停用 agent-memory-backpack。
-- 没有创建或观察停用后的新会话。
-- 因此，停用态是否仍发生注入：**未验证**。
-- 阻塞证据：当前可用界面状态列出 Chrome 与空的 Codex MCP Apps 标签，没有可绑定的 Codex 原生应用窗口（apps 列表为空）；查询 Codex 插件管理能力时只发现权限、依赖、卸载等接口，没有启用/停用接口。
-- 为遵守“在插件设置里停用”的限定，没有通过改本地设置文件或其他非 UI 手段更改插件状态。
+```powershell
+Get-Content 'C:\Users\czx\.codex\plugins\cache\openai-bundled\computer-use\26.1013.31256\skills\computer-use\SKILL.md' -Raw
+```
 
-### 3. 复验后的插件状态
+AMB 历史知识检索调用原文：
 
-- 当前状态：仍为启用态；依据是新建 Codex 会话确实确认看到 AMB 注入。
-- 本次没有做“重新启用”操作，因为没有执行停用。
-- 未重启 DSH。
+```js
+tools.mcp__amb__amb_search_universal({
+  query: "agent-memory-backpack Codex 插件设置 停用 新会话 上下文注入",
+  limit: 5
+})
+```
 
-## 检查与限制
+### 创建并检查启用态新会话
 
-- 运行了 Codex 账号额度查询；查询时短期窗口剩余 100%，周窗口剩余 71%。
-- 尝试枚举可操作的 Codex 界面。可用 UI 工具报告 `apps: []`，浏览器只有既有 Chrome 标签及空的 Codex MCP Apps 标签；`listWindows` 在当前工具暴露中不可用。
-- 插件管理接口检索结果：没有 Codex 插件启用/停用方法。
-- 本报告只记载已观察事实；停用缺陷是否修复仍需在可访问插件设置 UI 的 Codex 桌面环境中完成后两步复验。
+先列出 Codex 项目，再在 `D:\huange-skill` 项目中创建本次测试会话。创建调用原文：
 
-## 下一步
+```js
+tools.mcp__codex_app__create_thread({
+  title: "AMB 注入复验（启用态）",
+  prompt: "请只回复“收到”。",
+  target: {
+    type: "project",
+    projectId: "05a994bb-d56e-4e64-916f-25452794ab71",
+    environment: { type: "local" }
+  }
+})
+```
 
-1. 在可操作的 Codex 桌面窗口打开插件设置，停用 agent-memory-backpack。
-2. 新建 Codex 会话，检查是否完全没有 `[agent-memory-backpack]` 注入并记录观察。
-3. 立即在同一设置页重新启用插件，确认最终为启用态。
-4. 将停用前、停用后和恢复启用后的原始观察补入本文件。
+会话 ID：`01a14614-b502-7520-8a89-32a5aee6d9b9`。
+
+随后向该会话提问，调用原文：
+
+```js
+tools.mcp__codex_app__send_message_to_thread({
+  threadId: "01a14614-b502-7520-8a89-32a5aee6d9b9",
+  hostId: "local",
+  prompt: "本会话启动时的上下文是否包含以 [agent-memory-backpack] 开头的插件注入？如有，请逐字给出该注入的首行；只根据你实际看到的启动上下文回答，未见则明确说未见。"
+})
+```
+
+读取新会话结果的调用：
+
+```js
+tools.mcp__codex_app__read_thread({
+  threadId: "01a14614-b502-7520-8a89-32a5aee6d9b9",
+  hostId: "local",
+  turnLimit: 2,
+  includeOutputs: true
+})
+```
+
+### 查找可用设置界面
+
+检查界面清单的原始调用：
+
+```js
+await cua.getState();
+```
+
+尝试枚举原生窗口的原始调用：
+
+```js
+await cua.listWindows();
+```
+
+该调用返回错误：`cua.listWindows is not a function`。
+
+查询插件管理接口名称的原始表达式：
+
+```js
+ALL_TOOLS.filter(x => x.name.startsWith("mcp__codex_apps__plugin_management")).map(x => x.name)
+```
+
+结果只有 `get_app_permissions`、`get_plugin_dependencies`、`search_plugins`、`suggest_plugins`、`uninstall_app`、`update_app_permissions`；没有启用/停用接口。未调用卸载接口。
+
+## 2. 观察到的原始证据
+
+### 启用态注入存在
+
+新会话收到的首条测试提示是“请只回复‘收到’。”随后该会话对启动上下文的检查原始回答为：
+
+> 有。首行是：
+>
+> `[agent-memory-backpack]`
+
+因此，本次新会话实际报告看到以 `[agent-memory-backpack]` 开头的注入。首行原文为：
+
+```text
+[agent-memory-backpack]
+```
+
+### 停用态注入证据
+
+没有停用插件，也没有创建停用后的新会话；因此没有“停用后仍有注入”或“停用后无注入”的观察证据。
+
+## 3. 无法完成的部分及具体卡点
+
+无法完成停用态复验及复验后重新启用，卡在访问 Codex 插件设置 UI：
+
+- 可用界面清单中 `apps` 为空；浏览器清单中 Codex MCP Apps 标签页为空，只有既有 Chrome 标签。没有可绑定的 Codex 原生设置窗口或设置页。
+- 尝试调用 `cua.listWindows()` 枚举窗口，但当前界面工具没有暴露该函数，原始错误为 `cua.listWindows is not a function`。
+- 可用的插件管理连接器未提供启用/停用动作；其结果没有可替代 UI 开关的停用接口。
+- 因用户明确要求从插件设置中停用，未通过改本地设置文件或其他途径切换状态。
+- 实际没有执行停用；故插件保持本次观测到的启用状态。没有重启 DSH，也没有修改代码。
+
+## 4. 结论状态
+
+| 项目 | 状态 | 依据 |
+|---|---|---|
+| codex-load | 通过 | 新建 Codex 会话成功运行并回复“收到”。 |
+| codex-inject | 通过 | 新会话明确报告注入存在，并给出原始首行 `[agent-memory-backpack]`。 |
+| disable | 无法验证 | 无法访问插件设置中的开关；未停用，因此没有停用后新会话的观察，也未执行重新启用。 |
+
+本记录不代表停用缺陷已修复；该项需要在能操作 Codex 插件设置 UI 的环境中完成停用、新会话观察和重新启用复验。
+
