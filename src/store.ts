@@ -1127,8 +1127,8 @@ export class Store {
       matchedTokens: [...matchedTokens],
       gaps: retrievalTokens.filter(token => !matchedTokens.has(token)),
       selected: [
-        ...workflows.map(w => ({ id: w.id, kind: 'workflow' as const, why: w.why })),
-        ...knowledge.map(k => ({ id: k.id, kind: k.kind, why: k.why })),
+        ...workflows.map(w => ({ id: w.id, revision: w.revision, kind: 'workflow' as const, why: w.why })),
+        ...knowledge.map(k => ({ id: k.id, revision: k.revision, kind: k.kind, why: k.why })),
       ],
       note: '这是本次检索的理由与未命中片段，供日后排查漏检；未命中不等于库中一定该有。',
     };
