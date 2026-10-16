@@ -944,7 +944,30 @@ try {
         } else if (command === 'retire') {
           if (!values.id || !values.revision || !Number.isInteger(Number(values.revision))) throw new Error('--id and integer --revision required');
           store.retire(values.id, Number(values.revision)); console.log('Knowledge retired; history preserved.');
-        } else console.log(JSON.stringify(store.stats(), null, 2));
+        } else if (command === 'status') {
+          // Prose by default. This answers "what is in my library?", and the rest of the
+          // CLI already prints prose with --json for scripts; this one had not.
+          const s = store.stats();
+          if (values.json === true) {
+            console.log(JSON.stringify(s, null, 2));
+          } else {
+            console.log('Agent Memory Backpack 知识库');
+            console.log('  知识版本  ' + s.knowledgeRevision);
+            console.log('  知识条目  ' + s.entries);
+            console.log('  待审候选  ' + s.pendingProposals);
+            console.log('  任务      ' + s.tasks);
+            console.log('  采纳记录  ' + s.adoptions + '，取代记录 ' + s.supersessions);
+            console.log('  事件      ' + s.events);
+            console.log('  发送队列  待发 ' + s.outbox.pending + '，失败 ' + s.outbox.failed + '，已放弃 ' + s.outbox.abandoned);
+            if (s.lastRescanAt) console.log('  上次重扫  ' + new Date(s.lastRescanAt).toLocaleString());
+          }
+        } else {
+          // An unknown command used to fall through to the stats dump, which reads as
+          // success and hides the typo entirely. Say what is wrong instead.
+          console.error('未知命令：' + command);
+          console.error('运行 amb --help 查看全部命令。');
+          process.exitCode = 1;
+        }
       } finally { store.close(); }
     }
   } else if (command === undefined) {
