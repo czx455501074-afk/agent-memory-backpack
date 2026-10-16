@@ -363,3 +363,33 @@ test('CAS 提案验证：baseRevision 必须精确匹配当前版本', async () 
   });
   assert.equal(store.stats().pendingProposals, 2);
 });
+
+test('asOf reads the library as it stood at a moment, not its current value', async () => {
+  // A clock we control: the assertions are about moments, not about wall time.
+  let clock = 1_700_000_000_000;
+  const store = await openStore(() => clock);
+  const [norm] = await fixtureEntries();
+  assert.ok(norm && norm.kind === 'norm');
+
+  const beforeAnything = clock - 1;
+  store.import([norm]);
+  const afterFirstWrite = clock;
+
+  clock += 60_000;
+  store.import([{ ...norm, title: norm.title + '（修订二）', baseRevision: 1 }]);
+  const afterEdit = clock;
+
+  assert.deepEqual(store.asOf(beforeAnything), [],
+    '在第一条写入之前，那一刻的库里应当是空的');
+
+  const then = store.asOf(afterFirstWrite).find(e => e.id === norm.id);
+  const now = store.asOf(afterEdit).find(e => e.id === norm.id);
+  assert.ok(then && now, '两个时刻都应能读到这条目');
+  assert.equal(then.revision, 1, '较早的时刻读到的是第一个修订');
+  assert.equal(now.revision, 2, '较晚的时刻读到的是第二个修订');
+  assert.notEqual(then.content.title, now.content.title, '两个时刻的内容确实不同');
+
+  // The current view is unaffected: asOf is a read, not a rollback.
+  assert.equal(store.allEntries().find(e => e.id === norm.id)?.revision, 2,
+    'asOf 不得改变当前视图');
+});
