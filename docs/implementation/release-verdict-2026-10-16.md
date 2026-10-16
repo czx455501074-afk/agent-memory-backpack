@@ -101,9 +101,11 @@
 
 | 产物 | 字节数 | SHA256 |
 |---|---|---|
-| `Agent Memory Backpack_0.1.0_x64_en-US.msi` | 4,104,192 | `D34CC2E3E4B4A00E053F0A32A7F4BD633629C74A672A2AD6CC7B5308336A6749` |
-| `Agent Memory Backpack_0.1.0_x64-setup.exe`（NSIS） | 2,796,349 | `75BEEEFEC386918C2DFA827AEE51E4DBA9E990526C419129F8F1588BF0EBEBEB` |
-| `amb-desktop.exe`（release 主程序） | 11,465,728 | `D0F12EE73D64673F13166C7833D83775517DED3F11DEAB1BDDE37542300DC09C` |
+| `Agent Memory Backpack_1.0.0_x64_en-US.msi` | 4,104,192 | `3D09849054D7677C4842EF7E6F175056FCC79A1D3836F4F383E645657479FC59` |
+| `Agent Memory Backpack_1.0.0_x64-setup.exe`（NSIS） | 2,797,766 | `ECA182260B539D72D3B73568F865B0725421197C9679226C56CB106D6FA0AC44` |
+| `amb-desktop.exe`（release 主程序） | 11,465,728 | `1CCFEF51E170BF63A20ABC282B452438780D7E5A066E1BDA92DB923DB148EADD` |
+
+> **2026-10-17 更正**：上面登记的原本是 **0.1.0** 的产物。版本号统一为 1.0.0 之后，那批安装程序**文件名里仍带着旧版本号**——它们不是"过期"，而是**标错了版本**，留着会让人以为 1.0 装出来是 0.1。已重新构建，并**删除旧产物**。下表为 1.0.0 产物的独立重算结果；注意 MSI 与主程序的**字节数与旧版相同**，但**哈希不同**——只比大小会得出"没变"的错误结论。
 
 上述哈希由本文档撰写时**独立重算复核**，与此前记录一致。
 
