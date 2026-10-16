@@ -35,6 +35,29 @@ npm run install:local
 npm run install:local -- --codex-workspace <工作区名称>
 ```
 
+### DSH 侧：用宿主自己的插件命令装（推荐）
+
+DSH 自带插件安装命令，它会把这个插件**注册进指定 profile**，不需要手工改配置：
+
+```powershell
+# 本地目录用 link:，也可以给 git 地址或 registry 包名
+dsh plugin --profile desktop add D:\huange-skill\adapters\dsh
+# 然后重启 DSH 生效
+```
+
+装完看 `~/.dsh/profiles/<profile>/package.json`，会在**两处**看到它：
+
+```json
+"dependencies": { "dsh-agent-memory-backpack": "link:..." },
+"dsh": { "profile": { "bundles": [ "...", "dsh-agent-memory-backpack" ] } }
+```
+
+> **不要手工往 `cordis.patch.yml` 里 insert 本插件。** 它自带 bundle 补丁（`adapters/dsh/package.json` 的 `dsh.bundle.patch`），安装命令会自动注册；重复 insert 同一个 id 会让加载器因 duplicate loader entry id 拒绝启动。
+>
+> 这条已在 2026-10-17 实测：在一个**独立的临时 profile** 上跑到退出码 0，`bundles` 自动多了这一项，而 `cordis.patch.yml` **保持为空**（说明确实不需要手工补丁）。
+
+**两件事是分开的**：上面的命令只负责**把插件装进 DSH**；**数据目录与凭据**由 `amb init`（或 `npm run install:local`）创建。两者都要做，先后不限。
+
 安装脚本会：
 - 检查 Node 版本（必须 >=24.13.0 <25）
 - 创建数据目录 `~/.agent-memory-backpack`
