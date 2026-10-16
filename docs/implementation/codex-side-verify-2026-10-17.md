@@ -15,7 +15,7 @@ Get-ChildItem -Force | Select-Object Mode,Name; rg --files -g AGENTS.md -g '*plu
 读取 computer-use 操作规范：
 
 ```powershell
-Get-Content 'C:\Users\czx\.codex\plugins\cache\openai-bundled\computer-use\26.1013.31256\skills\computer-use\SKILL.md' -Raw
+Get-Content '<USER_HOME>\.codex\plugins\cache\openai-bundled\computer-use\26.1013.31256\skills\computer-use\SKILL.md' -Raw
 ```
 
 AMB 历史知识检索调用原文：

@@ -182,11 +182,15 @@ test('an existing archive is not overwritten without an explicit opt-in', () => 
 });
 
 test('the default archive name is dated and carries the expected extension', () => {
-  const name = defaultArchiveName(new Date('2026-10-10T12:34:56Z'));
+  // Built from local components, not an ISO string: the name exists so whoever exported
+  // the file can tell it apart from yesterday's, and they read their own clock. With a
+  // `Z` input this assertion would silently encode UTC and pass only in UTC.
+  const when = new Date(2026, 9, 10, 12, 34, 56);
+  const name = defaultArchiveName(when);
   assert.equal(name, 'agent-memory-backpack-20261010-123456.ambpack');
   assert.ok(name.endsWith(ARCHIVE_EXTENSION));
   // Two exports a second apart must not collide into the same default name.
-  assert.notEqual(name, defaultArchiveName(new Date('2026-10-10T12:34:57Z')));
+  assert.notEqual(name, defaultArchiveName(new Date(2026, 9, 10, 12, 34, 57)));
 });
 
 test('an archive directory entry or link is refused instead of being extracted', () => {

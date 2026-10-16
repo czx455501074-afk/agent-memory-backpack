@@ -773,17 +773,24 @@ try {
         // dated, so re-running cannot silently overwrite yesterday's archive.
         const file = values.file ? resolve(String(values.file)) : resolve(defaultArchiveName());
         const result = exportArchive(store, { file, dryRun: values.yes !== true, overwrite: values.overwrite === true });
-        console.log(JSON.stringify({
-          dryRun: values.yes !== true,
-          file: result.file,
-          bytes: result.bytes,
-          entries: result.entries,
-          counts: result.counts,
-          skipped: result.skipped,
-          note: values.yes === true
-            ? '归档已写入。它包含全部知识、历史版本、任务与候选队列，不含任何凭据；复制到另一台设备后用 restore 导入。'
-            : '干跑：未写入文件。确认路径后加 --yes 执行导出。',
-        }, null, 2));
+        const note = values.yes === true
+          ? '归档已写入。它包含全部知识、历史版本、任务与候选队列，不含任何凭据；复制到另一台设备后用 restore 导入。'
+          : '干跑：未写入文件。确认路径后加 --yes 执行导出。';
+        if (values.json === true) {
+          console.log(JSON.stringify({
+            dryRun: values.yes !== true, file: result.file, bytes: result.bytes,
+            entries: result.entries, counts: result.counts, skipped: result.skipped, note,
+          }, null, 2));
+        } else {
+          console.log(values.yes === true ? '导出知识库' : '导出知识库（干跑，未写文件）');
+          console.log('  文件  ' + result.file);
+          if (values.yes === true) {
+            console.log('  大小  ' + result.bytes + ' 字节');
+            console.log('  条目  ' + result.entries);
+          }
+          console.log('');
+          console.log('  ' + note);
+        }
       } else {
         if (!values.file) throw new Error('--file FILE is required: point it at the .ambpack archive to import');
         const file = resolve(String(values.file));
@@ -791,23 +798,39 @@ try {
           // Inspect first, so the user sees what is inside before anything is
           // merged; this is the same read the console shows in its confirm step.
           const preview = importArchive(store, { file, dryRun: true });
-          console.log(JSON.stringify({
-            dryRun: true,
-            archive: inspectArchive(file),
-            wouldImport: preview.imported,
-            wouldSkip: preview.skipped,
-            conflicts: preview.conflicts,
-            note: `干跑：未写入任何内容。加 --yes 执行合并导入。`
-              + (preview.conflicts.length ? ` 有 ${preview.conflicts.length} 条冲突会保留本机版本，不会覆盖。` : ''),
-          }, null, 2));
+          const note = '干跑：未写入任何内容。加 --yes 执行合并导入。'
+            + (preview.conflicts.length ? ` 有 ${preview.conflicts.length} 条冲突会保留本机版本，不会覆盖。` : '');
+          if (values.json === true) {
+            console.log(JSON.stringify({
+              dryRun: true, archive: inspectArchive(file), wouldImport: preview.imported,
+              wouldSkip: preview.skipped, conflicts: preview.conflicts, note,
+            }, null, 2));
+          } else {
+            console.log('导入预览（未写入任何内容）');
+            console.log('  归档  ' + file);
+            console.log('  将导入 ' + preview.imported + ' 条，跳过 ' + preview.skipped + ' 条');
+            if (preview.conflicts.length) {
+              console.log('  冲突  ' + preview.conflicts.length + ' 条（保留本机版本，不会被覆盖）');
+            }
+            console.log('');
+            console.log('  ' + note);
+          }
         } else {
           const result = importArchive(store, { file, dryRun: false });
-          console.log(JSON.stringify({
-            ...result,
-            knowledgeRevision: store.revision,
-            note: '导入完成，采用合并策略：只新增，不删除。'
-              + (result.conflicts.length ? ` ${result.conflicts.length} 条冲突保留了本机版本。` : ''),
-          }, null, 2));
+          const note = '导入完成，采用合并策略：只新增，不删除。'
+            + (result.conflicts.length ? ` ${result.conflicts.length} 条冲突保留了本机版本。` : '');
+          if (values.json === true) {
+            console.log(JSON.stringify({ ...result, knowledgeRevision: store.revision, note }, null, 2));
+          } else {
+            console.log('导入完成');
+            console.log('  导入  ' + result.imported + ' 条，跳过 ' + result.skipped + ' 条');
+            if (result.conflicts.length) {
+              console.log('  冲突  ' + result.conflicts.length + ' 条（保留了本机版本）');
+            }
+            console.log('  知识版本  ' + store.revision);
+            console.log('');
+            console.log('  ' + note);
+          }
         }
       }
     } finally { store.close(); }

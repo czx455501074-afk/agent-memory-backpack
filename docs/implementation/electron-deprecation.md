@@ -17,7 +17,7 @@
 | 内容 | 原位置 | 现位置 |
 |---|---|---|
 | 源码 | `D:\huange-skill\console\` | `D:\huange-skill\console.archived-electron\` |
-| 生产部署副本 | `D:\harness\toolchains\DeepSeek-Harness-plugins\console\` | `D:\harness\toolchains\DeepSeek-Harness-plugins\console.archived-at-20261016-201308\` |
+| 生产部署副本 | `<HOST_PLUGIN_ROOT>` | `<HOST_PLUGIN_ROOT>` |
 
 两者均为**重命名归档，不是删除**，内容完整保留。
 
@@ -50,7 +50,7 @@ Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
 对应的生产部署副本如需恢复：
 
 ```powershell
-Rename-Item 'D:\harness\toolchains\DeepSeek-Harness-plugins\console.archived-at-20261016-201308' 'console'
+Rename-Item '<HOST_PLUGIN_ROOT>' 'console'
 ```
 
 ## 已知遗留（未清理，非本记录遗漏）

@@ -224,12 +224,15 @@ export function importArchive(store: Store, options: { file: string; dryRun?: bo
 
 /** Default file name, so a user gets a dated archive instead of a bare overwrite risk. */
 export function defaultArchiveName(now = new Date()): string {
-  // UTC components, not `toISOString().slice()`: slicing the ISO string trims the
-  // seconds but keeps the milliseconds, producing a 6-digit clock block that no
-  // reader of the file name would interpret as HHmmss.
+  // Local components, not the ISO string. Two reasons:
+  //  - slicing the ISO string trims the seconds but keeps the milliseconds, producing a
+  //    6-digit clock block that no reader of the file name would interpret as HHmmss;
+  //  - the ISO string is UTC, so at 03:46 in UTC+8 this names the file with *yesterday's*
+  //    date. The whole point of the name is that a human can tell one export from another,
+  //    and a human reads their own clock.
   const pad = (value: number, width = 2) => String(value).padStart(width, '0');
-  const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}`
-    + `-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+    + `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
   return `agent-memory-backpack-${stamp}${ARCHIVE_EXTENSION}`;
 }
 

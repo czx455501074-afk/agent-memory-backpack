@@ -127,15 +127,15 @@
 
 | 位置 | 内容 | 数量 |
 |---|---|---|
-| `D:\harness\toolchains\DeepSeek-Harness-plugins\` | `agent-memory-backpack.backup-*` | 3 |
+| `<HOST_PLUGIN_ROOT>` | `agent-memory-backpack.backup-*` | 3 |
 | 同上 | `core.backup-*` | 3 |
 | 同上 | `console.backup-*` | 2（Electron 已弃用，历史遗留） |
-| `C:\Users\czx\.dsh\profiles\{amb-verify,desktop,headless,web}\` | `package.json.backup-*` 与 `node_modules/dsh-agent-memory-backpack.backup-*` | 各 6 |
+| `<USER_HOME>\.dsh\profiles\{amb-verify,desktop,headless,web}\` | `package.json.backup-*` 与 `node_modules/dsh-agent-memory-backpack.backup-*` | 各 6 |
 
 **还原步骤**（以核心 runtime 为例）：
 
 ```powershell
-$base = 'D:\harness\toolchains\DeepSeek-Harness-plugins'
+$base = '<HOST_PLUGIN_ROOT>'
 # 1. 选择要回滚到的备份（按时间戳取所需的一个）
 $keep = Get-ChildItem $base -Directory -Filter 'agent-memory-backpack.backup-*' | Sort-Object Name -Descending | Select-Object -First 1
 # 2. 先停掉正在使用它的核心进程，再替换（移动而非删除，保留现场）
@@ -143,7 +143,7 @@ Get-NetTCPConnection -LocalPort 47631 -State Listen | ForEach-Object { Stop-Proc
 Move-Item "$base\agent-memory-backpack" "$base\agent-memory-backpack.failed-$(Get-Date -Format yyyyMMddHHmmss)"
 Move-Item $keep.FullName "$base\agent-memory-backpack"
 # 3. 用还原后的 runtime 重启核心
-Start-Process -FilePath 'node' -ArgumentList @("$base\agent-memory-backpack\runtime\cli.js",'serve','--data-dir','C:\Users\czx\.agent-memory-backpack') -WindowStyle Hidden
+Start-Process -FilePath 'node' -ArgumentList @("$base\agent-memory-backpack\runtime\cli.js",'serve','--data-dir','<USER_HOME>\.agent-memory-backpack') -WindowStyle Hidden
 ```
 
 **验证**：`Get-NetTCPConnection -LocalPort 47631 -State Listen` 能查到新进程；对 `/v1/search` 连续采样应稳定在数百毫秒内（带 `x-amb-protocol: 1` 与匹配的 adapter 身份）。
@@ -172,7 +172,7 @@ Start-Process -FilePath 'node' -ArgumentList @("$base\agent-memory-backpack\runt
 
 DSH 通过 profile 清单的两处记录决定是否加载插件（撰写时实测 `profiles\desktop\package.json`）：
 
-- `dependencies["dsh-agent-memory-backpack"] = "link:D:/harness/toolchains/DeepSeek-Harness-plugins/agent-memory-backpack"`
+- `dependencies["dsh-agent-memory-backpack"] = "link:<HOST_PLUGIN_ROOT>"`
 - `dsh.profile.bundles` 数组内含 `dsh-agent-memory-backpack`
 
 **只从 `bundles` 移除该项即可停止加载**（依赖条目保留，文件与数据都不动，便于随时恢复）；要从清单中彻底移除则两个位置都要改。改完需重启 DSH。
