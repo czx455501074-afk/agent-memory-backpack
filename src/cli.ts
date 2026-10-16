@@ -38,6 +38,7 @@ const USAGE = [
   '  rescan [--roots PATH,...] [--yes]        compare sources against the ledger',
   '  supersede --old ID --new ID --reason TEXT --evidence TEXT [--action supersede|supplement]',
   '  history --id ID                          revision lineage of one entry',
+  '  asof --at TIME                           the library as it stood at that moment',
   '  structure --skill ID --input FILE --evidence TEXT [--derived-by user|agent]',
   '  unstructured                             skills awaiting structure',
   '  backup --file FILE [--yes] [--overwrite]  pack all data into one portable .ambpack file',
@@ -76,6 +77,7 @@ const parsed = (() => {
       skill: { type: 'string' }, 'derived-by': { type: 'string' },
       offline: { type: 'boolean', default: false }, json: { type: 'boolean', default: false },
       limit: { type: 'string' }, level: { type: 'string' }, event: { type: 'string' },
+      at: { type: 'string' },
       all: { type: 'boolean', default: false }, 'dsh-runtime-version': { type: 'string' },
       dir: { type: 'string' }, kinds: { type: 'string' },
       file: { type: 'string' }, overwrite: { type: 'boolean', default: false },
@@ -474,6 +476,33 @@ try {
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try { console.log(JSON.stringify(store.history(String(values.id)), null, 2)); }
     finally { store.close(); }
+  } else if (command === 'asof') {
+    // The library as it stood at a moment.
+    //
+    // Read-only on purpose: a past state answers a question ("what did this say back
+    // then"), it does not restore one. Nothing here writes or rolls anything back.
+    const spec = values.at;
+    if (!spec) throw new Error('缺少 --at：需要时间点，可用毫秒时间戳，或 2026-10-17T04:00:00+08:00 这样的时间');
+    const parsed = /^\d+$/.test(String(spec)) ? Number(spec) : Date.parse(String(spec));
+    if (!Number.isFinite(parsed)) throw new Error('无法解析 --at 的时间：' + String(spec));
+    const store = new Store(join(dir, 'knowledge.sqlite'));
+    try {
+      const entries = store.asOf(parsed);
+      if (values.json === true) {
+        console.log(JSON.stringify({
+          at: parsed, atIso: new Date(parsed).toISOString(), count: entries.length, entries,
+        }, null, 2));
+      } else {
+        console.log('知识库在 ' + new Date(parsed).toLocaleString() + ' 时的样子');
+        console.log('  条目 ' + entries.length + ' 条');
+        for (const e of entries.slice(0, 40)) {
+          console.log('    [修订 ' + e.revision + '] ' + String(e.content.title ?? e.id).slice(0, 56));
+        }
+        if (entries.length > 40) console.log('    ……还有 ' + (entries.length - 40) + ' 条（用 --json 取全部）');
+        console.log('');
+        console.log('  这是只读视图：过去的状态是一个问题，不是一次回滚。');
+      }
+    } finally { store.close(); }
   } else if (command === 'unstructured') {
     // Adopted skills still awaiting structure, so a user can see what is pending.
     const store = new Store(join(dir, 'knowledge.sqlite'));
