@@ -460,7 +460,23 @@ try {
     if (derivedBy !== 'user' && derivedBy !== 'agent') throw new Error('--derived-by must be user or agent');
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
-      const workflow = workflowSchema.parse(JSON.parse(readFileSync(resolve(values.input), 'utf8')));
+      // Fail with a sentence a user can act on. The raw readFileSync error is
+      // "ENOENT: no such file or directory, open 'C:\...\nope.json'" - it names a
+      // resolved path the user never typed, and says nothing about what to do next.
+      let authored: unknown;
+      try {
+        authored = JSON.parse(readFileSync(resolve(values.input), 'utf8'));
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        if (code === 'ENOENT') {
+          throw new Error(`找不到输入文件：${values.input}（--input 应指向你写好的工作流结构 JSON）`);
+        }
+        if (err instanceof SyntaxError) {
+          throw new Error(`输入文件不是合法 JSON：${values.input} —— ${err.message}`);
+        }
+        throw err;
+      }
+      const workflow = workflowSchema.parse(authored);
       const result = store.structureSkill({
         skillId: String(values.skill), workflow, derivedBy, evidence: String(values.evidence),
       });
