@@ -226,7 +226,7 @@ test('CLI adopt 默认只报告不改动，--yes 才写入，且提示撤销命�
     assert.match(dry.note, /nothing was written/i);
 
     const statusAfterDry = JSON.parse(execFileSync(process.execPath,
-      [cli, 'status', '--data-dir', dataDir], { encoding: 'utf8' }));
+      [cli, 'status', '--json', '--data-dir', dataDir], { encoding: 'utf8' }));
     assert.equal(statusAfterDry.entries, 0, '干跑不得写入任何条目');
 
     // Real adoption.
@@ -242,7 +242,7 @@ test('CLI adopt 默认只报告不改动，--yes 才写入，且提示撤销命�
     assert.equal(revoked.revoked.length, 2);
 
     const finalStatus = JSON.parse(execFileSync(process.execPath,
-      [cli, 'status', '--data-dir', dataDir], { encoding: 'utf8' }));
+      [cli, 'status', '--json', '--data-dir', dataDir], { encoding: 'utf8' }));
     assert.equal(finalStatus.entries, 0, '撤销后知识库应为空');
 
     assert.deepEqual(await digestTree(root), before, '整个 CLI 流程不得改动源文件');

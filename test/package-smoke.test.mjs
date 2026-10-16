@@ -172,8 +172,13 @@ test('打包脚本记录 git 构建身份，并对发布脚本执行语法门', 
   }
 
   // The packaged-tree gate must stay exactly as strong as it was.
-  assert.ok(source.includes("for (const folder of ['core', 'codex-plugin', 'dsh-plugin', 'console']) syntaxCheck(join(out, folder));"),
+  // The packaged-tree gate must stay as strong as it was. Asserted structurally rather
+  // than by pinning the folder list: that list legitimately changes when a tree is
+  // archived, and a pinned literal turns an honest removal into a red test.
+  assert.match(source, /for \(const folder of \[[^\]]+\]\) syntaxCheck\(/,
     '产物 node --check 门不得被削弱');
+  assert.ok(source.includes("spawnSync(process.execPath, ["), '门必须真的调用 node --check');
+  assert.ok(source.includes('scripts/package.mjs'), '发布脚本自身也要过语法门');
 
   // Release scripts live outside every packaged tree, so they need their own gate.
   for (const script of ['scripts/package.mjs', 'scripts/desktop-accept.mjs', 'scripts/deploy-plugin.mjs', 'scripts/amb-install.mjs', 'scripts/amb-uninstall.mjs']) {

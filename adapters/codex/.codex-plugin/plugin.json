@@ -1,6 +1,6 @@
 {
   "name": "agent-memory-backpack",
-  "version": "0.1.0-p0.1",
+  "version": "1.0.0",
   "description": "Retrieve versioned project knowledge, follow complete workflows, and submit experience as candidates for review.",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"

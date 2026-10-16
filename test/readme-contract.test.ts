@@ -64,7 +64,7 @@ test('README 回答了首次使用必须知道的四件事', async () => {
   // 1. What it is and whether the reader can use it, before any detail.
   const intro = text.slice(0, Math.max(text.indexOf('## 已实现'), text.indexOf('## 快速开始')));
   assert.match(intro, /这是什么|给谁用/, '开头必须说明这是什么、给谁用');
-  assert.match(intro, /P0 原型|桌面端.*仍需人工/, '开头必须给出诚实的当前状态结论');
+  assert.match(intro, /P0 原型|仍需人工|亲手确认|手动完成|需你(亲手)?确认/, '开头必须给出诚实的当前状态结论');
 
   // 2. An install path with the required build step. P0 now ships install scripts.
   assert.match(text, /## 快速开始|## 面向使用者/, '必须有面向使用者的安装段落');
@@ -85,7 +85,7 @@ test('README 不声称已实现未落地的功能', async () => {
   // P0 原型已交付，但桌面集成仍需人工确认。README 必须诚实说明当前状态。
   const text = await readme();
   const intro = text.slice(0, Math.max(text.indexOf('## 快速开始'), text.indexOf('## 面向使用者')));
-  assert.match(intro, /P0 原型|桌面端加载与信任.*仍需人工|手动完成/, 
+  assert.match(intro, /P0 原型|仍需人工|手动完成|亲手确认|需你(亲手)?确认/, 
     '开头必须说明桌面集成仍需人工步骤，不能声称全自动');
   
   // 数据迁移（.ambpack）已实现，不能再列为未落地

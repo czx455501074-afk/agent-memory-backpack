@@ -83,7 +83,12 @@ test('a normal command still works after the argument handling change', async ()
     assert.equal(init.code, 0, `init 应成功：${init.stderr.slice(0, 200)}`);
     const status = await runCli(['status', '--data-dir', dir]);
     assert.equal(status.code, 0, 'status 应成功');
-    assert.match(status.stdout, /knowledgeRevision/, 'status 应输出 JSON 状态');
+    // `status` prints prose by default now - the answer to "what is in my library" - and
+    // the machine-readable shape moved behind --json. Both are asserted so neither can
+    // silently disappear.
+    assert.match(status.stdout, /知识条目|知识版本/, 'status 应说明库里的情况');
+    const asJson = await runCli(['status', '--json', '--data-dir', dir]);
+    assert.match(asJson.stdout, /knowledgeRevision/, '--json 仍应输出 JSON 状态');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
