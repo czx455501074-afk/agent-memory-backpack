@@ -744,8 +744,11 @@ test('the view switch offers every view, moves between them, and states what eac
   findButton(tree, '待审').props.onClick();
   tree = await driver.settle(component);
   const reviewText = textOf(tree);
-  assert(reviewText.includes('仅展示'), '待审区必须说明只读');
-  assert(reviewText.includes('处理请在 DSH / CLI 侧进行'), '待审区必须指明处理位置');
+  assert(reviewText.includes('仅供浏览'), '待审区必须说明这几项计数只读');
+  // The panel CAN act on candidates now, but only through the manage view and only
+  // with an admin credential - so the review view must point there rather than tell
+  // the reader the panel cannot do it at all.
+  assert(reviewText.includes('管理'), '待审区必须指向真正能处理候选的位置');
   assert.equal(reviewText.includes('已采纳'), true, '已采纳计数必须有标签');
   assert.equal(reviewText.includes('已归档'), true, '已归档计数必须有标签');
   assert.equal(hasButton(tree, '采纳') || hasButton(tree, '拒绝'), false, '不得伪造采纳/拒绝按钮');
