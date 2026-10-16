@@ -1050,8 +1050,40 @@ try {
   if (/Unknown option/.test(message)) {
     // parseArgs phrases this poorly; answer a usage mistake with usage.
     console.error(`${message}\n\n${USAGE}`);
+  } else if (error instanceof Error && error.name === 'ZodError') {
+    // The comment above is right that a Zod message can quote submitted content, so the
+    // raw message is not dumped. But `issues[].path` and `.code` are structural: they name
+    // the field and the kind of problem without quoting any value. That is exactly what a
+    // user needs to fix their file, and a generic "schema is invalid" throws away the only
+    // actionable part of the error.
+    const issues = (error as unknown as { issues?: Array<{ path?: Array<string | number>; code?: string }> }).issues ?? [];
+    // Zod's codes are precise but not readable: "invalid_union" tells a user nothing
+    // about what to change. Translate the common ones and keep the code in parentheses so
+    // the wording is still searchable.
+    const CODE_HINT: Record<string, string> = {
+      invalid_union: '格式不属于任何一种允许的形式（kind / scope 这类字段有分支）',
+      unrecognized_keys: '含有本命令不认识的字段',
+      invalid_type: '类型不对',
+      too_small: '数量或长度不足',
+      too_big: '数量或长度超出上限',
+      invalid_string: '字符串格式不对',
+      invalid_enum_value: '不在允许的取值范围内',
+      required: '缺少必填字段',
+    };
+    const describe = (code?: string) =>
+      code && CODE_HINT[code] ? CODE_HINT[code] + '（' + code + '）' : (code ?? 'invalid');
+    console.error('输入不符合格式要求：');
+    if (issues.length) {
+      for (const issue of issues.slice(0, 8)) {
+        const where = issue.path && issue.path.length ? issue.path.join('.') : '(文档根)';
+        console.error('  ' + where + ' —— ' + describe(issue.code));
+      }
+      if (issues.length > 8) console.error('  ……还有 ' + (issues.length - 8) + ' 处');
+    } else {
+      console.error('  （未提供字段位置）');
+    }
   } else {
-    console.error(error instanceof Error && error.name === 'ZodError' ? 'Configuration or import schema is invalid' : message);
+    console.error(message);
   }
   process.exitCode = 1;
 }
