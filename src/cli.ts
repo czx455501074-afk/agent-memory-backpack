@@ -336,11 +336,11 @@ try {
   } else if (command === 'adopt') {
     // Promotion is explicit and reversible. Without --yes this only reports what
     // would change; it never writes, and it never touches a host file.
-    if (!existsSync(join(dir, 'core.json'))) throw new Error('Core is not initialized for this data dir; run init first.');
+    if (!existsSync(join(dir, 'core.json'))) throw new Error('该数据目录尚未初始化；请先运行 amb init');
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
       if (values.revoke !== undefined) {
-        if (!Number.isFinite(Number(values.revoke))) throw new Error('--revoke requires the numeric batch timestamp printed by adopt');
+        if (!Number.isFinite(Number(values.revoke))) throw new Error('--revoke 需要 adopt 打印的那个批次时间戳（数字）');
         const result = store.revokeAdoption(Number(values.revoke));
         console.log(JSON.stringify({
           revoked: result.retired, skipped: result.skipped,
@@ -399,7 +399,7 @@ try {
     // anything. Vanished sources are reported, never auto-retired: a path may be
     // temporarily missing and retiring the user's knowledge on that basis would
     // be destructive.
-    if (!existsSync(join(dir, 'core.json'))) throw new Error('Core is not initialized for this data dir; run init first.');
+    if (!existsSync(join(dir, 'core.json'))) throw new Error('该数据目录尚未初始化；请先运行 amb init');
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
       const roots = values.roots ? String(values.roots).split(',').map(root => root.trim()).filter(Boolean) : defaultScanRoots();
@@ -450,11 +450,11 @@ try {
     // Working-time correction: after verifying in practice, replace or complement
     // an earlier experience. The earlier revision is always retained, so an
     // overturn is auditable rather than a silent overwrite.
-    if (!values.old || !values.new) throw new Error('--old ID and --new ID are required');
-    if (!values.reason) throw new Error('--reason is required: a supersession must state why');
-    if (!values.evidence) throw new Error('--evidence is required: cite what verified the change');
+    if (!values.old || !values.new) throw new Error('缺少 --old 与 --new：需要「被取代」与「取代者」两个条目 ID');
+    if (!values.reason) throw new Error('缺少 --reason：取代必须说明理由');
+    if (!values.evidence) throw new Error('缺少 --evidence：请引用验证了该改动的事实');
     const action = values.action ?? 'supersede';
-    if (action !== 'supersede' && action !== 'supplement') throw new Error('--action must be supersede or supplement');
+    if (action !== 'supersede' && action !== 'supplement') throw new Error('--action 只能是 supersede 或 supplement');
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
       const result = store.supersede({
@@ -470,7 +470,7 @@ try {
     } finally { store.close(); }
   } else if (command === 'history') {
     // Lineage view: which revisions exist and what replaced or supplemented what.
-    if (!values.id) throw new Error('--id ID is required');
+    if (!values.id) throw new Error('缺少 --id：需要目标条目的 ID');
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try { console.log(JSON.stringify(store.history(String(values.id)), null, 2)); }
     finally { store.close(); }
@@ -503,11 +503,11 @@ try {
     // The structure is supplied by the caller, never inferred from the Markdown:
     // ordered steps and completion criteria cannot be reliably read out of prose,
     // so inventing them would dress a fabrication up as a verified method.
-    if (!values.skill) throw new Error('--skill ID is required (the adopted skill to structure)');
-    if (!values.input) throw new Error('--input FILE is required (the authored workflow structure as JSON)');
-    if (!values.evidence) throw new Error('--evidence TEXT is required: cite what the structure is based on');
+    if (!values.skill) throw new Error('缺少 --skill：要整理成流程的那个已采纳技能 ID');
+    if (!values.input) throw new Error('缺少 --input：你写好的工作流结构 JSON 文件');
+    if (!values.evidence) throw new Error('缺少 --evidence：请引用该结构所依据的内容');
     const derivedBy = values['derived-by'] ?? 'user';
-    if (derivedBy !== 'user' && derivedBy !== 'agent') throw new Error('--derived-by must be user or agent');
+    if (derivedBy !== 'user' && derivedBy !== 'agent') throw new Error('--derived-by 只能是 user 或 agent');
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
       // Fail with a sentence a user can act on. The raw readFileSync error is
@@ -740,7 +740,7 @@ try {
     // removed, so the output is a plain SKILL.md tree with no plugin-only
     // front matter. An explicit --dir is required; the exporter refuses any
     // directory it does not own.
-    if (!values.dir) throw new Error('--dir DIRECTORY is required (the export target, e.g. <project>/.agents/skills/amb)');
+    if (!values.dir) throw new Error('缺少 --dir：导出目标目录（例如 <项目>/.agents/skills/amb）');
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
       const kinds = values.kinds ? String(values.kinds).split(',').map(k => k.trim()) as Array<Knowledge['kind']> : undefined;
@@ -765,7 +765,7 @@ try {
     // archive never holds credentials (the directory exporter refuses even a
     // credential-shaped file name), and the import only adds: a local entry that
     // is newer or has diverged is reported as a conflict and left untouched.
-    if (!existsSync(join(dir, 'core.json'))) throw new Error('Core is not initialized for this data dir; run init first.');
+    if (!existsSync(join(dir, 'core.json'))) throw new Error('该数据目录尚未初始化；请先运行 amb init');
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
       if (command === 'backup') {
@@ -792,7 +792,7 @@ try {
           console.log('  ' + note);
         }
       } else {
-        if (!values.file) throw new Error('--file FILE is required: point it at the .ambpack archive to import');
+        if (!values.file) throw new Error('缺少 --file：请指向要导入的 .ambpack 归档');
         const file = resolve(String(values.file));
         if (values.yes !== true) {
           // Inspect first, so the user sees what is inside before anything is
@@ -836,7 +836,7 @@ try {
     } finally { store.close(); }
   } else if (command === 'init') {
     const corePath = join(dir, 'core.json');
-    if (existsSync(corePath) || existsSync(join(dir, 'client.json'))) throw new Error('Configuration exists; refusing to overwrite credentials');
+    if (existsSync(corePath) || existsSync(join(dir, 'client.json'))) throw new Error('配置已存在；拒绝覆盖凭据');
     // Three credentials, two roles. The adapters are agents: they read and
     // propose. The admin credential is the human's, and only it can review
     // proposals — otherwise an agent could approve its own submission.
@@ -1007,7 +1007,7 @@ try {
     } else {
       try {
         if (command === 'seed') {
-          if (!values.input) throw new Error('--input is required');
+          if (!values.input) throw new Error('缺少 --input');
           const input = seedSchema.parse(JSON.parse(readFileSync(resolve(values.input), 'utf8')));
           /**
            * The report names what was written and what is not usable.
@@ -1031,7 +1031,7 @@ try {
           }, null, 2));
           if (result.unusable.length) process.exitCode = 1;
         } else if (command === 'retire') {
-          if (!values.id || !values.revision || !Number.isInteger(Number(values.revision))) throw new Error('--id and integer --revision required');
+          if (!values.id || !values.revision || !Number.isInteger(Number(values.revision))) throw new Error('缺少 --id，或 --revision 不是整数');
           store.retire(values.id, Number(values.revision)); console.log('Knowledge retired; history preserved.');
         } else if (command === 'status') {
           // Prose by default. This answers "what is in my library?", and the rest of the
