@@ -1,9 +1,19 @@
 {
   "name": "agent-memory-backpack",
-  "version": "0.1.0-p0.1",
+  "version": "1.0.0",
   "type": "module",
-  "description": "Shared workflow knowledge core with DeepSeek Harness and Codex desktop adapters",
+  "description": "Versioned, reviewed project knowledge for coding agents: a local SQLite core with DSH and Codex adapters, an MCP server, and a knowledge gate",
   "license": "MIT",
+  "bin": {
+    "amb": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "adapters",
+    "scripts",
+    "docs",
+    "README.md"
+  ],
   "keywords": [
     "agent",
     "knowledge-base",
@@ -22,8 +32,6 @@
     "start": "node dist/src/cli.js serve",
     "doctor": "node dist/src/cli.js doctor",
     "logs": "node dist/src/cli.js logs",
-    "console": "electron console/main.cjs",
-    "tray": "electron console/main.cjs --tray",
     "accept:desktop": "node scripts/desktop-accept.mjs",
     "pack:local": "node scripts/package.mjs",
     "deploy:plugin": "node scripts/deploy-plugin.mjs",
@@ -36,7 +44,6 @@
   },
   "devDependencies": {
     "@types/node": "24.19.1",
-    "electron": "^44.7.0",
     "typescript": "7.0.2"
   },
   "repository": {

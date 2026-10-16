@@ -40,6 +40,8 @@ let adapter = 'codex';
 let window;
 let tray;
 let isQuitting = false;
+/** Why the core client is absent. Shown in the tray so a missing core is visible, not a silent exit. */
+let startupError = '';
 /** Resolved at startup; the self-check needs both after the client is built. */
 let runtimeBase = '';
 let configPath = '';
@@ -313,14 +315,76 @@ function registerIpc() {
 // Disable hardware acceleration to prevent GPU process crashes on some systems
 app.disableHardwareAcceleration();
 
-function createTray() {
+/**
+ * An icon the tray can actually paint.
+ *
+ * Windows hides a tray icon whose image is empty, which is what a missing PNG
+ * produces, so the console then looks like it never started. A generated
+ * template is the fallback, and it is marked as a template so macOS tints it.
+ */
+function trayIcon() {
   const iconPath = join(__dirname, 'assets', 'tray-icon.png');
-  const icon = existsSync(iconPath)
-    ? nativeImage.createFromPath(iconPath)
-    : nativeImage.createEmpty();
+  const fromFile = existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
+  if (!fromFile.isEmpty()) return fromFile;
+  const size = 16;
+  const pixels = Buffer.alloc(size * size * 4);
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const edge = x < 1 || y < 1 || x > size - 2 || y > size - 2;
+      const mark = x >= 4 && x <= 11 && y >= 7 && y <= 8;
+      const on = edge || mark;
+      const offset = (y * size + x) * 4;
+      pixels[offset] = on ? 230 : 0;
+      pixels[offset + 1] = on ? 234 : 0;
+      pixels[offset + 2] = on ? 240 : 0;
+      pixels[offset + 3] = on ? 255 : 0;
+    }
+  }
+  const icon = nativeImage.createFromBuffer(pixels, { width: size, height: size });
+  icon.setTemplateImage(true);
+  return icon;
+}
 
-  tray = new Tray(icon);
-  tray.setToolTip('Agent Memory Backpack 知识控制台 (核心 47631)');
+/**
+ * Login item for this process.
+ *
+ * `app.setLoginItemSettings` is the supported path on Windows and macOS. The
+ * open-at-login flag is read back rather than assumed, because a packaged app
+ * and `electron .` report it differently and the menu must show the real state.
+ */
+function loginItemEnabled() {
+  try {
+    return app.getLoginItemSettings().openAtLogin === true;
+  } catch {
+    return false;
+  }
+}
+
+function setLoginItem(openAtLogin) {
+  app.setLoginItemSettings({ openAtLogin, args: ['--tray'] });
+  return loginItemEnabled();
+}
+
+function createTray() {
+  tray = new Tray(trayIcon());
+  tray.setToolTip(client
+    ? 'Agent Memory Backpack 知识控制台'
+    : 'Agent Memory Backpack 知识控制台（核心未连接）');
+  rebuildTrayMenu();
+  tray.on('click', () => {
+    if (!window) return;
+    if (window.isVisible() && !window.isMinimized()) window.hide();
+    else { window.show(); window.focus(); }
+  });
+  tray.on('double-click', () => {
+    if (!window) return;
+    window.show();
+    window.focus();
+  });
+}
+
+function rebuildTrayMenu() {
+  if (!tray) return;
 
   const contextMenu = Menu.buildFromTemplate([
     {
@@ -339,12 +403,21 @@ function createTray() {
     },
     { type: 'separator' },
     {
-      label: '核心状态: 运行中 (127.0.0.1:47631)',
+      label: client
+        ? `核心已连接 (${config?.endpoint ?? '未记录地址'})`
+        : `核心未连接${startupError ? `: ${startupError}` : ''}`,
       enabled: false,
     },
     {
       label: `运行模式: 全局共享知识库 (${adapter})`,
       enabled: false,
+    },
+    { type: 'separator' },
+    {
+      label: '开机自动启动并隐藏到托盘',
+      type: 'checkbox',
+      checked: loginItemEnabled(),
+      click: item => { item.checked = setLoginItem(item.checked); },
     },
     { type: 'separator' },
     {
@@ -356,22 +429,6 @@ function createTray() {
     },
   ]);
   tray.setContextMenu(contextMenu);
-
-  tray.on('click', () => {
-    if (!window) return;
-    if (window.isVisible() && !window.isMinimized()) {
-      window.hide();
-    } else {
-      window.show();
-      window.focus();
-    }
-  });
-
-  tray.on('double-click', () => {
-    if (!window) return;
-    window.show();
-    window.focus();
-  });
 }
 
 function createWindow() {
@@ -515,6 +572,10 @@ async function maybeScreenshot() {
 }
 
 app.whenReady().then(async () => {
+  // The tray exists before the core client does. A core that is down, or a
+  // missing config, used to quit the process here, which is why the console
+  // looked like it had no tray at all.
+  createTray();
   try {
     const resolvedConfigPath = resolveConfigPath();
     configPath = resolvedConfigPath;
@@ -529,16 +590,24 @@ app.whenReady().then(async () => {
     client = new CoreClient(config, adapter);
     registerIpc();
     createWindow();
-    createTray();
+    rebuildTrayMenu();
 
     // Diagnostic modes: visit what was asked for, then quit. Dump and screenshot
     // are mutually exclusive; dump is checked first because it covers more panels.
     if (await maybeDump()) { isQuitting = true; app.quit(); return; }
     if (await maybeScreenshot()) { isQuitting = true; app.quit(); return; }
   } catch (error) {
-    process.stderr.write(`${error instanceof Error ? error.message : 'Console failed to start'}\n`);
-    isQuitting = true;
-    app.quit();
+    startupError = error instanceof Error ? error.message : 'Console failed to start';
+    process.stderr.write(`${startupError}\n`);
+    // A missing config names no library, so staying resident would show an empty
+    // console with nothing to reconnect to. A core that is merely down still
+    // leaves the tray, because the config exists and the core may come back.
+    if (!config) {
+      isQuitting = true;
+      app.quit();
+      return;
+    }
+    rebuildTrayMenu();
   }
 });
 

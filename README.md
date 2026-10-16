@@ -8,7 +8,9 @@
 
 **解决什么**：规范与经验目前散落在各 agent 自己的文件里，两端各写一份、互相不知道对方改了什么。这个插件把知识放到一个本地库里，两个桌面都从它读。
 
-**当前状态**：P0 原型，核心功能可用，包括一键安装脚本、数据导出导入、控制台管理面板。桌面端加载与信任 hooks 仍需人工确认（见下文安装步骤）。
+**当前状态**：**1.0**。核心功能已实测通过——知识读写与检索、提案审核、规范门禁、导出/导入迁移闭环（隔离库完成 11 张表计数一致的往返）。DSH 侧与管理面板已在真机验证；Codex 侧的加载、注入、门禁、停用等机制层已逐项验证，界面观感需你亲手确认一次（见下文安装步骤）。
+
+**与同类项目相比，它多了什么**：目前开源的 agent 记忆方案（官方 MCP Memory、Mem0、Zep/Graphiti、Basic Memory、doobidoo MCP Memory 等）大多把记忆当作**一段可检索的文本**。AMB 把它当作**有版本、要审核、可门禁的知识**——每次修改留下修订史（可回溯、可取代），写入先落候选再由人采纳，还能用一条规范直接禁止某个工具调用。**它少了什么**：没有向量语义检索（用全文索引 + 归一化替代）、没有实体关系图谱、不做多模态。这三样都是刻意的取舍，不是未完成。
 
 ## 快速开始
 
@@ -21,7 +23,7 @@
 
 ```powershell
 # 1. 获取源码并构建
-git clone <仓库地址> agent-memory-backpack
+git clone https://github.com/czx455501074-afk/agent-memory-backpack.git
 cd agent-memory-backpack
 npm ci --ignore-scripts
 npm run build
@@ -193,15 +195,14 @@ node dist/src/cli.js ui --open     # 打印地址并打开浏览器
 
 安全边界保持不变：核心仍然拒绝其它来源的浏览器请求（只放行它自己这个源），并且所有数据接口都要求凭据——同源不等于免认证。
 
-### Electron 桌面控制台（可选）
+### 已归档：Electron 桌面控制台
+
+早期版本提供过一个 Electron 控制台。**它已下线，不再随发行产物提供**——产品线只保留两条：**Tauri 桌面版**与 **DSH 内嵌面板**（见上文）。源码保留在 `console.archived-electron/`，原因与迁移说明见 [`docs/implementation/electron-deprecation.md`](docs/implementation/electron-deprecation.md)。下面这段保留是为了让旧安装的人知道该往哪走：
 
 ```powershell
-npm run console -- --config="$HOME/.agent-memory-backpack/admin-client.json"
+# 旧命令（已不再受支持）
+# npm run console -- --config="$HOME/.agent-memory-backpack/admin-client.json"
 ```
-
-功能更全（含原生文件对话框的数据迁移与自检面板），但需要 Electron 二进制：`npm ci --ignore-scripts` 不会拉取它，先跑一次 `npm install`。若报 `ELECTRON_RUN_AS_NODE is set`，先 `Remove-Item Env:ELECTRON_RUN_AS_NODE`。
-
-> 大多数情况下用上面的网页版就够了；桌面版只在需要原生文件选择器时才有优势。
 
 ## 卸载
 

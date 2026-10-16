@@ -1,0 +1,456 @@
+{
+  "evaluatedAt": "2026-10-14T15:13:37.973Z",
+  "budgetMs": 4000,
+  "defaultConfigurationChanged": false,
+  "realLibraryReadOnly": true,
+  "realQueries": [
+    "已重启dsh",
+    "codex和dsh的任何项目会话都共享一个amb库，agent主动去库中搜索需要用到的知识、经验、日记等",
+    "主动调用插件数据和主动落盘到插件数据库，还有skill融入数据库如何实现"
+  ],
+  "reports": [
+    {
+      "model": "gemini-3.8-flash-high",
+      "datasetStatus": "previously-inspected-diagnostic-not-new-blind-test",
+      "cases": 18,
+      "modelCalls": 7,
+      "degradedCalls": 11,
+      "timeoutCalls": 11,
+      "truePositive": 5,
+      "falsePositive": 0,
+      "falseNegative": 6,
+      "precision": 1,
+      "recall": 0.45454545454545453,
+      "latencyP50Ms": 4002,
+      "latencyP95Ms": 4015,
+      "records": [
+        {
+          "id": "version-v2",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4015,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-compose-v2"
+          ]
+        },
+        {
+          "id": "version-v1",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4010,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-compose-v1"
+          ]
+        },
+        {
+          "id": "negated-compose",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4009,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "negated-backup",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4002,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "synonym-permission",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4000,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-permission"
+          ]
+        },
+        {
+          "id": "synonym-accessibility",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4014,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-keyboard"
+          ]
+        },
+        {
+          "id": "synonym-dialogue",
+          "actual": [
+            "blind-dialogue"
+          ],
+          "mode": "model",
+          "ms": 3583,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "signature-permission",
+          "actual": [
+            "blind-permission"
+          ],
+          "mode": "model",
+          "ms": 3592,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "signature-unicode",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4009,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-unicode"
+          ]
+        },
+        {
+          "id": "exact-keyboard",
+          "actual": [
+            "blind-keyboard"
+          ],
+          "mode": "model",
+          "ms": 3830,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "exact-backup",
+          "actual": [
+            "blind-backup"
+          ],
+          "mode": "model",
+          "ms": 3975,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "query-unsupported",
+          "actual": [],
+          "mode": "model",
+          "ms": 3532,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "query-filler",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4005,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "query-scattered",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4004,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "query-confirmation",
+          "actual": [],
+          "mode": "model",
+          "ms": 2575,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "version-unsupported",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4011,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "backup-rephrase",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "ms": 4010,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-backup"
+          ]
+        },
+        {
+          "id": "leaf-id",
+          "actual": [
+            "blind-unicode"
+          ],
+          "mode": "model",
+          "ms": 3815,
+          "falsePositive": [],
+          "falseNegative": []
+        }
+      ],
+      "realLibraryEntryCount": 166,
+      "realResults": [
+        {
+          "queryIndex": 0,
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "selectedIds": [],
+          "ms": 4021
+        },
+        {
+          "queryIndex": 1,
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "selectedIds": [],
+          "ms": 4063
+        },
+        {
+          "queryIndex": 2,
+          "mode": "lexical_fallback",
+          "reason": "timeout",
+          "selectedIds": [],
+          "ms": 4029
+        }
+      ]
+    },
+    {
+      "model": "cmdc-gemini-3.8-flash",
+      "datasetStatus": "previously-inspected-diagnostic-not-new-blind-test",
+      "cases": 18,
+      "modelCalls": 0,
+      "degradedCalls": 18,
+      "timeoutCalls": 0,
+      "truePositive": 0,
+      "falsePositive": 0,
+      "falseNegative": 11,
+      "precision": 0,
+      "recall": 0,
+      "latencyP50Ms": 471,
+      "latencyP95Ms": 1668,
+      "records": [
+        {
+          "id": "version-v2",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 1641,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-compose-v2"
+          ]
+        },
+        {
+          "id": "version-v1",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 1641,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-compose-v1"
+          ]
+        },
+        {
+          "id": "negated-compose",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 1668,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "negated-backup",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 334,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "synonym-permission",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 417,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-permission"
+          ]
+        },
+        {
+          "id": "synonym-accessibility",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 471,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-keyboard"
+          ]
+        },
+        {
+          "id": "synonym-dialogue",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 369,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-dialogue"
+          ]
+        },
+        {
+          "id": "signature-permission",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 541,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-permission"
+          ]
+        },
+        {
+          "id": "signature-unicode",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 389,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-unicode"
+          ]
+        },
+        {
+          "id": "exact-keyboard",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 428,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-keyboard"
+          ]
+        },
+        {
+          "id": "exact-backup",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 773,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-backup"
+          ]
+        },
+        {
+          "id": "query-unsupported",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 733,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "query-filler",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 408,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "query-scattered",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 424,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "query-confirmation",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 423,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "version-unsupported",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 658,
+          "falsePositive": [],
+          "falseNegative": []
+        },
+        {
+          "id": "backup-rephrase",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 648,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-backup"
+          ]
+        },
+        {
+          "id": "leaf-id",
+          "actual": [],
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "ms": 651,
+          "falsePositive": [],
+          "falseNegative": [
+            "blind-unicode"
+          ]
+        }
+      ],
+      "realLibraryEntryCount": 166,
+      "realResults": [
+        {
+          "queryIndex": 0,
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "selectedIds": [],
+          "ms": 643
+        },
+        {
+          "queryIndex": 1,
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "selectedIds": [],
+          "ms": 680
+        },
+        {
+          "queryIndex": 2,
+          "mode": "lexical_fallback",
+          "reason": "unavailable",
+          "selectedIds": [],
+          "ms": 669
+        }
+      ]
+    }
+  ]
+}

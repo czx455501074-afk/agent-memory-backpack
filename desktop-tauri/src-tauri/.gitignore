@@ -1,0 +1,7 @@
+# Rust build output. The debug tree alone reached 6.7 GB on this machine, and
+# nothing above this directory ignored it, so `git add desktop-tauri` would have
+# committed the whole thing.
+/target/
+
+# Written by tauri-build / tauri-cli.
+/gen/

@@ -1,0 +1,6 @@
+{
+  "name": "amb-console",
+  "private": true,
+  "description": "Agent Memory Backpack 知识控制台（Electron 桌面应用）",
+  "main": "main.cjs"
+}

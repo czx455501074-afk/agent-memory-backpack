@@ -20,6 +20,8 @@ npm run accept:desktop
 
 **实测结果（2026-10-10）**：自动项 通过 16 / 失败 0 / 跳过 0；需人工 6 项。重复运行结果一致。
 
+**实测结果（2026-10-16）**：自动项 通过 20 / 失败 0 / 跳过 0；需人工 6 项。本次运行写入 `desktop-acceptance-report.json`（`ranAt` 2026-10-16T11:56:51.360Z，`buildIdentity.matched = true`），退出码 0。**两次运行的条目集合不同，计数不可直接相比**：本轮脚本新增 `same-build`、`latest-build`、`client-half-valid`、`origin-loopback-admitted`、`host-refused`，并把 `origin-refused` 的语义收紧为「非回环 Origin 被拒绝」。旧报告里的 `no-client-half` 失败项随该断言被推翻而消失，**不代表同一断言由失败转为通过**。证据来源与口径见 `desktop-acceptance-report-provenance.md`。
+
 ## 零点五、真实桌面验收结果（2026-10-10）
 
 用户已在真实 Codex 与 DSH 桌面执行，证据在 `.local/desktop-manual-20261010/` 与 `.local/desktop-codex-retest-20261010/`。详见 `2026-10-10-desktop-acceptance-results.md`。
@@ -53,8 +55,10 @@ npm run accept:desktop
 
 | 能力 | 证据 |
 |---|---|
-| 产物与清单一致 | `npm run accept:desktop`：48 个文件哈希全部匹配 |
-| 插件包自足 | 同上：DSH 插件包含全部被导入模块，且未声明会导致加载失败的浏览器半 |
+| 产物与清单一致 | `npm run accept:desktop`（2026-10-16 实测）：133 个文件哈希全部匹配 |
+| 产物与当前工作树同一构建 | 同上：产物清单记录 commit `fe8ceba8…`（工作树 dirty）与当前工作树一致，`buildIdentity.matched = true` |
+| 插件包自足 | 同上：DSH 插件包含全部被导入模块（4 个必需文件） |
+| 浏览器半存在且可用（`client-half-valid`） | 同上：包声明 `dsh.client` 与 `exports["./client"]`；`client.js` 存在、通过语法编译、导出 `apply`，并在 `conversation.view` 注册视图 `amb-knowledge-view` |
 | 宿主接受 bundle patch | `test/dsh-bundle-patch.test.mjs`：用宿主**自己的** `cordis-plugin-include` 与 YAML 方言解析并应用 |
 | 核心身份/协议/项目隔离 | `test/protocol.test.ts`：401、426、403（跨项目与跨适配器） |
 | 全新安装从空开始 | `test/clean-install.test.ts`：`entries=0 revision=0 adoptions=0` |
@@ -66,6 +70,24 @@ npm run accept:desktop
 | Codex hooks 全部事件 | `test/codex-hook.test.mjs`：15 项，含五种畸形响应拒绝 |
 | 采纳对宿主只读 | `test/adoption.test.ts` + 真实环境 301 文件零改动 |
 | 开源交付物无个人数据 | `test/clean-install.test.ts`：仓库与产物均无机器路径、用户名或作者技能内容 |
+| 非回环 Origin 被拒绝 | `npm run accept:desktop`（2026-10-16 实测）：`HTTP 403 origin_denied` |
+| 回环 Origin 有意放行 | 同上：`HTTP 200`（**设计如此，非回归**；同源 POST 也带 Origin，全拒会让界面空白） |
+| 非回环 Host 头被拒绝 | 同上：`HTTP 403 host_denied` |
+
+### 关于浏览器半的现状（2026-10-16 核实）
+
+本文档早前版本把「**未声明会导致加载失败的浏览器半**」当作通过条件，**这是一个已被推翻的旧假设**。事实相反：插件**故意**提供原生浏览器半 `adapters/dsh/client.js`。
+
+- 面板形态：**DSH 原生 React 面板**，挂载在宿主自己的 `conversation.view` 槽位；**已不再使用 iframe 内嵌 web 页面**。面板自行取数渲染，不嵌入第二个文档。
+- 对应验收项：已更名为 `client-half-valid`，断言「声明 `dsh.client` / `exports["./client"]` + `client.js` 存在 + 语法编译通过 + 导出 `apply` + 在 `conversation.view` 注册视图 id」。缺少浏览器半、或半不可加载，才会让桌面失去面板——这才是该项要抓的失败。
+
+### 关于面板数据端点与凭据（2026-10-16 核实）
+
+`/amb/ui-url` 与 `/amb/config` 两个端点**已下线删除**，不再由适配器提供：
+
+- `client.js` 只请求 `/amb/summary`、`/amb/search`、`/amb/task`；原生面板从不索要页面地址，两个端点因此失去存在理由。
+- `/amb/ui-url` 是此前唯一会返回 token 的响应。下线它同时是一次**安全收紧**；现存的三个数据路由只报告计数、条目与单条任务记录，**不含凭据**。
+- 依据：`adapters/dsh/index.mjs` 中 `/amb` 前缀处理段内的注释与 `PANEL_DATA_PATHS`；`adapters/dsh/client.js` 的 `ENDPOINTS` 表。
 
 ## 二、需人工执行的部分
 

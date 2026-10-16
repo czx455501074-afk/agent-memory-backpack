@@ -1,0 +1,17 @@
+{
+  "name": "amb-desktop-tauri",
+  "version": "0.1.0",
+  "description": "Agent Memory Backpack Desktop (Tauri)",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "dev:show": "tauri dev -- --show",
+    "build": "tauri build",
+    "icon": "tauri icon ../console/assets/icon-1024.png",
+    "check:js": "node --check src/main.js"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

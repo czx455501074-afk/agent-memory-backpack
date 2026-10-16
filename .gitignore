@@ -2,9 +2,27 @@
 node_modules/
 dist/
 
+# Standalone console builds. The installer and portable exe this produces are
+# release assets, not source.
+dist-console-out/
+dist-console/
+dist-console-build/
+
+# A pre-extracted Electron tree, used via `electronDist` in electron-builder.yml
+# so the build does not have to unpack and rename the cached archive itself.
+electron-dist/
+
 # Generated local artifacts: packaged bundles, extracted runtimes, test workspaces
 artifacts/
 .local/
+
+# Rollback copies written by scripts/deploy-plugin.mjs, and the deploy target a
+# test run may create inside this tree. Each backup is a full copy of a deployed
+# tree, so they must never be committed: 92 of them once added up to ~1.58 GB of
+# files that were never meant to ship. The deploy script now keeps only the
+# newest few per target; this rule covers whatever a past run left behind.
+*.backup-*
+.amb-deploy-test-target-*/
 
 # Verification run output. The scripts and their JSON results are kept (they are
 # reproducible evidence), but the raw console logs record absolute paths from the
@@ -54,3 +72,7 @@ docs/plans/
 
 # Environment-detection cache written by the zerotoken skill; machine-specific.
 .zerotoken/
+
+# Export artefacts and their archives are user data, not source.
+*.ambpack
+console.archived-electron/node_modules/

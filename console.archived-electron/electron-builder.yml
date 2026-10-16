@@ -1,0 +1,87 @@
+# electron-builder configuration for the Agent Memory Backpack console.
+#
+# Built from the repository root with `npm run dist:console`, because the console
+# needs two trees that sit outside its own directory: the compiled core runtime
+# and the runtime's npm dependencies. A build started from inside console/ would
+# not see either of them.
+#
+# Layout the packaged app produces, and the reason for each path:
+#
+#   resources/app.asar.unpacked/console/   console/main.cjs and its renderer
+#   resources/core/runtime/                client.js, config.js, doctor.js, ...
+#
+# `console/main.cjs` resolves the runtime by probing `../core/runtime` and
+# `../runtime` next to its own directory. Unpacking the console puts `__dirname`
+# inside app.asar.unpacked, so the probe lands on `resources/core/runtime` and
+# needs no code change at all. Shipping the console into the asar without
+# unpacking it would leave `__dirname` pointing at a path inside the archive,
+# where no sibling directory exists.
+
+appId: com.agent-memory-backpack.console
+productName: Agent Memory Backpack 知识控制台
+copyright: Agent Memory Backpack
+
+directories:
+  output: dist-console-out
+  buildResources: console/assets
+
+# A pre-extracted Electron, used instead of letting builder unpack the cached
+# archive itself.
+#
+# Builder's own path is: unpack the cached zip to `win-unpacked.tmp`, then rename
+# that directory to `win-unpacked`. On this machine the rename fails with EPERM
+# even in a fresh output directory and with no Electron process running — the
+# freshly written files are still held open, so the directory cannot be renamed
+# (a real-time scanner inspecting the new files is the usual cause). Pointing at
+# an already-extracted tree skips that step entirely: builder copies the files
+# instead of unpacking and renaming.
+#
+# MACHINE-SPECIFIC: this path lives outside the repository and must be prepared
+# once per machine. On a fresh machine either extract the archive first —
+#
+#   7z x "%LOCALAPPDATA%\electron\Cache\*\electron-v<version>-win32-x64.zip" -oD:\electron-dist
+#
+# — or delete the `electronDist` line below to fall back to builder's own
+# unpacking. Removing it is only safe where the rename above is permitted.
+electronDist: D:\electron-dist
+
+# The main entry must come from a manifest, so console/package.json names it.
+files:
+  - console/**
+  - package.json
+  - "!**/*.map"
+
+# The core runtime is placed outside the archive so the console can read it as
+# plain files. Only dist/src is needed: it is the compiled server, client,
+# schema and doctor that the console imports, and it is under a megabyte.
+extraResources:
+  - from: dist/src
+    to: core/runtime
+    filter:
+      - "**/*"
+
+asarUnpack:
+  - console/**
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  icon: console/assets/icon-256.png
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  # The console is a resident tray application, not a document handler: a desktop
+  # shortcut is what the user actually needs, and it is also what makes the app
+  # start with a clean environment instead of inheriting one from a host shell.
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: AMB 知识控制台
+  deleteAppDataOnUninstall: false

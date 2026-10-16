@@ -1,0 +1,155 @@
+{
+  "format": "agent-memory-backpack-acceptance-v1",
+  "ranAt": "2026-10-15T14:38:13.473Z",
+  "workspace": ".local\\desktop-accept\\workspace",
+  "dataDir": ".local\\desktop-accept\\data",
+  "summary": {
+    "pass": 15,
+    "fail": 1,
+    "skip": 0,
+    "manual": 6,
+    "automatedOk": false
+  },
+  "results": [
+    {
+      "id": "artifact",
+      "title": "打包产物与其清单一致",
+      "status": "pass",
+      "detail": "125 个文件哈希全部匹配",
+      "artifact": "artifacts\\p0-20261014153549972",
+      "mismatched": []
+    },
+    {
+      "id": "plugin-files",
+      "title": "DSH 插件包包含全部被导入的模块",
+      "status": "pass",
+      "detail": "已包含 4 个必需文件"
+    },
+    {
+      "id": "no-client-half",
+      "title": "插件未声明无法加载的浏览器半",
+      "status": "fail",
+      "detail": "声明了 dsh.client 或 ./client，宿主会尝试加载并失败"
+    },
+    {
+      "id": "bundle-patch",
+      "title": "宿主真实补丁机制接受该补丁",
+      "status": "pass",
+      "detail": "用宿主自己的 cordis-plugin-include 与 YAML 方言解析并应用成功"
+    },
+    {
+      "id": "runtime-load",
+      "title": "适配器在真实 DSH 运行时中加载与执行",
+      "status": "pass",
+      "detail": "真实 Cordis 事件总线与 ToolRuntime 下通过"
+    },
+    {
+      "id": "core-init",
+      "title": "初始化隔离数据目录",
+      "status": "pass",
+      "detail": "数据目录 .local\\desktop-accept\\data，端口 60988"
+    },
+    {
+      "id": "fresh-empty",
+      "title": "全新安装不含任何预置知识",
+      "status": "pass",
+      "detail": "entries=0 revision=0 adoptions=0"
+    },
+    {
+      "id": "core-health",
+      "title": "核心在环回地址上可访问",
+      "status": "pass",
+      "detail": "htt…/127.0.0.1:60988/health 回应正常"
+    },
+    {
+      "id": "auth-ok",
+      "title": "带正确凭据的请求被接受",
+      "status": "pass",
+      "detail": "HTTP 200"
+    },
+    {
+      "id": "auth-reject",
+      "title": "错误凭据被拒绝",
+      "status": "pass",
+      "detail": "HTTP 401"
+    },
+    {
+      "id": "origin-refused",
+      "title": "带 Origin 的浏览器式请求被拒绝",
+      "status": "pass",
+      "detail": "HTTP 403（安全边界：核心不接受页面来源的请求）"
+    },
+    {
+      "id": "project-isolation",
+      "title": "凭据不能跨项目访问",
+      "status": "pass",
+      "detail": "HTTP 403"
+    },
+    {
+      "id": "core-log",
+      "title": "核心写入可读的运行日志",
+      "status": "pass",
+      "detail": "2 条记录：run.start, core.listening"
+    },
+    {
+      "id": "self-check",
+      "title": "自检对照运行中的核心通过",
+      "status": "pass",
+      "detail": "共 14 项检查，无阻塞问题"
+    },
+    {
+      "id": "no-credential-leak",
+      "title": "自检输出不含凭据",
+      "status": "pass",
+      "detail": "凭据只以形态形式出现（长度与前缀）"
+    },
+    {
+      "id": "core-output",
+      "title": "核心启动输出包含监听地址",
+      "status": "pass",
+      "detail": "P0 core listening on http://127.0.0.1:60988; desktop integration remains unverified."
+    },
+    {
+      "id": "codex-load",
+      "title": "Codex 桌面加载插件",
+      "status": "manual",
+      "detail": "打开测试工作区（不要用正在工作的仓库），通过本地 marketplace 加载插件，并在信任提示出现时审阅并信任 hooks。未信任不算通过。",
+      "evidence": "插件出现在列表中的截图 + 信任确认后的状态截图"
+    },
+    {
+      "id": "codex-inject",
+      "title": "Codex 自动注入上下文",
+      "status": "manual",
+      "detail": "在该工作区新建会话，输入：查找本地流程资料，并说明开始前的检查。",
+      "evidence": "会话中出现来源标记为 agent-memory-backpack 的注入内容；仅模型自述不足为证"
+    },
+    {
+      "id": "dsh-load",
+      "title": "DSH 桌面加载插件",
+      "status": "manual",
+      "detail": "在“设置 → 插件”通过本地包入口加载 dsh-plugin。不要运行 dsh plugin --profile desktop，也不要手工 insert（包自带 bundle patch）。",
+      "evidence": "插件页显示已安装/已启用的截图"
+    },
+    {
+      "id": "dsh-inject",
+      "title": "DSH 自动注入上下文",
+      "status": "manual",
+      "detail": "在同一工作区新建会话，使用相同的自然语言请求。",
+      "evidence": "同上：注入内容须来自适配器而非模型自述"
+    },
+    {
+      "id": "gate-deny",
+      "title": "规范门禁确实阻止调用",
+      "status": "manual",
+      "detail": "先取到桌面实际传递的工具名，再在测试库加入只禁止该无副作用测试调用的规范，然后尝试调用。",
+      "evidence": "工具未执行 + 桌面显示拒绝原因"
+    },
+    {
+      "id": "disable",
+      "title": "停用后不再生效",
+      "status": "manual",
+      "detail": "通过各自 UI 停用插件，在新会话核查。",
+      "evidence": "不再注入上下文、不再提供工具；记录是否需要重启宿主"
+    }
+  ]
+}

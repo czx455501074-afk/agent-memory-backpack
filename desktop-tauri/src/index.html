@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost">
+    <title>Agent Memory Backpack</title>
+    <link rel="stylesheet" href="./app.css">
+</head>
+<body>
+    <header class="masthead">
+        <div class="masthead__mark" aria-hidden="true"></div>
+        <div class="masthead__text">
+            <h1>Agent Memory Backpack</h1>
+            <p class="masthead__sub">知识核心状态面板 · 关闭窗口即隐藏到托盘</p>
+        </div>
+        <div class="masthead__state">
+            <span class="dot" id="core-dot" data-state="unknown"></span>
+            <span id="core-state">正在检测核心…</span>
+        </div>
+    </header>
+
+    <main>
+        <section class="panel" aria-labelledby="metrics-title">
+            <h2 id="metrics-title">核心状态</h2>
+            <div class="metrics" id="metrics">
+                <article class="metric">
+                    <span class="metric__label">知识版本</span>
+                    <span class="metric__value" id="m-revision">—</span>
+                    <span class="metric__hint">knowledgeRevision</span>
+                </article>
+                <article class="metric">
+                    <span class="metric__label">生效条目</span>
+                    <span class="metric__value" id="m-entries">—</span>
+                    <span class="metric__hint">entries</span>
+                </article>
+                <article class="metric">
+                    <span class="metric__label">待审候选</span>
+                    <span class="metric__value" id="m-pending">—</span>
+                    <span class="metric__hint">pendingProposals</span>
+                </article>
+                <article class="metric">
+                    <span class="metric__label">任务记录</span>
+                    <span class="metric__value" id="m-tasks">—</span>
+                    <span class="metric__hint">tasks</span>
+                </article>
+                <article class="metric">
+                    <span class="metric__label">发件箱队列</span>
+                    <span class="metric__value" id="m-outbox">—</span>
+                    <span class="metric__hint">outbox.pending / failed / abandoned</span>
+                </article>
+                <article class="metric">
+                    <span class="metric__label">上次扫描</span>
+                    <span class="metric__value metric__value--time" id="m-rescan">—</span>
+                    <span class="metric__hint">lastRescanAt</span>
+                </article>
+            </div>
+            <p class="note" id="core-note">尚未读取。</p>
+        </section>
+
+        <section class="panel" aria-labelledby="actions-title">
+            <h2 id="actions-title">操作</h2>
+            <div class="row">
+                <button type="button" class="btn btn--primary" id="btn-refresh">刷新状态</button>
+                <button type="button" class="btn" id="btn-doctor">检查核心</button>
+                <button type="button" class="btn" id="btn-hide">隐藏到托盘</button>
+                <button type="button" class="btn btn--danger" id="btn-quit">彻底退出</button>
+            </div>
+            <p class="note" id="action-note">本窗口即知识面板；打开面板请用托盘菜单或托盘左键。</p>
+        </section>
+
+        <section class="panel" aria-labelledby="shell-title">
+            <h2 id="shell-title">桌面壳</h2>
+            <label class="switch">
+                <input type="checkbox" id="auto-launch">
+                <span class="switch__track" aria-hidden="true"></span>
+                <span class="switch__label">开机自动启动并隐藏到托盘</span>
+            </label>
+            <p class="note" id="auto-launch-note">勾选状态取自系统登录项的真实注册状态。</p>
+            <dl class="facts" id="facts">
+                <dt>核心地址</dt><dd id="f-endpoint">—</dd>
+                <dt>项目</dt><dd id="f-project">—</dd>
+                <dt>凭据角色</dt><dd id="f-role">—</dd>
+            </dl>
+        </section>
+
+        <section class="panel panel--log" aria-labelledby="log-title">
+            <h2 id="log-title">事件</h2>
+            <ol class="log" id="log"></ol>
+        </section>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+</body>
+</html>
