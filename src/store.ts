@@ -1930,6 +1930,27 @@ export class Store {
   }
   allEntries() { return this.current(); }
   /**
+   * The library as it stood at one moment.
+   *
+   * Every revision is kept together with its `created_at`, so the data needed to answer
+   * "what did this say back then" has always been in the library - only the query was
+   * missing. Without it that question could only be answered by walking one entry's
+   * history at a time.
+   *
+   * For each entry this returns the newest revision whose timestamp is at or before the
+   * given moment. An entry whose *first* revision came later is absent from the result,
+   * which is the honest answer rather than an omission: it had not been written yet.
+   *
+   * The comparison is inclusive, so passing a revision's own timestamp includes it.
+   */
+  asOf(at: number): Entry[] {
+    return this.db.prepare(`SELECT k.id,r.revision AS head,'active' AS status,r.content
+      FROM knowledge k JOIN revisions r ON k.id=r.id
+      WHERE r.created_at<=? AND r.revision=(
+        SELECT MAX(r2.revision) FROM revisions r2 WHERE r2.id=k.id AND r2.created_at<=?)
+      ORDER BY k.id`).all(at, at).map(row => this.decode(row));
+  }
+  /**
    * Promote a reviewed proposal.
    *
    * Promotion is never derived from the discovery text: a reviewer supplies the
