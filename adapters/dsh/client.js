@@ -841,6 +841,16 @@ window.__ModuleLoader__.load({
 }
 .amb-button:hover:enabled { background: var(--amb-bg-overlay); }
 .amb-button:disabled { opacity: 0.6; cursor: default; }
+/* A tab order already existed - every control in this panel is a real button, input or
+   select - it was simply invisible. Without a focus ring the panel cannot be operated
+   without a mouse, and it cannot be verified by anything other than aiming at pixels:
+   with no visible focus there is no way to tell a hit from a miss. */
+.amb-button:focus-visible,
+.amb-input:focus-visible,
+.amb-proposal-summary:focus-visible {
+  outline: 2px solid var(--amb-brand);
+  outline-offset: 2px;
+}
 .amb-section { display: flex; flex-direction: column; gap: 6px; }
 .amb-section-title { margin: 0; font-size: 12px; font-weight: 600; color: var(--amb-label-secondary); }
 .amb-grid {

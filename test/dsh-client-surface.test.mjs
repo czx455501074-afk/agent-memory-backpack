@@ -947,3 +947,14 @@ test('a candidate is identified by its own text, not by an id or a missing title
   tree = await driver.settle(registrations[0].component);
   assert(textOf(tree).includes('这里是被折叠起来的补充细节'), '展开后必须显示全文');
 });
+test('interactive controls show where the keyboard is', () => {
+  // A tab order already exists - every control in this panel is a real button, input or
+  // select - but with no focus ring it cannot be seen. That makes the panel unusable
+  // without a mouse, and unverifiable by anything except aiming at pixels. Anchored here
+  // so it cannot quietly disappear again.
+  assert(source.includes(':focus-visible'), '面板必须提供焦点指示');
+  assert(/outline:\s*2px solid var\(--amb-brand\)/.test(source), '焦点环必须可见且取自主题令牌');
+  for (const selector of ['.amb-button:focus-visible', '.amb-input:focus-visible']) {
+    assert(source.includes(selector), '缺少焦点样式的控件：' + selector);
+  }
+});
