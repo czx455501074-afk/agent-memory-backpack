@@ -74,6 +74,7 @@ dsh plugin --profile desktop add D:\huange-skill\adapters\dsh
 ```powershell
 amb --help                # 列出全部子命令
 amb history --id <ID>     # 查看某个条目的修订沿革
+amb asof --at <时间>      # 看知识库在某刻的样子（只读）
 amb backup --file <路径>  # 把全部数据打包成一个可迁移文件
 amb ui --open             # 打开管理面板地址
 ```
