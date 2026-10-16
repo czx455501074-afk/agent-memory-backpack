@@ -452,9 +452,17 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           const p = z.object({ projectId: z.string(), query: z.string().optional().default(''), kind: z.string().optional(), limit: z.number().int().positive().max(200).optional(), autoRecall: z.boolean().optional(),literal:z.boolean().optional() }).parse(body);
           const selection=p.kind!=='norm'&&!p.literal&&p.query.trim()?await selectKnowledge(p.projectId,p.query):{mode:'lexical_fallback' as const,selectedIds:[],reason:'explicit_full_text'};
           const catalog=store.searchUniversal(p.projectId,'',p.kind,Number.MAX_SAFE_INTEGER);
-          const results=p.kind==='norm'?store.searchUniversal(p.projectId,p.query,p.kind,p.limit):selection.mode==='model'||selection.mode==='index'||(p.autoRecall&&selection.reason!=='not_configured')?selection.selectedIds.flatMap(id=>catalog.filter(e=>e.id===id)).slice(0,p.limit??(p.autoRecall?3:100))
+          // When the model selects nothing, fall back to the lexical ranking instead of
+          // returning an empty set. The injection path has always done this; explicit
+          // search did not, so the same query could find an entry through injection and
+          // find nothing here. The reason is rewritten rather than dropped: a caller
+          // must still be able to tell "the model abstained" from "the model judged
+          // this irrelevant" - those are different facts and lead to different fixes.
+          const modelAbstained=(selection.mode==='model'||selection.mode==='index')&&selection.selectedIds.length===0;
+          const effective=modelAbstained?{...selection,mode:'lexical_fallback' as const,reason:`model_abstained:${selection.reason??'no_selection'}`}:selection;
+          const results=p.kind==='norm'?store.searchUniversal(p.projectId,p.query,p.kind,p.limit):effective.mode==='model'||effective.mode==='index'||(p.autoRecall&&effective.reason!=='not_configured')?effective.selectedIds.flatMap(id=>catalog.filter(e=>e.id===id)).slice(0,p.limit??(p.autoRecall?3:100))
             :p.autoRecall?store.autoRecall(p.projectId,p.query,p.kind,p.limit):store.searchUniversal(p.projectId,p.query,p.kind,p.limit);
-          return reply(res,200,{results,selection,knowledgeRevision:store.revision});
+          return reply(res,200,{results,selection:effective,knowledgeRevision:store.revision});
         }
         case '/v1/knowledge/get': {
           const p = z.object({ projectId: z.string(), id: z.string().min(1) }).parse(body);
