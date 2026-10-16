@@ -442,10 +442,23 @@ try {
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
       const skills = store.unstructuredSkills();
-      console.log(JSON.stringify({
-        count: skills.length, skills,
-        note: 'These adopted skills hold their original text and are not presented as verified procedures until structured.',
-      }, null, 2));
+      const note = 'These adopted skills hold their original text and are not presented as verified procedures until structured.';
+      if (values.json === true) {
+        console.log(JSON.stringify({ count: skills.length, skills, note }, null, 2));
+      } else {
+        console.log('待结构化的技能：' + skills.length + ' 个');
+        if (!skills.length) {
+          console.log('  （没有。已采纳的技能都已完成结构化。）');
+        } else {
+          for (const s of skills) {
+            const title = String((s as { title?: string }).title ?? '').trim();
+            console.log('  ' + String(s.id) + (title ? '  ' + title.slice(0, 60) : ''));
+          }
+        }
+        console.log('');
+        console.log('  这些技能保留原文，尚未整理成可复用的流程。');
+        console.log('  用 amb structure --skill <ID> --input <文件> --evidence <依据> 把它们变成正式流程。');
+      }
     } finally { store.close(); }
   } else if (command === 'structure') {
     // Convert one adopted skill into a real workflow.
