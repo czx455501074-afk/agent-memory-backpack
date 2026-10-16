@@ -58,7 +58,8 @@ dsh plugin --profile desktop add D:\huange-skill\adapters\dsh
 
 **两件事是分开的**：上面的命令只负责**把插件装进 DSH**；**数据目录与凭据**由 `amb init`（或 `npm run install:local`）创建。两者都要做，先后不限。
 
-安装脚本会：
+上面 
+pm run install:local 这个脚本会：
 - 检查 Node 版本（必须 >=24.13.0 <25）
 - 创建数据目录 `~/.agent-memory-backpack`
 - 生成三组独立凭据（codex、dsh、admin）
