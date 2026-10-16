@@ -406,7 +406,7 @@ try {
       const report = rescanDiff(discover(roots), store.adoptions());
 
       if (values.yes !== true) {
-        console.log(JSON.stringify({
+        const dry = {
           dryRun: true,
           summary: summarizeRescan(report),
           counts: report.counts,
@@ -415,8 +415,22 @@ try {
           newEntries: report.entries.filter(e => e.status === 'new')
             .map(e => ({ source: e.source.path, title: e.title, kind: e.kind })),
           vanished: report.vanished,
-          note: 'Dry run: nothing was written. Re-run with --yes to refresh changed sources (latest record wins).',
-        }, null, 2));
+          note: 'Dry run: nothing was written. Re-run with --yes to refresh changed sources (latest record wins; earlier revisions are kept).'
+        };
+        if (values.json === true) {
+          console.log(JSON.stringify(dry, null, 2));
+        } else {
+          // Default path, so this is the output most users see: say what would change,
+          // and that nothing has changed yet.
+          console.log('对比知识源与账本（预演，不写入）');
+          const c = dry.counts;
+          console.log('  新增 ' + c.new + '，变更 ' + c.changed + '，未变 ' + c.unchanged + '，消失 ' + c.vanished);
+          for (const e of dry.newEntries.slice(0, 20)) console.log('    [新增] ' + String(e.title ?? e.source).slice(0, 56));
+          for (const e of dry.changed.slice(0, 20)) console.log('    [变更] ' + String(e.title ?? e.source).slice(0, 56));
+          if (dry.newEntries.length + dry.changed.length > 40) console.log('    ……（更多条目见 --json）');
+          console.log('');
+          console.log('  这次什么都没写。确认清单无误后加 --yes 才会刷新变更的源。');
+        }
       } else {
         const outcome = applyRescan(store, roots);
         const { report } = outcome;
