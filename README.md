@@ -40,10 +40,12 @@ npm run install:local -- --codex-workspace <工作区名称>
 DSH 自带插件安装命令，它会把这个插件**注册进指定 profile**，不需要手工改配置：
 
 ```powershell
-# 本地目录用 link:，也可以给 git 地址或 registry 包名
-dsh plugin --profile desktop add D:\huange-skill\adapters\dsh
+# 在仓库根目录执行：本地目录用 link:，也可以给 git 地址或 registry 包名
+dsh plugin --profile <profile> add "$PWD\adapters\dsh"
 # 然后重启 DSH 生效
 ```
+
+`<profile>` 换成你的 profile 名（例如 `desktop`、`web`）。`$PWD` 是当前仓库所在目录，所以这条命令在任何人的机器上都成立——不要照抄某台机器的绝对路径。
 
 装完看 `~/.dsh/profiles/<profile>/package.json`，会在**两处**看到它：
 
@@ -161,18 +163,11 @@ node dist/src/cli.js restore --data-dir $AMB --file backup.ambpack --yes
 - `restore` 不带 `--yes` 时只检查归档（导出时间、条目计数、文件列表），不触碰数据库。
 - `restore --yes` 合并归档到当前库，重复条目会跳过，不覆盖本地更新。
 
-### 控制台方式（更直观）
+### 图形界面方式
 
-控制台是 Electron 桌面应用，需要指向 admin 凭据（否则无权审阅和导入）：
+图形入口是核心自己提供的网页界面，不需要另装桌面程序：`amb ui --open` 打印地址并打开浏览器。其中的「导入/导出」区块就是同一套迁移能力——导出可直接下载、导入会先预览再确认。详见下文[管理界面](#管理界面)。
 
-```powershell
-npm run console -- --config="$HOME/.agent-memory-backpack/admin-client.json"
-```
-
-提供「数据迁移」面板，支持：
-- 导出全部数据（弹保存对话框，自动带时间戳文件名）
-- 从文件导入（弹打开对话框，先预览再确认，显示导入统计）
-- 导出后直接打开文件所在文件夹
+> 早期版本另有一个 Electron 桌面控制台，**已下线**，`npm run console` 这条命令不再存在。源码留在 `console.archived-electron/`，去向见 [`docs/implementation/electron-deprecation.md`](docs/implementation/electron-deprecation.md)。
 
 ## 采纳你已有的知识
 
@@ -330,7 +325,6 @@ node dist/src/cli.js logs --source plugin   # 插件日志（核心不可达时�
 | `Core is not initialized for this data dir` | 该数据目录未初始化，运行安装脚本或 `cli init` |
 | `Cannot start core. Check whether this configured port is already in use.` | 端口被占用，换 `--port` |
 | `Configuration or import schema is invalid` | 某条内容不符合 schema（如正文超长），检查日志中的文件路径 |
-| `Console cannot start: ELECTRON_RUN_AS_NODE is set` | 见上文「控制台管理面板」 |
 
 ## 本机开发
 
@@ -346,14 +340,22 @@ npm run pack:local      # 生成可分发的产物
 
 ### 测试前置条件
 
-干净检出的 `npm test` 是 **315 通过 / 14 跳过**。全部失败数为 0；跳过的 14 项都缺少本机前置条件，
-**带原因跳过，不计为通过**。补齐后为 **329 通过 / 0 跳过**：
+同一套测试在两种环境下都能跑，差别只在**跳过哪些项**，从不出现失败：
+
+| 环境 | 实测结果 |
+|---|---|
+| 干净检出（刚 `git clone`，未准备任何本地资源） | **567 项：534 通过 / 0 失败 / 33 跳过** |
+| 本机已备齐下表的前置条件 | **567 项：565 通过 / 0 失败 / 2 跳过** |
+
+每次跳过都**带原因打印**，且不计为通过。33 项的构成：
 
 | 跳过项 | 数量 | 需要什么 |
 |---|---|---|
-| Electron 桌面控制台 | 5 | `node_modules/electron` 的 Electron 二进制（`npm ci` 未下载时缺失） |
-| 真实 DSH 运行库 | 8 | `.local/dsh-runtime-0.2.0-rc.2/node_modules`，或设 `DSH_PROFILE_NODE_MODULES` 指向别处 |
-| 打包产物冒烟 | 1 | `npm run pack:local` 后设 `AMB_ARTIFACT_DIR` 为产物根目录 |
+| 真实 DSH 运行库 | 20 | `scripts/extract-dsh-runtime.py` 解出的 `@deepseek-ai/* 0.2.0-rc.2`，或设 `DSH_PROFILE_NODE_MODULES` 指向别处 |
+| 未打包产物（部署与升级信号） | 7 | `npm run pack:local` |
+| 构建身份 fixture | 3 | 需要 git 元数据。源码压缩包、解包的 npm tarball 与 `git archive` 导出都没有 `.git`，**无法构造"当前提交"**，故带原因跳过而不是判失败 |
+| opt-in 检索测量 | 2 | `AMB_COMPARE_RETRIEVAL=1` 或 `AMB_LIVE_RETRIEVAL=1`（要调用模型，默认不跑） |
+| 打包产物冒烟 | 1 | `AMB_ARTIFACT_DIR` 指向 `artifacts/latest.json` 记录的那个目录 |
 
 ```powershell
 # 提取真实 DSH 运行库（只读桌面归档，不运行安装脚本，不改宿主）
@@ -368,29 +370,35 @@ npm test
 运行库目标契约为 `@deepseek-ai/* 0.2.0-rc.2`、Cordis 4.0.4；版本不符时这些测试**直接失败**（不是跳过）。
 前置条件与产物均为本地生成、已在 `.gitignore` 中，不随仓库分发。
 
+> 下面这条曾把新用户挡在门外：从 GitHub 下载的 zip 没有 `.git`，而三个验收测试要构造"当前提交"的 fixture，于是整份测试是红的。现在它们带原因跳过——**跳过项不是通过项，但也不会伪装成缺陷**。
+
 > PowerShell 示例使用 `$HOME`，需要 PowerShell 7（`pwsh`）。在 Windows PowerShell 5.1 下请改用 `$env:USERPROFILE`。
 
 ## 项目结构速查
 
 ```
 src/
-  cli.ts          CLI 入口（init, serve, backup, doctor, logs 等）
+  cli.ts          CLI 入口（--version/--help 与全部子命令）
   server.ts       HTTP 核心服务（协议 v1）
   store.ts        SQLite 存储层，全部 SQL 与事务逻辑
   backup.ts       目录形式导出导入（权威实现）
   archive.ts      单文件 .ambpack 归档（零依赖 tar+gzip）
+  ui.ts           核心自带的网页管理界面
+  retrieval-*.ts  词法索引、检索服务与可选的模型选择
   mcp.ts          MCP stdio 适配器
-  console.ts      Electron 控制台入口
 adapters/
-  dsh/            DSH 原生适配器（Cordis 插件）
-  codex/          Codex lifecycle hooks
-test/             189 项测试，覆盖协议、存储、归档、适配器
+  dsh/            DSH 原生适配器（Cordis 插件，含 bundle 补丁与面板 client.js）
+  codex/          Codex lifecycle hooks 与工作区插件
+test/             564 项测试（.ts 单元 + .mjs 端到端），覆盖协议、存储、归档、适配器
 scripts/
+  package.mjs        打包（含全量 node --check 语法门与构建身份记录）
+  deploy-plugin.mjs  部署到宿主 profile（读穿链接复核）
   amb-install.mjs    一键安装脚本（环境检查、初始化、自检）
   amb-uninstall.mjs  卸载脚本（只读检查或真实删除）
+desktop-tauri/    Tauri 桌面版（Windows x64 发行产物）
 docs/
-  architecture/   设计文档（协议、存储、权限模型）
-  implementation/ 实现细节（桌面集成 runbook、测试策略）
+  implementation/ 集成 runbook、审计与验证记录
+console.archived-electron/  已下线的 Electron 控制台源码（仅存档，不参与构建）
 ```
 
 ## 许可证

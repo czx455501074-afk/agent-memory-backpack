@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -57,6 +57,35 @@ test('README 中会写库的示例都指定了 --data-dir', async () => {
     .map(entry => entry.line);
   assert.deepEqual([...new Set(offenders)], [],
     '这些写库示例缺少 --data-dir，会让读者写到另一个库');
+});
+
+test('README 引用的本地文件与目录都真实存在', async () => {
+  // A link to a path that has since moved is worse than no link: it tells the
+  // reader the document is maintained while sending them nowhere. Only relative
+  // targets are checked — an external URL is somebody else's tree, and a heading
+  // anchor is not a path.
+  const text = await readme();
+  const targets = [...text.matchAll(/\]\(([^)]+)\)/g)]
+    .map(match => match[1]!.trim())
+    .filter(target => target !== '' && !/^(?:https?:|mailto:|#)/.test(target))
+    .map(target => decodeURIComponent(target.replace(/[#?].*$/, '')));
+
+  const missing: string[] = [];
+  for (const target of new Set(targets)) {
+    try { await stat(resolve(repoRoot, target)); } catch { missing.push(target); }
+  }
+  assert.deepEqual(missing, [],
+    `README 指向了不存在的路径（文档与仓库已经漂移）：${missing.join(', ')}`);
+});
+
+test('README 不携带本机绝对路径', async () => {
+  // The document ships to every reader; a drive-qualified path only ever works on
+  // the machine that wrote it. `https://` is excluded by the negative lookbehind
+  // and by refusing a separator that starts `//`.
+  const text = await readme();
+  const drivePaths = [...text.matchAll(/(?<![A-Za-z0-9])[A-Za-z]:[\\/](?!\/)[A-Za-z][^\s"'`)\]]*/g)].map(match => match[0]);
+  assert.deepEqual([...new Set(drivePaths)], [],
+    '公开文档不得硬编码某台机器的路径，请用相对路径或 <占位符>');
 });
 
 test('README 回答了首次使用必须知道的四件事', async () => {
