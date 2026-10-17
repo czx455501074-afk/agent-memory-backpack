@@ -118,6 +118,8 @@ window.__ModuleLoader__.load({
      */
     var MESSAGES = {
       "panel.tab": "AMB 知识库",
+      "panel.consoleOpen": "打开完整控制台 ↗",
+      "panel.consoleOpenHint": "检索、候选审阅、规范、任务日记、历史、自检与 Skill 整理都在完整控制台里",
       "status.reachable": "核心可达",
       "status.unreachable": "核心不可达",
       "status.unavailable": "知识库数据不可用",
@@ -127,8 +129,7 @@ window.__ModuleLoader__.load({
       "status.revision": "知识版本",
       "status.unreachableReason": "核心未报告不可达原因。",
       "status.unknown": "未知",
-      "action.refresh": "刷新",
-      "action.refreshing": "刷新中",
+      "action.refresh": "刷新",      "action.refreshing": "刷新中",
       "action.retry": "重试",
       "action.search": "搜索",
       "section.overview": "概览",
@@ -854,6 +855,20 @@ window.__ModuleLoader__.load({
   font-size: 13px;
   line-height: 20px;
 }
+/* The console link sits above the status bar: it is the one thing on this panel that leaves it,
+   so it gets a fixed place rather than sharing a row with controls that act on the panel itself. */
+.amb-knowledge-panel__console-link {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 2px 0;
+}
+.amb-knowledge-panel__console-open {
+  color: var(--amb-brand);
+  font-size: 12px;
+  text-decoration: none;
+  border-bottom: 1px dashed currentColor;
+}
+.amb-knowledge-panel__console-open:hover { text-decoration: none; opacity: 0.8; }
 @media (prefers-color-scheme: dark) {
   .amb-knowledge-panel {
     --amb-bg-base: var(--dsw-alias-bg-base, #14171d);
@@ -2156,6 +2171,38 @@ window.__ModuleLoader__.load({
      * is built inside a guard: a render-time fault reports itself in the panel
      * instead of collapsing the whole slot entry.
      */
+    /**
+     * One link to the real console.
+     *
+     * The panel draws its own reduced view; the core serves a ten-tab console at /ui. Both are
+     * legitimate - this view is tuned for the conversation slot, where a full page would be too
+     * much - but the reader should be able to reach the full one without remembering a CLI
+     * command or knowing that /ui exists at all.
+     *
+     * The address is fetched on click rather than on render, because it carries a credential:
+     * asking for it at render time would put a token in this component's state for the whole
+     * life of the panel, including the many renders where nobody wants it.
+     */
+    function consoleLink(h) {
+      return h("div", { className: ROOT_CLASS + "__console-link" },
+        h("a", {
+          href: "#",
+          className: ROOT_CLASS + "__console-open",
+          title: t("panel.consoleOpenHint"),
+          onClick: function (event) {
+            if (event && typeof event.preventDefault === "function") event.preventDefault();
+            requestJson("/amb/ui-url", resolveFetch()).then(function (data) {
+              var url = data && typeof data.url === "string" ? data.url : null;
+              if (!url) return;
+              if (typeof window !== "undefined" && window && window.location) window.location.href = url;
+            }).catch(function () {
+              // The panel keeps working; the link simply does nothing this time. Reporting a
+              // failure here would put an error in a status area that is about something else.
+            });
+          },
+        }, t("panel.consoleOpen")));
+    }
+
     function KnowledgePanel() {
       var h = React.createElement;
       // One hook call per slot, in a fixed order: a slot must never be declared
@@ -2488,6 +2535,7 @@ window.__ModuleLoader__.load({
           "data-plugin": PLUGIN_ID,
           "data-view": VIEW_ID,
         },
+          consoleLink(h),
           statusBar(h, {
             phase: summaryState.phase,
             summary: summaryState.value,

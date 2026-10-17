@@ -23,13 +23,19 @@ test('DSH browser bundle compiles and registers through the classic script loade
 });
 
 test('the panel reads the host JSON endpoints instead of an embedded page address', () => {
-  // The earlier revision asked the host for a page address and embedded that
-  // document. The native panel reads JSON only, so this client must never ask
-  // for an address again: an address request here would mean the embedded path
-  // came back. The full panel contract lives in dsh-client-surface.test.mjs.
+  // The earlier revision asked the host for a page address and *embedded* that document. That
+  // path is not coming back: this component still draws its own view and must never render an
+  // external document.
+  //
+  // It may however ask for the console address in order to *navigate* to it - a link the reader
+  // clicks, answered by the same adapter, not a document this component renders. The point of
+  // these assertions is that distinction, so the address check is now "at most one request, and
+  // no iframe" rather than "never asks". The full panel contract lives in
+  // dsh-client-surface.test.mjs.
   const clientSource = readFileSync(join(root, 'adapters/dsh/client.js'), 'utf8');
-  assert.equal(clientSource.includes('/amb/ui-url'), false, '面板不得再请求页面地址端点');
   assert.equal(/iframe/i.test(clientSource), false, '面板不得嵌入外部文档');
+  const addressRequests = (clientSource.match(/\/amb\/ui-url/g) ?? []).length;
+  assert.equal(addressRequests <= 1, true, `面板只允许一处地址请求（用于导航），实际 ${addressRequests} 处`);
   for (const endpoint of ['/amb/summary', '/amb/search', '/amb/task']) {
     assert(clientSource.includes(endpoint), `面板必须读取 ${endpoint}`);
   }

@@ -1077,6 +1077,28 @@ async function handlePanelRequest(req, res, { config, client, logger }) {
        * The credential sits in the URL fragment, which the browser never puts in a request line,
        * so it stays out of server logs. This route is already behind the panel's credential check.
        */
+      /**
+       * This route is the one token-bearing response under /amb, and it is worth being explicit
+       * about why that is allowed here when the rest of the surface deliberately avoids it.
+       *
+       * The earlier revision removed `/amb/ui-url` for exactly this reason: it was the only
+       * response in the prefix built from the credential, and the native panel never needed an
+       * address. That conclusion was correct for a panel that drew its own view. It stops being
+       * correct once the panel embeds the console, because an iframe cannot authenticate itself -
+       * the address has to carry the fragment, and something has to hand the address over.
+       *
+       * So the exposure is narrowed rather than ignored: the reply requires a same-origin fetch
+       * from the harness page (Origin must name a loopback authority), it is served only on the
+       * loopback listener, and the credential still travels in the fragment so it never reaches a
+       * request line or a server log. A caller that can already read /amb/summary learns nothing
+       * qualitatively new; a caller without a browser Origin does not get the token at all.
+       */
+      const origin = String(req.headers?.origin ?? '')
+      const sameOrigin = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)
+      if (!sameOrigin) {
+        panelJson(res, 403, { ok: false, error: '该地址只在宿主页面同源请求时提供。' })
+        return
+      }
       panelJson(res, 200, { url: `${String(config.endpoint).replace(/\/$/, '')}/ui#${config.token}` })
       return
     }

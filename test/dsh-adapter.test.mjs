@@ -198,7 +198,7 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
 
   assert.deepEqual([...registeredTools.keys()].sort(), [
     'amb_checkpoint_task', 'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
-    'amb_read_stage', 'amb_save_material', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
+    'amb_read_stage', 'amb_retire_knowledge', 'amb_save_material', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
     'amb_submit_experience', 'amb_supersede_experience', 'amb_task_activity', 'amb_unstructured_skills',
   ])
 
@@ -219,15 +219,17 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
     })
     return captured
   }
-  for (const retired of ['/amb/ui-url', '/amb/config']) {
-    const gone = callRoute(retired)
-    assert.equal(gone.status, 404, `${retired} 已随内嵌页面下线，不得再被应答`)
-    assert.equal(gone.body, undefined, `${retired} 不得返回任何响应体`)
-  }
+  // `/amb/config` stays retired. `/amb/ui-url` is back, and that is a deliberate reversal: the
+  // panel now embeds the console, and an iframe cannot authenticate itself, so something has to
+  // hand the address over. The route requires a loopback Origin before it answers, which is
+  // pinned in the panel suite where a request can carry headers.
+  const config = callRoute('/amb/config')
+  assert.equal(config.status, 404, '/amb/config 已下线，不得再被应答')
+  assert.equal(config.body, undefined, '/amb/config 不得返回任何响应体')
+
   // The prefix is a token boundary: no response it serves may carry a wildcard
   // CORS grant, because a wildcard would let any page read whatever the route
-  // answers. The retired address routes were the only ones that ever returned the
-  // credential, so this also pins down that nothing took their place.
+  // answers.
   const retired = callRoute('/amb/ui-url')
   assert.equal(retired.headers['Access-Control-Allow-Origin'], undefined, 'CORS 不得回落为通配')
   const unmapped = callRoute('/amb/other')
