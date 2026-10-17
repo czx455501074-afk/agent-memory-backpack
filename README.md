@@ -19,6 +19,12 @@
 - Node.js **24.13–24.x**（实测 24.19）。使用内置 SQLite，无需额外数据库。
 - Windows 系统（安装脚本针对 PowerShell）。
 
+### 想用原生桌面窗口
+
+插件本身不需要桌面程序——管理界面由核心自己提供。若你更想要一个常驻托盘的原生窗口，从 [Releases](https://github.com/czx455501074-afk/agent-memory-backpack/releases/tag/v1.0.0) 下载 `Agent Memory Backpack_1.0.0_x64-setup.exe`（NSIS）或 `.msi`，发行说明里附了 SHA256。主窗默认隐藏、驻留托盘，由托盘菜单唤出。
+
+> 桌面版只支持 Windows x64；macOS 与 Linux 不在本次范围内（原因见发行结论第六节）。
+
 ### 一键安装
 
 ```powershell
@@ -75,6 +81,7 @@ dsh plugin --profile <profile> add "$PWD\adapters\dsh"
 
 ```powershell
 amb --help                # 列出全部子命令
+amb --version             # 打印版本（本仓库为 1.0.0）
 amb history --id <ID>     # 查看某个条目的修订沿革
 amb asof --at <时间>      # 看知识库在某刻的样子（只读）
 amb backup --file <路径>  # 把全部数据打包成一个可迁移文件
