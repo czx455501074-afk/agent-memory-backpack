@@ -698,6 +698,30 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           }).parse(body);
           return reply(res, 200, store.supersede({ ...p, origin: 'agent', projectId: p.projectId }));
         }
+        /**
+         * Take an entry out of service, by the agent that found it wanting.
+         *
+         * `supersede` and `supplement` already let an agent correct or extend an entry, but
+         * there was no way to retire one: `store.retire` existed and nothing could reach it.
+         * A library whose only operations are "add" and "replace" cannot shed an entry that
+         * turned out to be wrong - it can only grow, which is how 1160 abandoned deliveries and
+         * a 65-entry norm pool accumulated.
+         *
+         * Retirement is reversible: the status flips to `retired`, the row and every revision
+         * stay, and `reopen` can bring it back. That is why this is not admin-gated - the agent
+         * that hit the wrong entry while using it is the one holding the evidence, and making it
+         * ask permission to be correct would leave the entry in service meanwhile. `reason` is
+         * mandatory: a retirement with no stated reason reads as an accident.
+         */
+        case '/v1/knowledge/retire': {
+          const p = z.object({
+            projectId: z.string(), id: z.string().min(1),
+            baseRevision: z.number().int().nonnegative(),
+            reason: z.string().min(1).max(500),
+          }).parse(body);
+          store.retire(p.id, p.baseRevision);
+          return reply(res, 200, { retired: p.id, reason: p.reason });
+        }
         case '/v1/knowledge/history': { const p = z.object({ projectId: z.string(), knowledgeId: z.string() }).parse(body); return reply(res, 200, store.history(p.knowledgeId, p.projectId)); }
         /**
          * Read one historical revision, read-only.

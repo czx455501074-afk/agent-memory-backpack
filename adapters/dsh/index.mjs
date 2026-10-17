@@ -1957,6 +1957,27 @@ export async function apply(ctx) {
     },
   }))
 
+  client.tool(t => ({
+    name: 'amb_retire_knowledge',
+    description: 'Take an entry out of service after using it revealed that it is wrong or obsolete. Reversible: the entry and every revision stay, and it can be reopened. Use amb_supersede_experience instead when the right fix is to replace or extend the entry - retire is for entries that should stop being injected at all.',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        id: { type: 'string', minLength: 1 },
+        baseRevision: { type: 'number', minimum: 0 },
+        reason: { type: 'string', minLength: 1, maxLength: 500 },
+      }, required: ['id', 'baseRevision', 'reason'],
+    },
+    async execute(args, exec) {
+      return client.post('/v1/knowledge/retire', {
+        projectId: config.projectId,
+        id: requireString(args?.id, 'id'),
+        baseRevision: Number(args?.baseRevision),
+        reason: requireString(args?.reason, 'reason'),
+      }, { signal: exec.signal })
+    },
+  }))
+
   registerTool(jsonTool({
     name: 'amb_knowledge_history',
     description: 'Read the revision lineage of one knowledge entry: which versions exist and what replaced or supplemented what.',

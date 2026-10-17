@@ -18,6 +18,7 @@
       "amb_prepare",
       "amb_read_knowledge",
       "amb_read_stage",
+      "amb_retire_knowledge",
       "amb_save_material",
       "amb_search_universal",
       "amb_search_workflows",
