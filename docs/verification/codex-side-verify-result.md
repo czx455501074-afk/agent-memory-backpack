@@ -3,7 +3,7 @@
 **执行者**：DSH 侧会话（本机操控）
 **时间**：2026-10-17
 **方式**：直接向 `adapters/codex/scripts/hook.mjs` 喂真实的 hook 事件 JSON，观察其 stdout 协议输出。
-**数据来源**：真实库（`C:\Users\czx\.agent-memory-backpack`，知识版本 2066），非夹具。
+**数据来源**：真实库（`&lt;数据目录&gt;`，知识版本 2066），非夹具。
 
 ## 为什么这样验证
 

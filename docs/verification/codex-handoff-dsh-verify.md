@@ -5,11 +5,11 @@
 
 ## 背景（已由 DSH 侧完成的事实，可直接采信但欢迎复核）
 
-- 项目：`agent-memory-backpack`（AMB），仓库根 `D:\huange-skill`，部署目录 `D:\harness\toolchains\DeepSeek-Harness-plugins\agent-memory-backpack`（同级的 `core` 是常驻核心）。
+- 项目：`agent-memory-backpack`（AMB），仓库根 `&lt;仓库根&gt;`，部署目录 `&lt;部署目录&gt;`（同级的 `core` 是常驻核心）。
 - 核心是**独立常驻服务，不随宿主退出**：监听 `127.0.0.1:47631`，协议 v1，请求需带 `x-amb-protocol: 1` 与 Bearer 凭据（凭据在数据目录的 `core.json`，**不要打印出来**）。
-- 数据目录默认 `C:\Users\czx\.agent-memory-backpack`（`amb doctor` 会报，无需手填）。
+- 数据目录默认 `&lt;数据目录&gt;`（`amb doctor` 会报，无需手填）。
 - 本机**没有全局 `amb` 命令**，CLI 入口是：
-  `D:\harness\toolchains\DeepSeek-Harness-plugins\core\runtime\cli.js`
+  `&lt;CLI 入口&gt;`
 - 本轮已完成并验证：
   - 存量候选分类回填已执行（430/430 待审带 `classifierVersion`，`r5-live-verify` 12/12）。
   - Codex 侧适配器五个 hook 已实测通过（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop）。
@@ -22,7 +22,7 @@ DSH 当前进程启动于本会话之前，**尚未加载最新插件构建**。
 
 1. 完整重启 DSH（以及 Codex 自身），然后**另外**重启常驻核心，否则会出现"适配器已更新、核心仍是旧代码"：
    ```powershell
-   $cli = 'D:\harness\toolchains\DeepSeek-Harness-plugins\core\runtime\cli.js'
+   $cli = '&lt;CLI 入口&gt;'
    node $cli service stop ; Start-Sleep 3 ; node $cli service start ; node $cli service status
    ```
    （核心重启会短暂中断 recall/prepare，属正常。）
@@ -36,7 +36,7 @@ DSH 当前进程启动于本会话之前，**尚未加载最新插件构建**。
 
 3. 同时确认部署一致性：
    ```powershell
-   cd D:\huange-skill ; node scripts/verify-host-deployment.mjs
+   cd &lt;仓库根&gt; ; node scripts/verify-host-deployment.mjs
    ```
    **判据**：报 `RUNNING DEPLOYED BUILD`。
 
