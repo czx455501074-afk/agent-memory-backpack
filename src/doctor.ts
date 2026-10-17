@@ -196,7 +196,9 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown';
       checks.push(fail('core-reachable', '核心可达', `无法连接核心: ${message.slice(0, 120)}`,
-        '先启动核心：node dist/src/cli.js serve --data-dir <目录>'));
+        // Advice has to be runnable where the reader is: someone who installed the
+        // package has no `dist/src/cli.js` under their cwd, only the `amb` command.
+        '先启动核心：amb serve --data-dir <目录>（源码目录里等价的写法是 node dist/src/cli.js serve）'));
       checks.push(skip('protocol-match', '协议版本匹配', '核心不可达，无法核对'));
     }
   }
@@ -217,7 +219,7 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
       status: mode.mode === 'Managed' ? 'pass' : mode.mode === 'ReadOnlySnapshot' ? 'warn' : 'warn',
       detail: `${mode.mode}（${label}）— ${mode.detail}`,
       ...(mode.mode === 'Ungoverned'
-        ? { hint: '核心不可达时不再阻断工具（这是有意的：一个可选知识服务不应锁死你的工作）。启动核心即可恢复 Managed：node dist/src/cli.js service start' }
+        ? { hint: '核心不可达时不再阻断工具（这是有意的：一个可选知识服务不应锁死你的工作）。启动核心即可恢复 Managed：amb service start' }
         : {}),
     });
   }

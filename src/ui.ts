@@ -939,7 +939,7 @@ function reportError(error) {
     '<div class="card__head"><span class="card__title">核心状态：无法读取（离线）</span>' +
     '<button class="primary btn-sm" id="err-retry-btn">重新连接</button></div>' +
     '<p class="card__body">核心服务可能未启动或当前凭据已被撤销。若曾成功连接过，本机保留的最近规则快照仍会执行已记录的禁止（只读快照保护）；未记录过的判断则无从核对，属于未知边界，不等于“无风险”。<br>' +
-    '启动核心命令（在已安装插件的运行时目录执行，或直接重新打开本页触发重试）：<code>node runtime/cli.js serve --data-dir &lt;数据目录&gt;</code></p>' +
+    '启动核心命令（在任意位置执行，或直接重新打开本页触发重试）：<code>amb serve --data-dir &lt;数据目录&gt;</code><br>若当前就在已安装插件的运行时目录内，等价写法是 <code>node runtime/cli.js serve --data-dir &lt;数据目录&gt;</code></p>' +
     '</div>';
 }
 
@@ -1552,7 +1552,7 @@ panel.addEventListener('keydown', function (event) {
 });
 
 if (!token) {
-  panel.innerHTML = notice('缺少凭据。请用已安装插件的运行时执行 node runtime/cli.js ui --data-dir <数据目录>（源码目录则为 node dist/src/cli.js ui）生成带凭据的地址后打开；凭据保存在当前标签页会话存储（sessionStorage）中。') +
+  panel.innerHTML = notice('缺少凭据。请执行 amb ui --data-dir <数据目录>（源码目录里等价：node dist/src/cli.js ui）生成带凭据的地址后打开；凭据保存在当前标签页会话存储（sessionStorage）中。') +
     '<div class="card"><div class="card__head"><span class="card__title">如何取得带凭据的地址</span></div>' +
     '<p class="card__body">在插件运行时目录（例如 <code>.dsh/plugins/agent-memory-backpack-test-20261013/runtime</code>）执行：<br>' +
     '<code>node cli.js ui --data-dir &lt;数据目录&gt;</code><br>' +
