@@ -316,11 +316,21 @@ function renderStatus() {
     return Promise.all([
       Promise.resolve(s),
       post('/v1/rescan/state').catch(function () { return {}; }),
-      post('/v1/material/list', { limit: 1 }).catch(function () { return { material: [], stats: {} }; })
+      post('/v1/material/list', { limit: 1 }).catch(function () { return { material: [], stats: {} }; }),
+      post('/v1/stats').catch(function () { return {}; }),
+      post('/v1/norms').catch(function () { return { norms: [] }; })
     ]);
   }).then(function (out) {
-    var s = out[0], r = out[1], m = out[2];
+    var s = out[0], r = out[1], m = out[2], st = out[3], nm = out[4];
     var matStats = m.stats || {};
+    var norms = (nm && nm.norms) || [];
+    var normChars = norms.reduce(function (a, n) {
+      return a + String((n.content && n.content.body) || '').length;
+    }, 0);
+    var NORM_BUDGET = 12000;
+    var over = normChars > NORM_BUDGET;
+    var outbox = st.outbox || {};
+    var abandoned = outbox.abandoned || 0;
     panel.innerHTML = metrics([
       ['生效条目', s.entries],
       ['待审阅候选', s.pendingProposals],
@@ -328,7 +338,20 @@ function renderStatus() {
       ['取代记录', s.supersessions],
       ['任务记录', s.tasks],
       ['临时资料', (matStats.total || 0) + ' 条（' + (matStats.expiredUnpurged || 0) + ' 条已过期）'],
+      ['规范上下文占用', normChars + ' / ' + NORM_BUDGET + ' 字符'],
+      ['投递队列放弃', abandoned]
     ]) +
+      '<div class="card"><div class="card__head"><span class="card__title">规范上下文预算</span>' +
+      '<span class="card__meta">' + (over ? '已超预算，会省略部分规范' : '在预算内') + '</span></div>' +
+      '<p class="card__body">当前有 ' + norms.length + ' 条生效规范，正文合计约 ' + normChars +
+      ' 字符；每轮注入的规范上下文预算为 ' + NORM_BUDGET + ' 字符。' +
+      (over ? '超出部分不会消失，但该轮注入会省略其中若干条并列出被省略的 id —— 也就是说某个规范可能在你需要它的那一轮恰好没到。减少规范条数或合并相近条目是最直接的解法。' : '') +
+      '</p></div>' +
+      '<div class="card"><div class="card__head"><span class="card__title">投递队列</span>' +
+      '<span class="card__meta">' + (abandoned > 0 ? '有 ' + abandoned + ' 条已放弃' : '无放弃') + '</span></div>' +
+      '<p class="card__body">待投递 ' + (outbox.pending || 0) + ' 条，失败 ' + (outbox.failed || 0) + ' 条，放弃 ' + abandoned + ' 条。' +
+      (abandoned > 0 ? '放弃表示这些条目在多次重试后判定无法送达，内容仍在库里但不会再自动重发。这个数字长期只增不减，说明上游曾经有段时间收不下来。' : '') +
+      '</p></div>' +
       '<div class="card"><div class="card__head"><span class="card__title">定期同步与生命周期</span>' +
       '<span class="card__meta">' + (r.due ? '已到期待扫描' : '正常周期内') + '</span></div>' +
       '<p class="card__body">上次扫描：' + esc(localTime(r.lastRescanAt)) +
