@@ -23,33 +23,31 @@ const skipLive = args.includes('--skip-live');
 const asJson = args.includes('--json');
 
 /** Run one step and reduce its output to a single verdict line. */
-function step(name, command, { required = true, pattern, live = false, retry = true } = {}) {
+function step(name, command, { required = true, pattern, detailPattern, live = false, retry = true } = {}) {
   if (live && skipLive) return { name, ok: null, detail: '已跳过（--skip-live）', required };
   const run = () => {
     const started = Date.now();
     const result = spawnSync(command, { cwd: root, shell: true, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
     const ms = Date.now() - started;
-    const match = pattern ? pattern.exec(output) : null;
-    // A step without an explicit pattern succeeds when the process exits 0. Steps whose
-    // tool reports failures with a zero exit need a pattern (the test runner does not,
-    // which is why its summary is read explicitly).
-    const ok = result.status === 0 && (!pattern || Boolean(match));
+    // `pattern` decides pass or fail and must be written so it cannot match by accident.
+    // `detailPattern` only supplies the number shown to the reader; conflating the two is
+    // how this script previously reported green suites as red.
+    const match = detailPattern ? detailPattern.exec(output) : (pattern ? pattern.exec(output) : null);
+    const ok = result.status === 0 && (!pattern || pattern.test(output));
     return { ok, match, ms, status: result.status };
   };
 
   let first = run();
-  // A failure is retried once, because this harness has produced one that did not
-  // survive a second run: it built while another workstream was mid-edit, so the
-  // compiled tree was momentarily incomplete and the install-face test failed. A single
-  // attempt cannot tell "the code is broken" from "I raced someone". The difference
-  // matters, so it is measured rather than guessed - and a flaky result is reported as
-  // flaky instead of being quietly rounded to pass.
+  // A failure is retried once, because a single attempt cannot tell "the code is broken"
+  // from "this step raced something outside itself". If the retry passes, the result is
+  // reported as flaky with the first exit code kept, rather than quietly rounded to pass;
+  // if it fails again, the reproducible failure is what gets reported.
   let flaky = false;
   if (!first.ok && retry) {
     const second = run();
     if (second.ok) { first = second; flaky = true; }
-    else first = second; // report the second failure's detail: it is the reproducible one
+    else first = second;
   }
   const detail = flaky
     ? `重跑通过（首次退出码 ${first.status}）——不稳定，需查并发编辑或计时`
@@ -59,15 +57,21 @@ function step(name, command, { required = true, pattern, live = false, retry = t
 
 const results = [
   step('类型检查与构建', 'npm run build', { pattern: /tsc -p tsconfig\.json[\s\S]*$/ }),
-  step('全量测试（dist）', 'node --test dist/test/*.test.js', { pattern: /# (pass|fail) (\d+)[\s\S]*?# (pass|fail) (\d+)/ }),
-  step('全量测试（.mjs）', 'node --test test/*.test.mjs'),
+  // node's reporter prints "ℹ fail 0"; TAP's "# fail 0" is a different format. The first
+  // version of this harness looked for the TAP form, never matched, and so reported every
+  // passing suite as FAILED. I then explained that as a flaky race and wrote it up as a
+  // lesson about flakiness - the lesson was wrong, the check was wrong. Assert on the
+  // failure count being zero, because that is the thing that matters, and it cannot match
+  // by accident.
+  step('全量测试（dist）', 'node --test dist/test/*.test.js', { pattern: /ℹ fail 0\b/, detailPattern: /ℹ pass (\d+)/ }),
+  step('全量测试（.mjs）', 'node --test test/*.test.mjs', { pattern: /ℹ fail 0\b/, detailPattern: /ℹ pass (\d+)/ }),
   step('交付契约（此前各轮是否还在）', 'node scripts/verify-deliverables.mjs', { pattern: /(\d+\/\d+ 通过[^\n]*)/ }),
   step('工具面 × admin 白名单对账', 'node scripts/verify-tool-surface.mjs'),
   step('文档不含机器路径', 'node scripts/sanitize-doc-paths.mjs --check', { pattern: /(\d+ file\(s\) would change)/ }),
-  step('冷启动安装面', 'node --test dist/test/clean-install.test.js', { pattern: /# pass (\d+)/ }),
+  step('冷启动安装面', 'node --test dist/test/clean-install.test.js', { pattern: /ℹ fail 0\b/, detailPattern: /ℹ pass (\d+)/ }),
   step('打包内容', 'npm pack --dry-run', { pattern: /package size: ([^\n]*)/ }),
   step('真实库状态（只读）', 'node scripts/r5-live-state.mjs', { pattern: /(\d+) 条 pending/ }),
-  step('对运行中的核心验收', 'node scripts/r5-live-verify.mjs', { live: true, pattern: /(\d+\/\d+ 通过)/ }),
+  step('对运行中的核心验收', 'node scripts/r5-live-verify.mjs', { live: true, pattern: /(\d+\/\d+) 通过/ }),
 ];
 
 const failed = results.filter(row => row.required && row.ok === false);
