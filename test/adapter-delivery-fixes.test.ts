@@ -342,11 +342,18 @@ test('F07: Codex hook 发送 Stop 事件携带 taskId', async () => {
     }, configPath);
 
     assert.equal(hookRes.status, 0);
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].url, '/v1/events');
-    assert.equal(requests[0].body.taskId, 'task-abc');
-    assert.equal(requests[0].body.sessionId, 'session-xyz');
-    assert.equal(requests[0].body.kind, 'turn_stopped');
+    // The turn's own event is this test's subject. The session end also files the
+    // task diary now (W9), so count the event request itself rather than every
+    // request the hook made, and assert the archive separately below.
+    const events = requests.filter(entry => entry.url === '/v1/events');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].body.taskId, 'task-abc');
+    assert.equal(events[0].body.sessionId, 'session-xyz');
+    assert.equal(events[0].body.kind, 'turn_stopped');
+    const archives = requests.filter(entry => entry.url === '/v1/tasks/archive');
+    assert.equal(archives.length, 1, '会话结束必须发起一次归档');
+    assert.equal(archives[0].body.projectId, 'proj-1');
+    assert.equal(archives[0].body.taskId, 'task-abc');
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });

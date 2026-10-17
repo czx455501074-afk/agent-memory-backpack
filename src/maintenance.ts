@@ -7,6 +7,7 @@ import { DurableJobs } from './jobs.js';
 import { analyzeWithModel, modelReviewConfigSchema } from './model-review.js';
 import { exportSkills } from './export-skills.js';
 import { initializeWorkflowDrafts, processWorkflowDraft, processWorkflowDigest, enqueueWorkflowDraft } from './workflow-organization.js';
+import { collect, proposalSourceFrom, refineThresholds, type RefineRun } from './refine.js';
 
 export function initializeMaintenance(store: Store) {
   initializeWorkflowDrafts(store);
@@ -25,9 +26,35 @@ export function maintenanceStatus(store: Store, projectId: string) {
   };
 }
 
+/**
+ * Read the queue and report what could be distilled from it. Never writes.
+ *
+ * Deliberately not wired into the worker's tick: the first version of this scheduler
+ * exists to be read by a person and checked against the queue it read, and a dry run
+ * that a scheduler calls on a timer is not a dry run. `dryRun` is therefore the only
+ * mode implemented — there is no code path from here to `submit` or to `import`.
+ */
+export function refineStatus(store: Store, options: { projects?: string[]; now?: number } = {}): RefineRun {
+  return collect({
+    source: proposalSourceFrom(store.db as unknown as { prepare: (sql: string) => { all: (...params: unknown[]) => unknown[] } }, options.projects ?? []),
+    meta: (key) => {
+      const row = store.db.prepare('SELECT value FROM meta WHERE key=?').get(key) as { value: number } | undefined;
+      return row === undefined ? undefined : Number(row.value);
+    },
+    now: options.now,
+  });
+}
+
+/** The thresholds in force, for a caller that only wants to display them. */
+export function refineThresholdsInUse(store: Store) {
+  return refineThresholds((key) => {
+    const row = store.db.prepare('SELECT value FROM meta WHERE key=?').get(key) as { value: number } | undefined;
+    return row === undefined ? undefined : Number(row.value);
+  });
+}
+
 /** One idempotent worker shared by CLI and other actual core entry paths. */
-export function createMaintenanceWorker(store: Store, dataDir: string, projectIds: string[] = []) {
-  const jobs = initializeMaintenance(store);
+export function createMaintenanceWorker(store: Store, dataDir: string, projectIds: string[] = []) {  const jobs = initializeMaintenance(store);
   let busy = false;
   let stopped = false;
   const tick = async () => {

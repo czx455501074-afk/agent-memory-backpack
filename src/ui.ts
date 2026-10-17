@@ -535,10 +535,27 @@ function renderProposals(filterState) {
       else if (item.state === 'rejected') statePill = '<span class="pill pill--fail">已拒收</span>';
       else if (item.state === 'approved') statePill = '<span class="pill pill--ok">已生效</span>';
 
+      // The analyzer's suggestion, when one is stored. Shown so a reviewer can
+      // tell at a glance which candidates already have an answer waiting inside
+      // the form instead of opening each one to find out. Its absence is left
+      // silent rather than rendered as "no suggestion": the list is a queue, and
+      // a row without one is described by the fields it has.
+      var prefillPill = item.prefill
+        ? '<span class="pill pill--idle">' + (item.prefill.source === 'model' ? '模型建议已就绪' : '规则建议已就绪') + '</span>'
+        : '';
+
       var actions = '';
+      // The promotion verdict, shown beside the button that acts on it. The core sends it
+      // only for rows that need a person (field: classificationGate), so its presence is
+      // already the answer to "does this one need me?" and the page does not have to
+      // re-derive that from the raw payload.
+      var gatePill = item.classificationGate
+        ? '<span class="pill pill--warn">需人工确认</span><span class="card__meta">不可自动升格：' + esc(item.classificationGate.reason) + '</span>'
+        : '';
       if (item.state === 'pending' || item.state === 'needs_evidence') {
         actions = '<div class="card__actions">' +
           '<button class="primary btn-sm action-approve" data-id="' + esc(item.id) + '">批准生效</button>' +
+          gatePill +
           '<button class="ghost btn-sm action-evidence" data-id="' + esc(item.id) + '">要求补证</button>' +
           '<button class="ghost btn-sm action-archive" data-id="' + esc(item.id) + '">移出归档</button>' +
           '<button class="ghost btn-sm btn-danger action-reject" data-id="' + esc(item.id) + '">拒收</button>' +
@@ -561,7 +578,7 @@ function renderProposals(filterState) {
         '<input type="checkbox" class="prop-checkbox" data-id="' + esc(item.id) + '"> ' +
         '<span>' + esc(payload.discovery ? String(payload.discovery).slice(0, 60) : item.id) + '</span>' +
         '</label>' +
-        '<div>' + tierPill + ' ' + statePill + '</div>' +
+        '<div>' + tierPill + ' ' + prefillPill + ' ' + statePill + '</div>' +
         '</div>' +
         '<div class="card__meta">ID: <code>' + esc(item.id) + '</code>　来源 ' + esc(item.principal) +
         '　提交 ' + esc(localTime(item.createdAt)) +
@@ -600,7 +617,17 @@ function showProposalEditor(proposalId) {
   post('/v1/proposals/get', { id: proposalId }).then(function (detail) {
     if (!box) return;
     var target = detail.target || {};
-    var scopeKind = detail.payload && detail.payload.scope && detail.payload.scope.kind === 'global' ? 'global' : 'project';
+    // The stored suggestion, when the analyzer produced one. Everything below
+    // treats it as a *default value*: the reviewer confirms or overrides it, and
+    // the fields it fills are shown as coming from the analysis rather than from
+    // the person, so the form cannot make a suggestion look like a decision.
+    var prefill = detail.prefill || null;
+    // The core's own verdict about adopting this candidate unattended. Read, never
+    // re-derived here: the page prints the reason beside the button that would need the
+    // acknowledgement, instead of hiding it one click deeper in the detail view.
+    var gate = detail.classificationGate || null;
+    var scopeKind = detail.payload && detail.payload.scope && detail.payload.scope.kind === 'global' ? 'global'
+      : (prefill && prefill.scope === 'global' ? 'global' : 'project');
     var targetLine = target.available
       ? '<div class="card__path">目标流程：<code>' + esc(target.workflowId) + '</code>' +
         (target.baseRevision !== null && target.baseRevision !== undefined ? '（候选基于 v' + esc(target.baseRevision) + '，当前 v' + esc(target.currentRevision !== null && target.currentRevision !== undefined ? target.currentRevision : '—') + '）' : '') + '</div>'
@@ -612,6 +639,44 @@ function showProposalEditor(proposalId) {
     var modelLine = '<div class="card__meta">分析来源：' + esc(modelReview.mode === 'model' ? ('模型 ' + modelReview.model) : '规则分析；等待模型') +
       '；仅供审阅参考，不代表批准。</div>' + (analysis.summary ? '<p>' + esc(analysis.summary) + '</p>' : '') +
       (analysis.reasoning ? '<p class="muted">' + esc(analysis.reasoning) + '</p>' : '');
+
+    var kindLabels = {
+      memory: '记忆（经验记录，默认）', norm: '规范（参与门禁判定）', preference: '偏好',
+      skill: '技能', material: '临时资料', journal: '日记'
+    };
+    var prefillLine = '';
+    if (prefill) {
+      var scopeLabel = prefill.scope === 'global' ? '全局' : (prefill.scope === 'task' ? '任务级' : '项目级');
+      var splitLine = (prefill.suggestedSplit && prefill.suggestedSplit.length)
+        ? '<div class="card__meta">建议拆分：' + prefill.suggestedSplit.map(function (item) {
+          return esc((kindLabels[item.kind] || item.kind) + ' — ' + item.text);
+        }).join('；') + '</div>'
+        : '';
+      prefillLine = '<div class="card__path">' +
+        '<span class="pill pill--idle">' + (prefill.source === 'model'
+          ? ('模型建议' + (prefill.model ? '（' + esc(prefill.model) + '）' : ''))
+          : '规则分析建议（模型判定尚未完成）') + '</span>' +
+        '　置信度 ' + esc(String(prefill.confidence)) +
+        '　类别 ' + esc(kindLabels[prefill.kind] || prefill.kind) +
+        '　作用域 ' + esc(scopeLabel) +
+        '　关系 ' + esc(prefill.relation) +
+        (prefill.stale ? '　<span class="pill pill--warn">建议基于提交时的文本，其后有更新，请核对</span>' : '') +
+        '</div>' +
+        (prefill.needsSplit ? '<div class="card__meta">此候选被认为混有多种类别，建议按拆分结果分别采纳。</div>' : '') +
+        splitLine +
+        (prefill.scope === 'task' ? '<div class="card__meta">建议作用域是任务级（task）；本表单只能提交项目级或全局，请人工确认后再采纳。</div>' : '') +
+        (prefill.autoPromotable ? '' : '<div class="card__meta">不可自动升格：' + esc(prefill.promotionBlockedReason || '未说明') +
+          '；类别与作用域必须由人确认。</div>') +
+        '<div class="card__meta">以上已作为表单默认值填入，采纳仍由你确认。</div>';
+    } else {
+      prefillLine = '<div class="card__meta">暂无建议：模型与规则分析都没有给出这条候选的判定，类别与作用域需由你选择。</div>';
+    }
+    var kindSelect = '<div class="form-group"><label>条目类别</label>' +
+      '<select id="pe-kind" class="select">' +
+      ['memory', 'norm', 'preference', 'skill', 'material', 'journal'].map(function (kind) {
+        return '<option value="' + kind + '"' + (prefill && prefill.kind === kind ? ' selected' : '') + '>' + esc(kindLabels[kind]) + '</option>';
+      }).join('') +
+      '</select></div>';
 
     var body = '';
     var formBody = '';
@@ -627,6 +692,7 @@ function showProposalEditor(proposalId) {
       formBody =
         '<div class="form-group"><label>条目 ID' + (detail.payload && detail.payload.workflowId ? '（必须等于目标流程 ID）' : '（默认使用候选 UUID）') + '</label>' +
         '<input type="text" id="pe-id" value="' + esc(detail.payload && detail.payload.workflowId ? detail.payload.workflowId : detail.id) + '"></div>' +
+        kindSelect +
         '<div class="form-group"><label>标题</label>' +
         '<input type="text" id="pe-title" value="' + esc((detail.discovery || '').slice(0, 40) || '经验记录') + '"></div>' +
         '<div class="form-group"><label>正文</label>' +
@@ -638,7 +704,7 @@ function showProposalEditor(proposalId) {
       '<span class="card__title">审阅候选：' + esc(detail.id) + '</span>' +
       '<button class="ghost btn-sm" id="pe-cancel">取消</button>' +
       '</div>' +
-      targetLine + needsEvidence + modelLine +
+      targetLine + needsEvidence + modelLine + prefillLine +
       '<p class="card__body">' + esc(detail.discovery || '') + '</p>' +
       formBody +
       '<div class="form-group"><label>作用范围</label>' +
@@ -647,8 +713,11 @@ function showProposalEditor(proposalId) {
       '<option value="global"' + (scopeKind === 'global' ? ' selected' : '') + '>全局共享（将应用到所有项目）</option>' +
       '</select></div>' +
       '<div class="card__actions">' +
-      '<button class="primary" id="pe-approve" data-id="' + esc(detail.id) + '" data-target="' + esc(target.available ? target.workflowId : '') + '">批准并生效</button>' +
-      '<span class="muted" style="font-size:12px;">批准后目标流程产生新 revision；DSH 下一轮检索即可读到。</span>' +
+      '<button class="primary" id="pe-approve" data-id="' + esc(detail.id) + '" data-target="' + esc(target.available ? target.workflowId : '') +
+      '" data-prefill="' + esc(prefill ? prefill.source : '') + '">批准并生效</button>' +
+      (gate && gate.required
+        ? '<span class="pill pill--warn">需人工确认</span><span class="muted" style="font-size:12px;">不可自动升格：' + esc(gate.reason) + '</span>'
+        : '<span class="muted" style="font-size:12px;">批准后目标流程产生新 revision；DSH 下一轮检索即可读到。</span>') +
       '</div>' +
       '</div>';
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -682,17 +751,25 @@ function buildApprovalEntry(detail) {
   var id = ((document.getElementById('pe-id') || {}).value || '').trim();
   var title = ((document.getElementById('pe-title') || {}).value || '').trim();
   var body = ((document.getElementById('pe-body') || {}).value || '').trim();
+  // The category comes from the form, which the analyzer's suggestion pre-filled
+  // when there is one. The person's value wins: this reads what is on screen now,
+  // never the stored suggestion, so editing the field is what changes the entry.
+  var chosenKind = ((document.getElementById('pe-kind') || {}).value || '');
+  var kind = ['memory', 'norm', 'preference', 'skill', 'material', 'journal'].indexOf(chosenKind) >= 0 ? chosenKind : 'memory';
   if (!id) throw new Error('条目 ID 必填');
   if (target.available && id !== target.workflowId) throw new Error('该候选关联流程 ' + target.workflowId + '，条目 ID 必须与之一致');
   return {
     entry: {
       id: id,
-      kind: 'memory',
+      kind: kind,
       title: title || '经验记录',
       body: body,
       scope: scope,
       baseRevision: 0,
       labels: ['approved'],
+      // Pre-filling a category does not transfer authorship: the reviewer
+      // confirmed this text, so the entry records the review as the human's.
+      // A suggestion is never allowed to upgrade this field on its own.
       provenance: 'user',
       evidence: 'verifiable',
       platforms: [],
@@ -735,20 +812,54 @@ function programmaticApproval(detail) {
   };
 }
 
-function approveProposalForm(proposalId) {
+/**
+ * Send the approval the form is showing.
+ *
+ * prefillSource is what the fields were pre-filled from, and it is sent so the
+ * reply can say so: the core keeps the suggestion out of the entry, and this is
+ * how a reader learns that a reviewer confirmed a suggestion rather than typed
+ * every field themselves. It never stands in for the entry — the built entry is
+ * still what gets written.
+ */
+function approveProposalForm(proposalId, prefillSource) {
   return post('/v1/proposals/get', { id: proposalId }).then(function (detail) {
     var built;
     try { built = buildApprovalEntry(detail); } catch (e) { throw e; }
-    return post('/v1/proposals/approve', {
-      id: proposalId,
-      entry: built.entry,
-      allowGlobalScope: built.allowGlobalScope,
-    }).then(function (res) {
+    var request = { id: proposalId, entry: built.entry, allowGlobalScope: built.allowGlobalScope };
+    if (prefillSource) request.prefillSource = prefillSource;
+    return approveWithAcknowledgement(request).then(function (res) {
       return refreshHeader().then(function () {
-        alert('候选已批准生效！知识版本 v' + res.knowledgeRevision + (res.note ? '\\n' + res.note : ''));
+        alert('候选已批准生效！知识版本 v' + res.knowledgeRevision +
+          (res.note ? '\\n' + res.note : '') + (res.prefillNote ? '\\n' + res.prefillNote : ''));
         var filter = document.getElementById('prop-filter');
         renderProposals(filter ? filter.value : 'pending');
       });
+    });
+  });
+}
+
+/**
+ * Send one approval, answering the server's demand for a human decision.
+ *
+ * The gate is the server's, not this page's: the core refuses an approval whose stored
+ * verdict cannot promote itself, and it answers with the reason and the field that
+ * completes it (code: classification_confirmation_required). So the page's whole job here
+ * is to put the server's own sentence in front of the person once, and to carry their
+ * answer back as an explicit field — which is what makes "a person acknowledged this"
+ * a recorded act rather than a page that decided to be permissive.
+ *
+ * A refusal the person declines to answer is re-thrown unchanged, so the candidate stays
+ * exactly where it was.
+ */
+function approveWithAcknowledgement(request) {
+  return post('/v1/proposals/approve', request).catch(function (error) {
+    if (!error || error.code !== 'classification_confirmation_required') throw error;
+    var question = '核心拒绝在没有人工确认的情况下采纳这条候选。\\n\\n原因：' + (error.message || '未说明')
+      + '\\n\\n只有你核对过类别与作用域，这次采纳才算有人做过判定。确认已核对并继续提交？';
+    if (!confirm(question)) throw error;
+    return post('/v1/proposals/approve', Object.assign({}, request, { classificationAcknowledged: true })).then(function (res) {
+      // An approval happened, so the version in the masthead is stale now.
+      return refreshHeader().then(function () { return res; });
     });
   });
 }
@@ -1202,7 +1313,7 @@ panel.addEventListener('click', function (event) {
   }
 
   if (target.id === 'pe-approve') {
-    approveProposalForm(target.dataset.id).catch(function (error) {
+    approveProposalForm(target.dataset.id, target.dataset.prefill || null).catch(function (error) {
       alert((error && (error.friendlyMessage || error.message)) || '批准失败');
     });
     return;
@@ -1274,32 +1385,63 @@ panel.addEventListener('click', function (event) {
   if (target.id === 'batch-approve') {
     var approveIds = getCheckedIds();
     if (!approveIds.length) { alert('请先勾选要批量批准的候选！'); return; }
-    if (!confirm('确定批量批准选中的 ' + approveIds.length + ' 条候选？\\n关联流程的候选将按各自目标流程生成新 revision。')) return;
     /**
-     * Resolve each candidate's own target before approving.
+     * Resolve each candidate's own target — and its promotion verdict — before approving.
      *
      * A single hand-written memory entry per id (the previous behaviour) is
      * exactly the shape F01 rejects: it turns a workflow candidate into an
      * unrelated memory, and the core refuses it with target_mismatch. Each id is
      * therefore read back and given the entry its target actually requires.
+     *
+     * The verdict travels with the same read, because a batch is where "one click
+     * adopted twelve experiences as rules" would happen if anything were silent: the
+     * count and the reasons for the rows that need a person are put in front of the
+     * reviewer *before* the batch is sent, and the acknowledgement they give is carried
+     * back as an explicit field. The core refuses the batch as a whole when any member
+     * still needs one, so nothing is half-applied by accident.
      */
     Promise.all(approveIds.map(function (id) {
       return post('/v1/proposals/get', { id: id }).then(function (detail) {
-        return { id: id, built: programmaticApproval(detail) };
+        return { id: id, built: programmaticApproval(detail), gate: detail.classificationGate || null };
       });
     })).then(function (resolved) {
+      var needsConfirm = resolved.filter(function (item) { return item.gate && item.gate.required; });
+      var question = '确定批量批准选中的 ' + resolved.length + ' 条候选？\\n关联流程的候选将按各自目标流程生成新 revision。';
+      if (needsConfirm.length) {
+        var preview = needsConfirm.slice(0, 3).map(function (item) {
+          return '· ' + item.id + '：' + (item.gate.reason || '需人工确认');
+        }).join('\\n');
+        question = '选中的 ' + resolved.length + ' 条里有 ' + needsConfirm.length + ' 条需要人工确认后才能采纳：\\n'
+          + preview
+          + (needsConfirm.length > 3 ? '\\n……另有 ' + (needsConfirm.length - 3) + ' 条同样需要确认。' : '')
+          + '\\n\\n关联流程的候选将按各自目标流程生成新 revision。'
+          + '\\n确认你已核对这些候选的类别与作用域，继续批量采纳？';
+      }
+      if (!confirm(question)) { alert('已取消：这次没有提交任何候选。'); return null; }
       var entriesMap = {};
       resolved.forEach(function (item) { entriesMap[item.id] = item.built.entry; });
-      return post('/v1/proposals/batch', {
+      var batchRequest = {
         action: 'approve',
         ids: approveIds,
-        entries: entriesMap
+        entries: entriesMap,
+        // The reviewer's answer, recorded as a field, and only when something in the batch
+        // asked for it — an ordinary batch sends exactly what it always did.
+        classificationAcknowledged: needsConfirm.length > 0
+      };
+      return post('/v1/proposals/batch', batchRequest).catch(function (error) {
+        // The core may still refuse as a batch: a verdict that changed after this page
+        // read it, or a candidate it could not read. Its own answer says how many and why,
+        // so the same one-question flow applies rather than a raw error dialog.
+        if (!error || error.code !== 'classification_confirmation_required') throw error;
+        if (!confirm(error.message + '\\n\\n确认已人工核对后继续提交这批？')) throw error;
+        return post('/v1/proposals/batch', Object.assign({}, batchRequest, { classificationAcknowledged: true }));
       });
     }).then(function (res) {
+      if (!res) return;
       return refreshHeader().then(function () {
         if (res.failed && res.failed.length) {
           alert('部分候选批准未完成（' + res.failed.length + ' 条）：\\n' +
-            res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n'));
+            res.failed.map(function (f) { return f.id + ': ' + (f.message || f.reason || '未说明'); }).join('\\n'));
         } else {
           alert('选中的 ' + approveIds.length + ' 条候选已全部批准入库！');
         }

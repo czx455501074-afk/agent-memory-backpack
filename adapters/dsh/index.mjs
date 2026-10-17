@@ -647,11 +647,26 @@ export async function buildPanelAdminParams(action, body, config, admin) {
         // of being paraphrased into something vaguer.
         const classification = payload && isRecordValue(payload.classification)
           ? payload.classification : null
-        const blocked = classification && classification.autoPromotable === false
-          ? (typeof classification.promotionBlockedReason === 'string' && classification.promotionBlockedReason !== ''
-            ? classification.promotionBlockedReason
-            : '该候选不得自动升格。')
-          : null
+        /**
+         * The reason, in the core's own words when the core gave one.
+         *
+         * Three cases, kept apart because they ask the reviewer to do different things:
+         * the core's gate said this candidate needs a person (quote its sentence); the
+         * stored verdict says `autoPromotable: false` (quote `promotionBlockedReason`);
+         * or the verdict carries no usable field at all, which is the shape every stored
+         * candidate has — "missing" is a reason to ask a person, so it is stated as such
+         * rather than folded into "no classification".
+         */
+        const gate = payload && isRecordValue(payload.classificationGate) ? payload.classificationGate : null
+        const blocked = gate && typeof gate.reason === 'string' && gate.reason !== ''
+          ? gate.reason
+          : classification && classification.autoPromotable === false
+            ? (typeof classification.promotionBlockedReason === 'string' && classification.promotionBlockedReason !== ''
+              ? classification.promotionBlockedReason
+              : '该候选不得自动升格。')
+            : classification
+              ? '该候选的判定来自旧版本判定器（快照里没有可用的判定字段），无法据此自动放行。'
+              : null
         throw new Error(
           blocked === null
             ? '该候选没有可用的分类判定，或它要成为全局知识，因此无法一键采纳。'
@@ -694,16 +709,23 @@ export function entryFromClassification(payload, projectId, proposalId) {
   const classification = isRecordValue(payload.classification) ? payload.classification : null
   if (!classification) return null
 
-  // The classification itself may say one click is not enough. `autoPromotable:
-  // false` means the plugin declined to decide on its own — a norm whose evidence is
-  // self-reported, or whose text is an episode report, or a scope that widens to every
-  // project. Returning null routes the caller to the compose form, which is the
-  // existing path for "a human must pick the kind and the scope".
+  // Whether this candidate may be adopted unattended. The verdict is the core's when the
+  // core sent one — `payload.classificationGate` on `/v1/proposals/get` — because the
+  // core computes it with the same function its write path enforces. This adapter does
+  // not re-derive it: two derivations of one rule is exactly how the previous
+  // `autoPromotable === false` test came to disagree with the gate it mirrored, reading
+  // `undefined === false` as "nothing objected" while the core read the same missing
+  // field as "nobody has confirmed this".
   //
-  // Only an explicit `false` refuses: a candidate classified before this field
-  // existed carries no verdict, and treating "no opinion" as "refused" would break the
-  // ordinary one-click case for every stored candidate.
-  if (classification.autoPromotable === false) return null
+  // When no gate arrived (an older core, or a payload read from elsewhere) the rule is
+  // applied here in the same words: only an explicit `true` is promoted unattended.
+  // Missing is not consent — that was the defect: 255 stored candidates classified by an
+  // older classifier were one click away from becoming rules, because "no opinion" had
+  // been written into the code as "no objection". Returning null routes the caller to the
+  // compose form, which is the existing path for "a human must pick the kind and scope".
+  const gate = isRecordValue(payload.classificationGate) ? payload.classificationGate : null
+  const mayPromoteUnattended = gate ? gate.required !== true : classification.autoPromotable === true
+  if (!mayPromoteUnattended) return null
 
   const kind = typeof classification.kind === 'string' ? classification.kind : ''
   if (!AUTO_PROMOTE_KINDS.has(kind)) return null
@@ -810,7 +832,25 @@ async function handlePanelAdminRequest(req, res, { config, logger }) {
   } catch (error) {
     // Same treatment as the data routes: status stays 200, the reason is sanitized,
     // and neither the credential nor raw server text travels with it.
-    panelJson(res, 200, { ok: false, action, target, error: panelReason(error, undefined) })
+    const reason = panelReason(error, undefined)
+    /**
+     * When the core's review gate is what refused, the panel also says what to do about it.
+     *
+     * The gate is the core's decision and nothing here overrides it — the code is read
+     * only to attach the instruction a person needs beside the core's own sentence (which
+     * travels inside `reason` as its `Detail:` text). A refusal with no guidance is how
+     * "the button does nothing" gets reported as a bug in the wrong component.
+     */
+    panelJson(res, 200, {
+      ok: false, action, target, error: reason,
+      ...(error && error.code === 'classification_confirmation_required'
+        ? {
+            requiresConfirmation: true,
+            guidance: '该候选的判定不授权一键采纳（核心给出的原因见 error）。请在候选审阅里打开它，人工选定类别与作用域后再采纳；'
+              + '管理界面在人工确认后会用 classificationAcknowledged: true 重试同一请求。',
+          }
+        : {}),
+    })
   }
 }
 
@@ -1231,12 +1271,62 @@ export async function apply(ctx) {
     agent.inject(message)
   }
 
+  /**
+   * File this session's task diary the moment the host says the turn is over.
+   *
+   * The core's convergence rule is the slow path: it waits for a task to sit idle
+   * and the deployed core may not run its periodic pass at all. A real library
+   * showed the cost — 19 tasks whose turn-end event had already been recorded were
+   * still `in_progress`, because the signal arrived before the core could converge
+   * on it. The host knows the turn ended *now*, so it asks the core to file the
+   * diary immediately rather than waiting for a clock.
+   *
+   * `/v1/tasks/archive` is idempotent by construction: an unchanged diary writes
+   * nothing and answers `unchanged: true`. The per-session set below means one
+   * session asks at most once per task, and a failed attempt releases its claim so
+   * the next turn retries it. Every failure is logged and swallowed — an archive is
+   * bookkeeping, and a turn that has already ended must not fail because bookkeeping
+   * did.
+   */
+  const archivedTasks = new Map()
+  const archiveSessionTask = (agent, rawTaskId) => {
+    const taskId = typeof rawTaskId === 'string' ? rawTaskId.trim() : ''
+    if (!taskId) return
+    const seen = archivedTasks.get(agent.id) ?? new Set()
+    if (seen.has(taskId)) return
+    // The claim is taken before the request, not after it. A second stop arriving
+    // while the first archive is still in flight would otherwise ask again: the
+    // core would answer `unchanged`, but this adapter's own "once per session and
+    // task" would have been false exactly when the core is slow.
+    seen.add(taskId)
+    archivedTasks.set(agent.id, seen)
+    // No request signal on purpose: at this boundary the turn's own signal may
+    // already be aborted, and an archive cancelled for that reason would have
+    // nothing left to retry it.
+    void client.post('/v1/tasks/archive', { projectId: config.projectId, taskId }).then(receipt => {
+      logger.info('task.archived', { adapter: 'dsh', sessionId: agent.id, taskId,
+        knowledgeId: receipt?.knowledgeId, revision: receipt?.revision, unchanged: receipt?.unchanged })
+    }).catch(error => {
+      // A failed attempt must stay retryable, so the claim is released instead of
+      // being remembered as done.
+      seen.delete(taskId)
+      if (client.isDisposed() || isCancelledClientError(error)) return
+      logger.warn('task.archive_failed', { adapter: 'dsh', sessionId: agent.id, taskId,
+        failureKind: error?.kind, code: error?.code, status: error?.status,
+        message: error instanceof Error ? error.message : String(error) })
+    })
+  }
+
   // Verified against dsh-agent-loop: this serial hook runs only at a natural
   // stop boundary. steer() schedules one more step; an aborted user turn never
   // reaches it. At most one reflection request per turn, never an endless gate.
   ctx.on('agent/turn-stopping', ({ agent, turn, signal }) => {
-    if (!config.autoReflect || signal?.aborted || !inProject(agent) || typeof agent?.steer !== 'function') return
+    if (signal?.aborted || !inProject(agent)) return
     const state = getSessionState(agent.id)
+    // The end of the turn is the host's own knowledge that this session stopped;
+    // it is what makes the archive immediate instead of idle-based.
+    archiveSessionTask(agent, sessionTasks.get(agent.id) ?? state.currentTaskId)
+    if (!config.autoReflect || typeof agent?.steer !== 'function') return
     if (!state.businessSinceCheckpoint || state.reflectionTurn === turn) return
     state.reflectionTurn = turn
     state.businessSinceCheckpoint = false

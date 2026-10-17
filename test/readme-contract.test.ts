@@ -51,7 +51,7 @@ test('README 中会写库的示例都指定了 --data-dir', async () => {
   // `backup`/`restore` belong here for the same reason as the rest: without
   // --data-dir they open whatever `defaultDataDir()` resolves to, which is not
   // necessarily the library the reader just started the core against.
-  const writing = new Set(['adopt', 'rescan', 'supersede', 'structure', 'seed', 'retire', 'serve', 'backup', 'restore']);
+  const writing = new Set(['adopt', 'rescan', 'supersede', 'structure', 'seed', 'retire', 'serve', 'backup', 'restore', 'reclassify']);
   const offenders = fencedCommands(await readme())
     .filter(entry => writing.has(entry.command) && !/--data-dir/.test(entry.line))
     .map(entry => entry.line);

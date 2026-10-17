@@ -22,7 +22,7 @@ import {
 } from './service.js';
 import { exportSkills } from './export-skills.js';
 import { defaultArchiveName, exportArchive, importArchive, inspectArchive } from './archive.js';
-import { createMaintenanceWorker } from './maintenance.js';
+import { createMaintenanceWorker, refineStatus } from './maintenance.js';
 
 /**
  * Command help.
@@ -36,10 +36,14 @@ const USAGE = [
   '  discover [--roots PATH,...]              scan for existing knowledge (read-only)',
   '  adopt [--yes | --revoke TIMESTAMP]       adopt discovered knowledge, or undo a batch',
   '  rescan [--roots PATH,...] [--yes]        compare sources against the ledger',
+  '  refine [--project ID] [--json]           dry run: what repeated failures could be distilled into',
+  '                                           (read-only; never submits a candidate)',
   '  supersede --old ID --new ID --reason TEXT --evidence TEXT [--action supersede|supplement]',
   '  history --id ID                          revision lineage of one entry',
   '  asof --at TIME                           the library as it stood at that moment',
   '  structure --skill ID --input FILE --evidence TEXT [--derived-by user|agent]',
+  '  reclassify [--project ID] [--limit N] [--yes]  backfill stored classification of pending',
+  '                                           candidates (dry run by default; --yes writes)',
   '  unstructured                             skills awaiting structure',
   '  backup --file FILE [--yes] [--overwrite]  pack all data into one portable .ambpack file',
   '  restore --file FILE [--yes] [--json]     inspect, then merge an .ambpack archive',
@@ -353,6 +357,38 @@ try {
       console.log('');
       console.log('  下一步：amb adopt --yes 采纳；或 amb rescan --roots <目录> 先看会改什么。');
     }
+  } else if (command === 'refine') {
+    // The distillation skeleton, dry-run by construction: it reads the queued
+    // candidates and prints what it would propose. Nothing is written — no proposal,
+    // no knowledge entry — because promoting machine-generated text is a decision a
+    // person makes, not a side effect of asking "what would you propose".
+    if (!existsSync(join(dir, 'knowledge.sqlite'))) throw new Error('该数据目录尚未初始化；请先运行 amb init');
+    const store = new Store(join(dir, 'knowledge.sqlite'));
+    try {
+      const run = refineStatus(store, { projects: values.project ? [String(values.project)] : [] });
+      if (values.json === true) {
+        console.log(JSON.stringify({ ...run, thresholds: run.thresholds, wrote: false }, null, 2));
+      } else {
+        console.log('维护期提炼（干跑，只读）');
+        console.log(`  扫描待审候选 ${run.scanned} 条；自动捕获失败签名 ${run.groups} 个；通过门槛 ${run.considered} 个`);
+        console.log(`  门槛：同签名 ≥${run.thresholds.minOccurrences} 次、跨度 ≥${Math.round(run.thresholds.minSpanMs / 1000)} 秒、置信度 ≥${run.thresholds.minConfidence}、每次最多 ${run.thresholds.maxProposalsPerRun} 条`);
+        if (run.suggestions.length === 0) {
+          console.log('  本次没有可产出：' + (run.suppressed.length > 0 ? `被负向过滤挡住 ${run.suppressed.length} 组，其余未达门槛。` : '所有签名都在门槛之下。'));
+        } else {
+          console.log(`  建议产出 ${run.suggestions.length} 条：`);
+          for (const item of run.suggestions) {
+            console.log(`    [${item.tool}] ${item.signature.slice(0, 70)}`);
+            console.log(`      出现 ${item.occurrences} 次；置信度 ${item.confidence}；成员 ${item.memberIds.length} 条`);
+          }
+        }
+        if (run.belowThreshold.length) console.log(`  未达门槛 ${run.belowThreshold.length} 组（原因见 --json）`);
+        if (run.suppressed.length) console.log(`  负向过滤挡住 ${run.suppressed.length} 组（规则与原因见 --json）`);
+        if (run.withheld > 0) console.log(`  受每次上限限制，另有 ${run.withheld} 条本次未列出。`);
+        console.log('');
+        console.log('  ' + run.note);
+        console.log('  下一步：核对上面的签名后，由人决定是否提交候选（本命令不提交）。');
+      }
+    } finally { store.close(); }
   } else if (command === 'adopt') {
     // Promotion is explicit and reversible. Without --yes this only reports what
     // would change; it never writes, and it never touches a host file.
@@ -519,6 +555,48 @@ try {
         if (entries.length > 40) console.log('    ……还有 ' + (entries.length - 40) + ' 条（用 --json 取全部）');
         console.log('');
         console.log('  这是只读视图：过去的状态是一个问题，不是一次回滚。');
+      }
+    } finally { store.close(); }
+  } else if (command === 'reclassify') {
+    // Backfill the stored classification of the candidates still awaiting review (B2).
+    //
+    // Why a CLI subcommand rather than a management endpoint: this is a one-off repair of
+    // existing rows, it needs direct access to the database, and the conventions for that
+    // already exist here — `adopt`, `rescan`, `restore` and `backup` all report by default
+    // and write only with `--yes`, which is exactly the "dry run first" shape this needs.
+    // It also lets the work be done against a *copy* of the library (`--data-dir`), which
+    // is how the real library is measured without writing to it; a management endpoint
+    // would require the running core and its admin credential, and would queue the writes
+    // into a process a user is working in.
+    const store = new Store(join(dir, 'knowledge.sqlite'));
+    try {
+      const report = store.reclassifyPending(String(values.project), {
+        apply: values.yes === true,
+        limit: values.limit ? Number(values.limit) : undefined,
+      });
+      if (values.json === true) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        const counts = (bag: Record<string, number>) =>
+          Object.entries(bag).sort((a, b) => b[1] - a[1]).map(([kind, n]) => `${kind} ${n}`).join('，') || '（无）';
+        console.log(report.applied ? '存量候选分类判定回填（已写入）' : '存量候选分类判定回填（预演，不写入）');
+        console.log('  判定器版本 ' + report.classifierVersion);
+        console.log('  待审候选 ' + report.scanned + ' 条：判定变化 ' + report.changed
+          + '，已是当前版本 ' + report.skipped + '，无文本 ' + report.unreadable);
+        console.log('  kind              before: ' + counts(report.before));
+        console.log('                    after : ' + counts(report.after));
+        console.log('  autoPromotable    before: ' + counts(report.beforeAutoPromotable));
+        console.log('                    after : ' + counts(report.afterAutoPromotable));
+        for (const change of report.changes) {
+          console.log('    [' + change.from + ' → ' + change.to + '] ' + change.id
+            + '（autoPromotable ' + String(change.autoPromotableBefore) + ' → ' + String(change.autoPromotableAfter) + '）'
+            + ' ' + change.reason.slice(0, 60));
+        }
+        if (report.changed > report.changes.length) {
+          console.log('    ……还有 ' + (report.changed - report.changes.length) + ' 条（用 --limit 调明细条数，--json 取全部统计）');
+        }
+        console.log('');
+        console.log('  ' + report.note);
       }
     } finally { store.close(); }
   } else if (command === 'unstructured') {

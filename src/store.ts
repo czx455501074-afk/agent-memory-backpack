@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { DomainError, knowledgeSchema, proposalSchema, workflowSchema, type Knowledge, type KnowledgeDraft, type WorkflowDraft, type Workflow, type Scope } from './schema.js';
 import { reviewDecision, type ReviewDecision } from './policy.js';
-import { classifyCandidate } from './semantic.js';
+import { classifyCandidate, type SemanticAnalysis } from './semantic.js';
 import { DurableJobs } from './jobs.js';
 import { MATERIAL_TTL_DAYS, expiryFrom, isLive, materialEntry, renew, type MaterialInput } from './material.js';
 
@@ -11,6 +11,70 @@ type Entry = { id: string; revision: number; status: string; content: Knowledge 
 export type TaskStatus = 'in_progress' | 'paused' | 'completed' | 'cancelled' | 'failed';
 const DAY = 86400000;
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+/**
+ * Which version of the classifier produced a stored verdict.
+ *
+ * `payload.classification` is a snapshot taken when the candidate was submitted, and
+ * the classifier has already changed once in a way that made most stored verdicts
+ * wrong: 255 of 360 pending candidates still say `norm` while recomputing them with
+ * the current classifier yields about 13. Without a version written next to the
+ * snapshot there is no way to ask "which verdicts came from the current classifier",
+ * so every improvement silently mixes old and new judgements — which is exactly what
+ * happened, and what `reclassifyPending` now exists to repair.
+ *
+ * The constant must be bumped whenever `classifyCandidate`'s decisions change. It
+ * lives here rather than beside the classifier because that file's shape is frozen for
+ * this change; the note is the link between the two.
+ */
+export const CLASSIFIER_VERSION = 'semantic-2026-10-17';
+/**
+ * What a stored classification says about promoting a candidate unattended.
+ *
+ * One function, read by the server gate, the batch pre-check and the review pages, so
+ * "may this be adopted without a person" has exactly one answer in the process. The
+ * DSH adapter cannot import this file (it runs in another process against a core that
+ * may be older), so it reads the same verdict from the server's response instead of
+ * re-deriving it — see `classificationGate` on `/v1/proposals/get`.
+ *
+ * The load-bearing rule is the last branch: a snapshot with **no** `autoPromotable`
+ * field is *not* an approval. Missing means "the verdict cannot speak for itself",
+ * which is the state every stored candidate is in, and reading it as consent is how
+ * 255 candidates classified `norm` by an older classifier could still be promoted in
+ * one click.
+ */
+export interface ClassificationGate {
+  /** True when a person has to acknowledge the verdict before the candidate is adopted. */
+  required: boolean;
+  /** The machine-readable reason a caller can branch on; null when nothing is required. */
+  code: string | null;
+  /** Why, in the sentence a reviewer is shown. Empty when nothing is required. */
+  reason: string;
+  /** What was read, so a client does not have to re-derive the verdict. */
+  kind: string | null;
+  scope: string | null;
+  autoPromotable: boolean | null;
+  classifierVersion: string | null;
+}
+export function classificationApprovalGate(classification: unknown): ClassificationGate {
+  const record = classification && typeof classification === 'object' && !Array.isArray(classification)
+    ? classification as Record<string, unknown> : null;
+  const read = {
+    kind: record && typeof record.kind === 'string' ? record.kind : null,
+    scope: record && typeof record.scope === 'string' ? record.scope : null,
+    autoPromotable: record && typeof record.autoPromotable === 'boolean' ? record.autoPromotable : null,
+    classifierVersion: record && typeof record.classifierVersion === 'string' ? record.classifierVersion : null,
+  };
+  if (read.autoPromotable === true) return { required: false, code: null, reason: '', ...read };
+  if (read.autoPromotable === false) {
+    const reason = record && typeof record.promotionBlockedReason === 'string' && record.promotionBlockedReason
+      ? record.promotionBlockedReason : '该候选被判定为不得自动升格，但快照里没有留下理由。';
+    return { required: true, code: 'classification_confirmation_required', reason, ...read };
+  }
+  const reason = record
+    ? '该候选的判定来自旧版本判定器（快照里没有 autoPromotable 字段），无法据此自动放行。'
+    : '该候选没有分类判定，无法据此自动放行。';
+  return { required: true, code: 'classification_confirmation_required', reason, ...read };
+}
 /**
  * Bounds on the persistent outbox.
  *
@@ -320,6 +384,70 @@ export function autoFailureSignature(discovery: string): FailureSignature | null
   };
 }
 
+/**
+ * Where a stored candidate says it belongs, and whether the library could confirm it.
+ *
+ * One function, because two read paths used to answer this differently: a row written
+ * with no `attribution` object was reported as `resolved: true` by `listProposals`
+ * and as `resolved: false` by `getProposal`. Both readings are wrong in the same way
+ * — the record says nothing, so neither "located" nor "known unlocatable" is a fact
+ * about it. The queue then ranked that candidate as though a person had placed it in
+ * a flow, and the detail page said the opposite about the same row.
+ *
+ * Three cases, kept apart because they need different sentences:
+ *
+ *  - the record carries a verdict: reported verbatim, and `described` is true;
+ *  - the record carries a workflow id but no verdict: the claim is kept, the verdict
+ *    is false, and the reviewer is told the id was not found;
+ *  - the record carries nothing: false, with no claim to report.
+ *
+ * `resolved` is false in the last two cases and never invented as true. Nothing here
+ * refuses, filters or downgrades a candidate: attribution is what the queue *shows*,
+ * not a gate a candidate has to pass. A library with no workflows yet (the state this
+ * was found in: 349 of 349 queued candidates unattributed, 0 workflow entries) must
+ * still review and adopt everything that is queued.
+ */
+export function resolveAttribution(
+  payload: Record<string, unknown> | null | undefined,
+): { workflowId: string | null; stageId: string | null; resolved: boolean; described: boolean; reason: string | null } {
+  const recorded = payload?.['attribution'];
+  if (recorded && typeof recorded === 'object') {
+    const verdict = recorded as { workflowId?: unknown; stageId?: unknown; resolved?: unknown };
+    const workflowId = typeof verdict.workflowId === 'string' ? verdict.workflowId : null;
+    const stageId = typeof verdict.stageId === 'string' ? verdict.stageId : null;
+    const resolved = verdict.resolved === true;
+    return {
+      workflowId, stageId, resolved, described: true,
+      reason: resolved ? null : workflowId
+        ? `候选声明的流程 ${workflowId} 不存在或不可见，未归属，采纳不依赖它`
+        : '候选未标注归属流程，未归属，采纳不依赖它',
+    };
+  }
+  const workflowId = typeof payload?.['workflowId'] === 'string' ? payload['workflowId'] as string : null;
+  return {
+    workflowId, stageId: null, resolved: false, described: false,
+    reason: workflowId
+      ? `候选声明的流程 ${workflowId} 不存在或不可见，未归属，采纳不依赖它`
+      : '候选未标注归属流程，未归属，采纳不依赖它',
+  };
+}
+
+/**
+ * The three fields the review surfaces have always returned, unchanged.
+ *
+ * `attribution` is a shape other code already asserts against field-for-field, and its
+ * callers predate the two additions below. So this returns exactly what `resolved`,
+ * `stageId` and `workflowId` were, and the explanation travels beside it rather than
+ * inside it — an added field in a pinned object is a behaviour change for every
+ * consumer, which is not what "the candidate is unattributed" should cost.
+ */
+export function attributionFields(
+  payload: Record<string, unknown> | null | undefined,
+): { workflowId: string | null; stageId: string | null; resolved: boolean } {
+  const { workflowId, stageId, resolved } = resolveAttribution(payload);
+  return { workflowId, stageId, resolved };
+}
+
 /** How loudly a candidate asks for a reviewer's first minutes. */
 export type QueueBand = 'critical' | 'high' | 'normal' | 'low';
 
@@ -365,7 +493,12 @@ export function proposalPriority(input: {
   else if (['conflict', 'supersede'].includes(input.relation)) reasons.push(`与已有知识的关系是 ${input.relation}，采纳前要核对冲突`);
   else if (input.hasEvidence) reasons.push('提交者附带了可核对证据');
   else if (input.attributed) reasons.push('候选已归属到具体流程与步骤');
-  else reasons.push('人工提交的可复用经验，未附证据');
+  // The last line used to read "未附证据" and left the missing attribution to be
+  // inferred; a reviewer reading the queue could not tell whether a candidate had no
+  // flow because none was named or because the named one was not found. Both are
+  // adopted the same way, so naming which one it is changes the work a person does,
+  // not whether the candidate moves.
+  else reasons.push('人工提交的可复用经验，未附证据；未归属流程，采纳不依赖它');
   const weight: Record<QueueBand, number> = { critical: 4000, high: 3000, normal: 2000, low: 1000 };
   const score = weight[band] + Math.round(Math.max(0, Math.min(1, input.confidence)) * 100)
     + (input.hasEvidence ? 50 : 0) + (input.attributed ? 30 : 0);
@@ -1419,6 +1552,39 @@ export class Store {
     };
   }
   /**
+   * The entries a candidate is classified against.
+   *
+   * Extracted so the submission path and the backfill compare a candidate against
+   * exactly the same library. The backfill must produce the verdict the submission
+   * path would produce *now*; a second filter written on the other side is precisely
+   * how two classifiers drift apart, and this project has already paid for that once.
+   */
+  private classificationCandidates(projectId: string): Array<{ id: string; title: string; body: string; kind: string }> {
+    return this.liveEntries()
+      .filter(entry => entry.content.kind !== 'material' && applicable(entry.content.scope, projectId))
+      .map(entry => ({
+        id: entry.id, title: entry.content.title, kind: entry.content.kind,
+        body: 'body' in entry.content ? String(entry.content.body) : '',
+      }));
+  }
+  /**
+   * Classify one candidate text and stamp the snapshot with where the verdict came from.
+   *
+   * The two added fields are what make the backfill idempotent and auditable:
+   * `classifierVersion` says which classifier produced this verdict, and `textDigest`
+   * says which text it was produced from — a candidate whose text changed after
+   * submission was never classified as it now reads. A stored verdict carrying both,
+   * matching the current constant and the current text, is already current and is
+   * reported as skipped rather than rewritten.
+   */
+  private classifyForStorage(text: string, projectId: string): SemanticAnalysis & { classifierVersion: string; textDigest: string } {
+    return {
+      ...classifyCandidate(text, this.classificationCandidates(projectId)),
+      classifierVersion: CLASSIFIER_VERSION,
+      textDigest: digest(text.trim()),
+    };
+  }
+  /**
    * Record a candidate for review.
    *
    * The return type is stated rather than inferred: the two branches (retry, new)
@@ -1595,15 +1761,7 @@ export class Store {
        * without it in the record the review queue showed raw text with no analysis
        * at all, and a genuine conflict looked identical to a routine addition.
        */
-      const classification = classifyCandidate(
-        payload.discovery,
-        this.liveEntries()
-          .filter(entry => entry.content.kind !== 'material' && applicable(entry.content.scope, payload.projectId))
-          .map(entry => ({
-            id: entry.id, title: entry.content.title, kind: entry.content.kind,
-            body: 'body' in entry.content ? String(entry.content.body) : '',
-          })),
-      );
+      const classification = this.classifyForStorage(payload.discovery, payload.projectId);
       /**
        * An identical candidate already waiting is a duplicate, not a new discovery.
        *
@@ -1849,15 +2007,14 @@ export class Store {
          * `resolved` is the program's verdict rather than the submitter's claim:
          * it is false when the named workflow could not be found, which is what
          * tells a reviewer that the workflow id and the step are *assertions*
-         * needing confirmation instead of facts. Older rows carry no such flag —
-         * they were written when an unresolved workflow could not be stored at
-         * all — and are reported as resolved, which is what they were.
+         * needing confirmation instead of facts. It reads a missing verdict as
+         * false rather than as true — a row that names no location is not a
+         * located one — and leaves the row itself untouched, because an
+         * unattributed candidate is reviewed and adopted exactly like any other.
+         * Older rows that carry no attribution at all are handled by the same
+         * rule: `resolveAttribution` reports nothing recorded, not a location.
          */
-        attribution: payload ? {
-          workflowId: payload.attribution?.workflowId ?? payload.workflowId ?? null,
-          stageId: payload.attribution?.stageId ?? payload.stageId ?? null,
-          resolved: payload.attribution?.resolved ?? true,
-        } : null,
+        attribution: payload ? attributionFields(payload) : null,
       };
     });
   }
@@ -1911,9 +2068,19 @@ export class Store {
     // disagree about what a row says.
     const rows = this.listProposals(projectId, state);
     interface Member {
+      /**
+       * `candidate` here; the folded group beside it is `aggregate`.
+       *
+       * The group always carried its `kind` while a plain candidate carried nothing at
+       * all, so a caller branching on this field (the adapter panel does) read a plain
+       * candidate as `undefined` and could not tell the two shapes apart. Naming it
+       * fixes that; the field that says "this candidate is unattributed" is
+       * `attribution.described`/`reason` below, which is additive.
+       */
+      kind: 'candidate';
       id: string; state: string; createdAt: number; expiresAt: number;
       discovery: string; priority: PriorityVerdict;
-      attribution: { workflowId: string | null; stageId: string | null; resolved: boolean };
+      attribution: { workflowId: string | null; stageId: string | null; resolved: boolean; described: boolean; reason: string | null };
       important: boolean; relation: string; confidence: number;
     }
     const actionable: Member[] = [];
@@ -1925,8 +2092,12 @@ export class Store {
       const confidence = typeof classification.confidence === 'number' ? classification.confidence : 0;
       const needsSplit = classification.needsSplit === true;
       const discovery = typeof row.discovery === 'string' ? row.discovery : '';
-      const attribution = row.attribution as { workflowId: string | null; stageId: string | null; resolved: boolean } | null;
-      const attributed = attribution?.resolved === true;
+      // Read through the shared resolver rather than trusting the list projection's
+      // field: the projection is a presentation of the same payload, and a queue that
+      // ranked on a different reading than it displayed is how the two views drifted
+      // apart in the first place.
+      const attribution = resolveAttribution(payload);
+      const attributed = attribution.resolved;
       const hasEvidence = typeof payload.evidence === 'string' && payload.evidence.trim().length > 0;
       const signature = autoFailureSignature(discovery);
       const priority = proposalPriority({
@@ -1934,9 +2105,10 @@ export class Store {
         hasEvidence, attributed, autoFailure: signature !== null,
       });
       const member: Member = {
+        kind: 'candidate',
         id: row.id, state: row.state, createdAt: Number(row.createdAt), expiresAt: Number(row.expiresAt),
         discovery, priority,
-        attribution: attribution ?? { workflowId: null, stageId: null, resolved: false },
+        attribution,
         important: payload.important === true, relation, confidence,
       };
       if (!signature) { actionable.push(member); continue; }
@@ -2033,7 +2205,13 @@ export class Store {
         },
       },
       membersQueryable: true,
-      note: '聚合是只读派生视图：底层 proposals 一条未删、状态未改，成员 id 见 memberIds，用 /v1/proposals/get 或按 state 过滤的列表可逐条取回。',
+      /**
+       * The same sentence the receipt and the list give, so a reviewer reading only
+       * the queue learns that the candidate is unattributed *and* that this is not a
+       * reason to wait: adoption and archiving do not depend on it.
+       */
+      note: '聚合是只读派生视图：底层 proposals 一条未删、状态未改，成员 id 见 memberIds，用 /v1/proposals/get 或按 state 过滤的列表可逐条取回。'
+        + ' 归属（attribution）是展示与排序的增强项：未归属候选照常出现在队列里、照常可采纳与归档，采纳与归档都不要求先补归属。',
     };
   }
   /**
@@ -2073,16 +2251,17 @@ export class Store {
         target = { workflowId, baseRevision, currentRevision: head.revision, entry: head.content as Knowledge, available: true, reason: '目标流程当前可见' };
       }
     }
+    // One verdict for both read paths. This method used to answer `resolved: false`
+    // for a row that named a workflow without a stored verdict, while the list view
+    // answered `true` for the same row: two pages describing one candidate
+    // differently, which is what makes a reviewer stop trusting either.
+    const attribution = attributionFields(payload);
     return {
       id: row.id, principal: row.principal, state: row.state,
       createdAt: row.created_at, expiresAt: row.expires_at,
       payload,
       discovery: typeof payload.discovery === 'string' ? payload.discovery : '',
-      attribution: {
-        workflowId: (payload.attribution as { workflowId?: string | null } | undefined)?.workflowId ?? workflowId,
-        stageId: (payload.attribution as { stageId?: string | null } | undefined)?.stageId ?? (typeof payload.stageId === 'string' ? payload.stageId : null),
-        resolved: (payload.attribution as { resolved?: boolean } | undefined)?.resolved ?? false,
-      },
+      attribution,
       review: (payload.review as Record<string, unknown> | undefined) ?? null,
       decision: (payload.decision as Record<string, unknown> | undefined) ?? null,
       target,
@@ -2345,8 +2524,13 @@ export class Store {
    *    so via `allowGlobalScope`.
    *  - when the proposal named a target workflow, the entry must be that entry.
    *    Otherwise an unrelated entry could be approved under its cover.
+   *
+   * A third guard, added later, is the classification gate in the body below:
+   * `allowGlobalScope` widens one project's knowledge, while a candidate whose stored
+   * verdict cannot promote itself must not be adopted on a bare click at all — from any
+   * entry point, which is why it is enforced here and not in a client.
    */
-  approveProposal(id: string, entry: KnowledgeDraft, options: { allowGlobalScope?: boolean; actor?: string; projectId?: string } = {}): number {
+  approveProposal(id: string, entry: KnowledgeDraft, options: { allowGlobalScope?: boolean; actor?: string; projectId?: string; classificationAcknowledged?: boolean } = {}): number {
     const validated = knowledgeSchema.parse(entry);
     return this.transaction(() => {
       const row = this.db.prepare('SELECT state,payload,project_id FROM proposals WHERE id=?').get(id) as
@@ -2358,7 +2542,31 @@ export class Store {
       if (options.projectId !== undefined && row.project_id !== options.projectId)
         throw new DomainError('scope_denied', `Proposal ${id} belongs to another project`, 403);
 
-      const payload = JSON.parse(row.payload || '{}') as { projectId?: string; workflowId?: string; baseRevision?: number };
+      const payload = JSON.parse(row.payload || '{}') as { projectId?: string; workflowId?: string; baseRevision?: number; classification?: unknown };
+      /**
+       * The review gate, enforced where the write happens.
+       *
+       * It used to live in one client (the DSH adapter's `autoPromotable === false`
+       * test), which meant the web page approved anything, the batch endpoint approved
+       * N at once, and a candidate whose snapshot predated the field was promoted by a
+       * single click — so the rule "an experience is not promoted into a rule by one
+       * click" held for new candidates and for one door only, while 255 stored
+       * candidates classified `norm` fell straight through.
+       *
+       * A verdict that says `autoPromotable: true` keeps the ordinary path. Anything
+       * else — an explicit `false`, or a snapshot that cannot answer at all — needs the
+       * request to say, explicitly, that a person acknowledged the kind and the scope.
+       * `classificationAcknowledged` is therefore optional in the request (no caller
+       * breaks) and load-bearing here: its absence is a refusal, never a pass, because
+       * "the program has no opinion" is a reason to ask a person, not a reason to
+       * proceed.
+       */
+      const gate = classificationApprovalGate(payload.classification);
+      if (gate.required && options.classificationAcknowledged !== true) {
+        throw new DomainError('classification_confirmation_required',
+          `该候选不能在没有人工确认的情况下采纳：${gate.reason}`
+          + '请人工核对类别与作用域；确认后在请求体里带上 classificationAcknowledged: true 重试。', 409);
+      }
       const proposalProject = payload.projectId;
       const scope = validated.scope;
 
@@ -2513,6 +2721,161 @@ export class Store {
     });
   }
   /**
+   * Which of these candidates cannot be approved without an explicit acknowledgement.
+   *
+   * Read-only, and it answers with the same function the write path enforces, so a
+   * batch entry point can tell a person "N of these need your confirmation" *before*
+   * anything is written, and cannot disagree with what the write would refuse. Ids that
+   * do not exist, or that belong to another project, are not reported here: the write
+   * path already refuses those with their own error, and inventing a second verdict for
+   * them would only shadow it.
+   */
+  classificationGateFor(projectId: string, ids: string[]): Array<{ id: string; gate: ClassificationGate }> {
+    const required: Array<{ id: string; gate: ClassificationGate }> = [];
+    for (const id of ids) {
+      const row = this.db.prepare('SELECT payload,project_id FROM proposals WHERE id=?').get(id) as
+        { payload: string | null; project_id: string } | undefined;
+      if (!row || row.project_id !== projectId) continue;
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(row.payload || '{}') as Record<string, unknown>; } catch { /* an unreadable row cannot speak for itself, so it needs confirmation */ }
+      const gate = classificationApprovalGate(payload.classification);
+      if (gate.required) required.push({ id, gate });
+    }
+    return required;
+  }
+  /**
+   * Backfill the stored classification of the candidates still waiting for review.
+   *
+   * `payload.classification` is a snapshot from submission time, and nothing recomputed
+   * it after the classifier was fixed: 255 of 360 pending candidates still said `norm`
+   * while the current classifier answers about 13. Both numbers were true — one was
+   * "what a recomputation would say", the other "what the user sees" — and only the
+   * second one decides what happens in the review queue.
+   *
+   * The recomputation calls the same `classifyCandidate` the submission path calls, over
+   * the same library slice (`classificationCandidates`), and stamps the result with
+   * `CLASSIFIER_VERSION` and a digest of the text it was computed from. Three
+   * consequences are deliberate:
+   *
+   *  - **dry run is the default.** The report is a before/after distribution plus the
+   *    first few changed rows; `apply: true` is what writes.
+   *  - **idempotent.** A snapshot whose version and text digest are current is skipped
+   *    and counted, so re-running reports "everything skipped" instead of rewriting.
+   *  - **only the verdict moves.** Rows that are not `pending` are not read at all, and
+   *    for the rows that are, only `classification` is replaced — `state`, `discovery`,
+   *    the review decision and the attribution are untouched, and the replaced snapshot
+   *    is kept under `classificationPrevious` so the change stays auditable. An adopted
+   *    entry is never a candidate and is therefore never in scope.
+   */
+  reclassifyPending(projectId: string, options: { apply?: boolean; limit?: number } = {}): {
+    projectId: string; applied: boolean; classifierVersion: string;
+    scanned: number; skipped: number; changed: number; unreadable: number;
+    before: Record<string, number>; after: Record<string, number>;
+    beforeAutoPromotable: Record<string, number>; afterAutoPromotable: Record<string, number>;
+    changes: Array<{ id: string; from: string; to: string; autoPromotableBefore: boolean | null; autoPromotableAfter: boolean | null; reason: string }>;
+    note: string;
+  } {
+    const rows = this.db.prepare("SELECT id,payload FROM proposals WHERE project_id=? AND state='pending' ORDER BY created_at")
+      .all(projectId) as Array<{ id: string; payload: string | null }>;
+    const limit = options.limit === undefined ? 20 : Math.max(0, options.limit);
+    const before: Record<string, number> = {};
+    const after: Record<string, number> = {};
+    const beforeAuto: Record<string, number> = {};
+    const afterAuto: Record<string, number> = {};
+    const changes: Array<{ id: string; from: string; to: string; autoPromotableBefore: boolean | null; autoPromotableAfter: boolean | null; reason: string }> = [];
+    const count = (bag: Record<string, number>, key: string) => { bag[key] = (bag[key] ?? 0) + 1; };
+    const autoKey = (value: boolean | null | undefined) => value === true ? 'true' : value === false ? 'false' : 'missing';
+    let skipped = 0;
+    let changed = 0;
+    let unreadable = 0;
+    const writes: Array<{ id: string; payload: string }> = [];
+
+    for (const row of rows) {
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(row.payload || '{}') as Record<string, unknown>; } catch { payload = {}; }
+      const stored = payload.classification && typeof payload.classification === 'object' && !Array.isArray(payload.classification)
+        ? payload.classification as Record<string, unknown> : null;
+      const storedKind = stored && typeof stored.kind === 'string' ? stored.kind : 'none';
+      const storedAuto = stored && typeof stored.autoPromotable === 'boolean' ? stored.autoPromotable : null;
+      count(before, storedKind);
+      count(beforeAuto, autoKey(storedAuto));
+
+      const text = typeof payload.discovery === 'string' ? payload.discovery : '';
+      if (text.trim() === '') {
+        // Without text there is nothing to classify; the row is reported, not rewritten.
+        unreadable += 1;
+        count(after, storedKind);
+        count(afterAuto, autoKey(storedAuto));
+        continue;
+      }
+      const upToDate = stored !== null
+        && stored.classifierVersion === CLASSIFIER_VERSION
+        && stored.textDigest === digest(text.trim());
+      if (upToDate) {
+        skipped += 1;
+        count(after, storedKind);
+        count(afterAuto, autoKey(storedAuto));
+        continue;
+      }
+
+      const next = this.classifyForStorage(text, projectId);
+      const nextKind = typeof next.kind === 'string' ? next.kind : 'none';
+      const nextAuto = typeof next.autoPromotable === 'boolean' ? next.autoPromotable : null;
+      count(after, nextKind);
+      count(afterAuto, autoKey(nextAuto));
+      changed += 1;
+      if (nextKind !== storedKind || nextAuto !== storedAuto) {
+        changes.push({
+          id: row.id, from: storedKind, to: nextKind,
+          autoPromotableBefore: storedAuto, autoPromotableAfter: nextAuto,
+          reason: typeof next.promotionBlockedReason === 'string' ? next.promotionBlockedReason
+            : (nextAuto === true ? '可自动升格' : '判定器未给出可自动升格'),
+        });
+      }
+      if (options.apply === true) {
+        writes.push({
+          id: row.id,
+          payload: JSON.stringify({
+            ...payload,
+            classification: next,
+            /**
+             * The replaced snapshot, kept rather than dropped.
+             *
+             * This is the field that makes the backfill reviewable after the fact: a
+             * reader can see that a verdict changed, which classifier produced the old
+             * one (usually none — that is the whole reason the row was stale) and when.
+             * Nothing else in the payload is touched.
+             */
+            classificationPrevious: {
+              ...(stored ?? {}),
+              classifierVersion: stored && typeof stored.classifierVersion === 'string' ? stored.classifierVersion : null,
+              replacedAt: this.now(),
+            },
+          }),
+        });
+      }
+    }
+
+    if (writes.length) {
+      this.transaction(() => {
+        const update = this.db.prepare('UPDATE proposals SET payload=? WHERE id=? AND state=\'pending\'');
+        for (const write of writes) update.run(write.payload, write.id);
+      });
+    }
+
+    return {
+      projectId, applied: options.apply === true, classifierVersion: CLASSIFIER_VERSION,
+      scanned: rows.length, skipped, changed, unreadable,
+      before, after, beforeAutoPromotable: beforeAuto, afterAutoPromotable: afterAuto,
+      changes: changes.slice(0, limit),
+      note: options.apply === true
+        ? `已回填 ${writes.length} 条候选的分类判定（state/discovery 与已采纳条目均未改动）；`
+          + '重跑本命令应报"全部跳过"。'
+        : `预演：只读取与计算，未写入任何一行。共扫描 ${rows.length} 条待审，其中 ${changed} 条判定会变化、${skipped} 条已是当前判定器版本。`
+          + '确认分布无误后加 --yes（或 apply: true）才会写入。',
+    };
+  }
+  /**
    * Apply one decision to many proposals.
    *
    * The design asks for batch operations so a user is not interrupted per candidate.
@@ -2529,6 +2892,16 @@ export class Store {
     /** Required for request-evidence. */
     reason?: string;
     allowGlobalScope?: boolean;
+    /**
+     * Whether the reviewer acknowledged the classification of every candidate in this
+     * batch that needs it.
+     *
+     * One flag for the batch, but not one verdict: each id is still gated on its own
+     * stored classification, so a batch that mixes an ordinary candidate with one whose
+     * verdict cannot promote itself reports the second as failed instead of smuggling
+     * it through on the first one's merits.
+     */
+    classificationAcknowledged?: boolean;
   }): { applied: string[]; failed: Array<{ id: string; message: string }> } {
     const applied: string[] = [];
     const failed: Array<{ id: string; message: string }> = [];
@@ -2548,7 +2921,7 @@ export class Store {
         else {
           const entry = input.entries?.[id];
           if (!entry) throw new DomainError('invalid_request', `No entry supplied for ${id}`, 400);
-          this.approveProposal(id, entry, { allowGlobalScope: input.allowGlobalScope, projectId });
+          this.approveProposal(id, entry, { allowGlobalScope: input.allowGlobalScope, projectId, classificationAcknowledged: input.classificationAcknowledged });
         }
         applied.push(id);
       } catch (error) {
@@ -2968,8 +3341,15 @@ export class Store {
         const converges = task.status === 'in_progress' && idleMs >= thresholds.idleMs;
         const archives = idleMs >= thresholds.archiveAfterMs;
         if (!converges && !archives) {
+          // Name the threshold that was not reached, and name it per status. The
+          // previous single sentence ("still within the active window") was read by a
+          // reviewer as "within 12 hours" for a task idle for 42 hours: the number was
+          // right, but which window it referred to was not, and a receipt that can be
+          // misread is a receipt that gets acted on wrongly.
           kept.push({ taskId: task.id, projectId: owner, status: task.status, idleMs,
-            reason: `距上次记录 ${Math.round(idleMs / 60000)} 分钟，仍在活跃阈值内` });
+            reason: task.status === 'in_progress'
+              ? `距上次记录 ${Math.round(idleMs / 60000)} 分钟，未到 ${Math.round(thresholds.idleMs / 60000)} 分钟收敛阈值`
+              : `距上次记录 ${Math.round(idleMs / 60000)} 分钟，状态已是 ${task.status}，未到 ${Math.round(thresholds.archiveAfterMs / 3600000)} 小时归档阈值` });
           continue;
         }
         if (converges) {

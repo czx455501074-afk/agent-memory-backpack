@@ -86,17 +86,41 @@ test('a candidate the classifier allows is still promoted in one click', async (
   assert.equal(params.entry.provenance, 'agent', '形态由插件决定这一事实必须留在条目里');
 });
 
-test('a stored candidate classified before the verdict existed keeps its one-click path', async () => {
-  // The verdict is an addition, not a replacement: candidates submitted before it have
-  // no `autoPromotable` field, and reading absence as a refusal would turn every one of
-  // them into a form. Only an explicit `false` blocks.
+test('a stored candidate classified before the verdict existed now needs a person', async () => {
+  // Deliberate reversal (B1). The verdict used to be additive: a snapshot without
+  // `autoPromotable` kept its one-click path, because reading absence as a refusal "would
+  // turn every one of them into a form". Measured on the real library, 341 of the pending
+  // candidates have no such field and 256 of those still say `norm` — so absence was
+  // precisely the door through which an older classifier's verdict could still become a
+  // rule. Absence is now a reason to ask a person, and the refusal has to say which one
+  // it is rather than reporting "no classification".
   const payload = {
     projectId: PROJECT,
     discovery: '旧候选的文本',
     classification: { kind: 'memory', scope: 'project', relation: 'new', confidence: 0.5 },
   };
-  const params = await buildPanelAdminParams('proposal-approve', { id: 'c3' }, CONFIG, adminStub(payload));
-  assert.equal(params.entry.kind, 'memory', '缺少判定字段的旧候选必须保持一键采纳');
+  await assert.rejects(
+    () => buildPanelAdminParams('proposal-approve', { id: 'c3' }, CONFIG, adminStub(payload)),
+    /旧版本判定器/,
+    '缺少判定字段的旧候选不得再一键采纳，且必须说明原因',
+  );
+});
+
+test('a core that allows the promotion restores the one-click path', async () => {
+  // The adapter reads the core's own gate when it is present, so a candidate the core has
+  // reclassified (or a core that computed a fresh verdict) is promoted exactly as before.
+  // One rule, one place: the adapter does not second-guess the verdict it was handed.
+  const payload = {
+    projectId: PROJECT,
+    discovery: '已由核心判定的候选',
+    classification: { kind: 'memory', scope: 'project' },
+    classificationGate: {
+      required: false, reason: '', kind: 'memory', scope: 'project', autoPromotable: true, classifierVersion: 'test',
+    },
+  };
+  const params = await buildPanelAdminParams('proposal-approve', { id: 'c5' }, CONFIG, adminStub(payload));
+  assert.equal(params.entry.kind, 'memory', '核心判定为可放行时必须仍然一键采纳');
+  assert.equal(params.entry.provenance, 'agent');
 });
 
 test('entryFromClassification refuses a verdict-bearing candidate on its own', () => {

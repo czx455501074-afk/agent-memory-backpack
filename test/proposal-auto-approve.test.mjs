@@ -19,7 +19,10 @@ import { entryFromClassification, buildPanelAdminParams } from '../adapters/dsh/
 const candidate = (over = {}) => ({
   projectId: 'p0-workflow',
   discovery: '首行结论\n第二行细节',
-  classification: { kind: 'norm', scope: 'project', relation: 'new', confidence: 0.71 },
+  // `autoPromotable: true` is what the current classifier writes for a candidate that may
+  // be adopted unattended. A snapshot without it is a verdict from an older build, and the
+  // gate now treats that as "needs a person" rather than as consent — see the last test.
+  classification: { kind: 'norm', scope: 'project', relation: 'new', confidence: 0.71, autoPromotable: true },
   ...over,
 })
 
@@ -39,7 +42,7 @@ test('the plugin decides the kind and scope, and the entry records that it did',
 test('a task-scoped candidate keeps its task', () => {
   const entry = entryFromClassification(candidate({
     taskId: 'task-42',
-    classification: { kind: 'memory', scope: 'task' },
+    classification: { kind: 'memory', scope: 'task', autoPromotable: true },
   }), 'p0-workflow', 'id-1')
 
   assert.deepEqual(entry.scope, { kind: 'task', projectId: 'p0-workflow', taskId: 'task-42' })
@@ -48,7 +51,7 @@ test('a task-scoped candidate keeps its task', () => {
 
 test('a task-scoped candidate without a task id is refused rather than demoted', () => {
   // Silently turning it into a project entry would widen what the candidate said.
-  const entry = entryFromClassification(candidate({ classification: { kind: 'memory', scope: 'task' } }), 'p0', 'id-2')
+  const entry = entryFromClassification(candidate({ classification: { kind: 'memory', scope: 'task', autoPromotable: true } }), 'p0', 'id-2')
   assert.equal(entry, null)
 })
 
@@ -65,7 +68,7 @@ test('no classification means no guess', () => {
 })
 
 test('a kind the panel cannot show is refused instead of written', () => {
-  const entry = entryFromClassification(candidate({ classification: { kind: 'workflow', scope: 'project' } }), 'p0', 'id-6')
+  const entry = entryFromClassification(candidate({ classification: { kind: 'workflow', scope: 'project', autoPromotable: true } }), 'p0', 'id-6')
   assert.equal(entry, null)
 })
 
@@ -127,4 +130,42 @@ test('a candidate the plugin cannot classify is refused, not guessed', async () 
     /分类|作用域/,
     '没有分类时必须说明原因，而不是编一个类别写进去',
   )
+})
+
+/**
+ * A verdict from an older build is not consent (B1).
+ *
+ * The previous rule was `autoPromotable === false`, and a snapshot written before the field
+ * existed is `undefined` — so a missing verdict fell on the permissive side. That is how 255
+ * stored candidates classified `norm` by an older classifier stayed one click away from
+ * becoming rules. Missing is now a reason to ask a person, and the message says so.
+ */
+test('a snapshot with no autoPromotable field is refused rather than promoted', async () => {
+  const legacy = candidate({ classification: { kind: 'norm', scope: 'project', relation: 'new', confidence: 0.71 } })
+  assert.equal(entryFromClassification(legacy, 'p0-workflow', 'cand-legacy'), null,
+    '缺少判定字段时不得一键采纳')
+
+  await assert.rejects(
+    () => buildPanelAdminParams('proposal-approve', { id: 'cand-legacy', projectId: 'p0' },
+      { projectId: 'p0' }, adminStub(legacy)),
+    /旧版本判定器/,
+    '必须说明这条判定来自旧版本判定器，而不是笼统地说"没有分类"',
+  )
+})
+
+test('a core that already decided needs no re-derivation by the adapter', () => {
+  // The gate is the core's answer; when it says `required: false` the candidate is promoted
+  // exactly as before, whatever the stored snapshot would have said on its own.
+  const withGate = candidate({
+    classification: { kind: 'norm', scope: 'project' },
+    classificationGate: { required: false, reason: '', kind: 'norm', scope: 'project', autoPromotable: true, classifierVersion: 'x' },
+  })
+  assert.ok(entryFromClassification(withGate, 'p0-workflow', 'cand-gate-ok'), '核心判定为可放行时仍应一键采纳')
+
+  const refusedByCore = candidate({
+    classification: { kind: 'norm', scope: 'project', autoPromotable: true },
+    classificationGate: { required: true, reason: '核心说这条需要人确认', kind: 'norm', scope: 'project', autoPromotable: null, classifierVersion: null },
+  })
+  assert.equal(entryFromClassification(refusedByCore, 'p0-workflow', 'cand-gate-no'), null,
+    '核心判定优先于本地快照')
 })

@@ -474,6 +474,73 @@ test("Stop service failure exits unsuccessfully without an apparent stop success
   assert.equal(service.requests[0].body.kind, "turn_stopped");
 });
 
+test("Stop files the task diary once per turn through the idempotent archive endpoint", async () => {
+  const service = await startServer((request, response) => {
+    if (request.url === "/v1/events") {
+      return json(response, 200, {
+        id: "event-fixture", stored: true, duplicate: false,
+        taskId: "task-fixture", journalId: "journal-task-fixture", revision: 1, outcome: "unverified",
+      });
+    }
+    if (request.url === "/v1/tasks/archive") {
+      return json(response, 200, {
+        taskId: request.body.taskId, projectId: request.body.projectId,
+        knowledgeId: `journal-task-${request.body.taskId}`, revision: 1,
+        replaced: false, unchanged: false, archivedAt: 1,
+      });
+    }
+    json(response, 404, { message: "missing" });
+  });
+  const config = await createConfig(service.endpoint);
+  const stop = { hook_event_name: "Stop", session_id: "thread-archive", turn_id: "turn-archive" };
+  const archives = () => service.requests.filter((entry) => entry.url === "/v1/tasks/archive");
+
+  assert.deepEqual(parseStdout(await runHook(stop, config)), { continue: true });
+  assert.equal(archives().length, 1, "会话结束必须发起一次归档");
+  assert.deepEqual(archives()[0].body, { projectId: "project-fixture", taskId: "task-fixture" });
+  assert.equal(archives()[0].headers["x-amb-protocol"], "1", "归档调用必须带 x-amb-protocol: 1");
+
+  // Idempotent at this end: a Stop retried for the same turn asks nothing again.
+  assert.equal((await runHook(stop, config)).status, 0);
+  assert.equal(archives().length, 1, "同一回合的重复 Stop 不得重复归档");
+
+  // A later turn may file again; a duplicate cannot appear, because the core
+  // answers `unchanged` for content that has not moved.
+  const nextTurn = { ...stop, turn_id: "turn-archive-2" };
+  assert.equal((await runHook(nextTurn, config)).status, 0);
+  assert.equal(archives().length, 2, "新回合结束应再次归档，重复写入由 core 的内容幂等兜住");
+});
+
+test("Stop survives an unavailable archive and retries it on the next Stop", async () => {
+  let archiveCalls = 0;
+  const service = await startServer((request, response) => {
+    if (request.url === "/v1/events") {
+      return json(response, 200, {
+        id: "event-fixture", stored: true, duplicate: false,
+        taskId: "task-fixture", journalId: "journal-task-fixture", revision: 1, outcome: "unverified",
+      });
+    }
+    if (request.url === "/v1/tasks/archive") {
+      archiveCalls += 1;
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "unavailable" }));
+      return;
+    }
+    json(response, 404, { message: "missing" });
+  });
+  const config = await createConfig(service.endpoint);
+  const stop = { hook_event_name: "Stop", session_id: "thread-archive-fail", turn_id: "turn-1" };
+
+  const first = await runHook(stop, config);
+  assert.equal(first.status, 0, "归档失败不得让 Stop 退出失败");
+  assert.deepEqual(parseStdout(first), { continue: true });
+  assert.equal(archiveCalls, 1);
+
+  const retry = await runHook(stop, config);
+  assert.equal(retry.status, 0);
+  assert.equal(archiveCalls, 2, "失败的归档必须留待下次重试，而不是被记为已完成");
+});
+
 test("the default config path is ~/.agent-memory-backpack/client.json", async () => {
   const dir = await mkdtemp(join(tmpdir(), "amb-codex-no-config-"));
   fixtureDirs.add(dir);

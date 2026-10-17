@@ -609,6 +609,15 @@ function toTaskRecord(rawTask, extraSessionId) {
   const recalled = await recallKnowledge({ client: { post: (route, payload, options) => post(config, route, payload, options) },
     config, logger, adapter: 'codex', sessionId: sessionInfo.sessionId, query, trigger: 'task' });
   const finalContext = [handoffBlock, redact(result.context, config.token), redact(recalled.context, config.token)].filter(Boolean).join("\n\n");
+  /**
+   * The recall passage is the only part of a turn that carries a budget, so the
+   * receipt names each part rather than one total: with only `chars` above, a
+   * Codex turn cannot say which half grew, and the budget cannot be checked
+   * against the turn it was supposed to bound.
+   */
+  logger.info("context.injected.parts", { adapter: "codex", sessionId: sessionInfo.sessionId,
+    handoffChars: handoffBlock.length, preparedChars: result.context.length,
+    recallChars: recalled.context.length, chars: finalContext.length + SOURCE_MARKER.length + 1 });
   emit({
     hookSpecificOutput: {
       hookEventName: input.hook_event_name,
@@ -738,6 +747,38 @@ async function replayOutboxIfNeeded(input, config) {
   }
 }
 
+/**
+ * File a stopped turn's diary under the task's own scope, once per turn.
+ *
+ * The core's convergence rule only reaches a task after it has sat idle, and the
+ * core actually running may predate that rule, so a session that has stopped could
+ * leave an `in_progress` task behind with no signal left to end it. The Stop hook
+ * knows the turn just ended and can file the diary at once; `/v1/tasks/archive` is
+ * idempotent by construction (unchanged content writes nothing), so a repeat cannot
+ * duplicate an entry.
+ *
+ * `archivedStopTurnKey` in the session state makes the repeat a no-op at this end
+ * as well: a Stop retried for the same turn does not ask again. It is written only
+ * after the core accepted the call, so a failure stays retryable on the next Stop
+ * rather than being silently forgotten. A failure never propagates — filing a diary
+ * is not what the host asked this hook to do, and it cannot fail the turn it just
+ * recorded.
+ */
+async function archiveStoppedTurn({ config, logger, sessionId, taskId, turnKey }) {
+  if (typeof taskId !== "string" || !taskId.trim()) return;
+  const trimmed = taskId.trim();
+  try {
+    const receipt = await post(config, "/v1/tasks/archive", { projectId: config.projectId, taskId: trimmed });
+    logger.info("task.archived", { adapter: "codex", sessionId, taskId: trimmed,
+      knowledgeId: receipt?.knowledgeId, revision: receipt?.revision, unchanged: receipt?.unchanged });
+    saveSessionState(config.dataDir, sessionId, { archivedStopTurnKey: turnKey, archivedTaskId: trimmed });
+  } catch (error) {
+    logger.warn("task.archive_failed", { adapter: "codex", sessionId, taskId: trimmed,
+      failureKind: error?.kind, code: error?.code, status: error?.status,
+      message: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 async function recordEvent(input, config) {
   const stopped = input.hook_event_name === "Stop";
   const sessionInfo = sessionFields(input, config);
@@ -790,7 +831,16 @@ async function recordEvent(input, config) {
         taskId: result.taskId, journalId: result.journalId, revision: result.revision, outcome: result.outcome });
     }
     if (recalled?.context) emit({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: `${SOURCE_MARKER}\n${redact(recalled.context, config.token)}` } });
-    if (stopped) emit({ continue: true });
+    if (stopped) {
+      // One idempotent archive per stopped turn. The marker is written only after
+      // the core accepted the call, so a retried Stop for the same turn asks
+      // nothing again, while a failed attempt is retried by the next Stop.
+      if (state.archivedStopTurnKey !== stopTurnKey) {
+        await archiveStoppedTurn({ config, logger, sessionId: sessionInfo.sessionId,
+          taskId: stopTaskId ?? result.taskId, turnKey: stopTurnKey });
+      }
+      emit({ continue: true });
+    }
   } catch (error) {
     // An `http4xx` refusal, a protocol mismatch or a withdrawn call is a decision
     // to report, never a queue entry: replaying it would fail the same way.

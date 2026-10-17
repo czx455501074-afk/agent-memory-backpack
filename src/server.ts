@@ -1,14 +1,15 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, createHash } from 'node:crypto';
 import { dirname } from 'node:path';
 import { z } from 'zod';
-import { Store } from './store.js';
+import { Store, classificationApprovalGate } from './store.js';
 import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, outboxEntrySchema, DomainError } from './schema.js';
 import { coreSchema, type CoreConfig } from './config.js';
 import { exportArchive, importArchive, inspectArchive } from './archive.js';
 import { capabilityManifest, operatingModeFromDisk } from './capabilities.js';
 import { UI_CSS, UI_HTML, UI_JS } from './ui.js';
 import { maintenanceStatus, initializeMaintenance } from './maintenance.js';
+import { reviewPrefill, reviewPrefills, type ReviewPrefill } from './model-review.js';
 import { enqueueWorkflowDraft, listWorkflowDrafts, readWorkflowDraft, approveWorkflowDraft, reviseWorkflowDraft } from './workflow-organization.js';
 import { createRetrievalService, selectionSource } from './retrieval-service.js';
 import { relevantPassages } from './retrieval-excerpt.js';
@@ -105,6 +106,42 @@ const ADMIN_ONLY = new Set([
  */
 const ADMIN_ONLY_HINT = 'This operation changes the effective knowledge base and requires the admin credential. '
   + 'Submit a candidate instead (amb_submit_experience) and let a human review it.';
+
+/**
+ * The analyzer's suggestions for one project's candidates, in one read.
+ *
+ * `model_reviews` is the only place the analysis survives, keyed by proposal id.
+ * Two facts have to be joined here rather than in the table: the row's own
+ * `inputHash` against the candidate's current payload, which is the only way to
+ * tell a suggestion that still describes the candidate from one computed against
+ * text that has since been edited. Computing it per row would mean one query per
+ * candidate on a list page, so the payloads are read once as well.
+ */
+function reviewSuggestions(store: Store, projectId: string): Map<string, ReviewPrefill> {
+  const rows = store.db.prepare('SELECT proposal_id,result FROM model_reviews WHERE project_id=?')
+    .all(projectId) as Array<{ proposal_id: string; result: string }>;
+  if (!rows.length) return new Map();
+  const payloads = store.db.prepare('SELECT id,payload FROM proposals WHERE project_id=?')
+    .all(projectId) as Array<{ id: string; payload: string | null }>;
+  // The same hash `maintenance.ts` stores, so the two can be compared at all.
+  const hashes = new Map(payloads.map(row => [String(row.id), createHash('sha256').update(String(row.payload)).digest('hex')]));
+  return reviewPrefills(rows.map(row => {
+    let result: unknown = null;
+    try { result = JSON.parse(String(row.result)); } catch { /* an unreadable row yields no suggestion */ }
+    return { proposalId: String(row.proposal_id), result };
+  }), hashes);
+}
+
+/** One candidate's stored suggestion, or `null` when the analyzer never decided one. */
+function reviewSuggestion(store: Store, projectId: string, proposalId: string): ReviewPrefill | null {
+  const row = store.db.prepare('SELECT result FROM model_reviews WHERE proposal_id=? AND project_id=?')
+    .get(proposalId, projectId) as { result: string } | undefined;
+  if (!row) return null;
+  const payload = store.db.prepare('SELECT payload FROM proposals WHERE id=?').get(proposalId) as { payload: string | null } | undefined;
+  let result: unknown = null;
+  try { result = JSON.parse(String(row.result)); } catch { return null; }
+  return reviewPrefill(result, { payloadHash: createHash('sha256').update(String(payload?.payload)).digest('hex') });
+}
 
 export function createCoreServer(store: Store, config: CoreConfig) {
   initializeMaintenance(store);
@@ -356,10 +393,68 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             sampleLimit: z.number().int().min(1).max(20).default(3),
             limit: z.number().int().positive().max(500).optional(),
           }).parse(body);
-          if (p.view === 'flat') return reply(res, 200, { proposals: store.listProposals(p.projectId, p.state) });
-          return reply(res, 200, store.queueProposals(p.projectId, {
+          if (p.view === 'flat') {
+            // `prefill` is added only for rows the analyzer actually decided, so
+            // every existing consumer keeps reading exactly the fields it reads
+            // today, and a candidate with no stored analysis stays field-for-field
+            // identical to before.
+            const suggestions = reviewSuggestions(store, p.projectId);
+            return reply(res, 200, {
+              proposals: store.listProposals(p.projectId, p.state).map(proposal => {
+                const prefill = suggestions.get(proposal.id);
+                /**
+                 * The promotion verdict travels with the row that needs one.
+                 *
+                 * The queue shows the reason a candidate cannot be adopted on a bare
+                 * click, and the rule for that reason lives in one place (`store`'s
+                 * gate). Re-deriving "does this need confirmation" here would be a
+                 * second opinion about one verdict, which is the shape of drift this
+                 * whole change exists to remove — so the row carries the gate, and a
+                 * row that needs nothing keeps exactly the fields it had before.
+                 */
+                const gate = classificationApprovalGate(
+                  (proposal.payload as { classification?: unknown } | null)?.classification,
+                );
+                return {
+                  ...proposal,
+                  ...(prefill ? { prefill } : {}),
+                  ...(gate.required ? { classificationGate: gate } : {}),
+                };
+              }),
+            });
+          }
+          /**
+           * The queue view is the one the panel opens by default, so the same
+           * suggestion has to travel on its candidate entries: a prefill available
+           * only in the flat list would sit on the road a reviewer rarely takes,
+           * which is the same "computed and then unused" gap one layer down.
+           *
+           * `reviewSuggestions()` is reused rather than re-derived. Two paths that
+           * each decide "is this suggestion still current" would drift apart —
+           * same stored row, same payload hash, same vocabulary check, one answer.
+           *
+           * A candidate entry carries no `kind` (the stored projection has never had
+           * one); only the folded group is tagged `aggregate`. That entry represents
+           * repeated sightings of one failure signature rather than an adoptable
+           * candidate, so it carries no suggestion, and the reply says so in `note`
+           * instead of leaving a caller to guess whether a missing field meant
+           * "nothing to suggest" or "the server forgot to fill it in".
+           */
+          const queue = store.queueProposals(p.projectId, {
             state: p.state, include: p.include, sampleLimit: p.sampleLimit, limit: p.limit,
-          }));
+          });
+          const suggestions = reviewSuggestions(store, p.projectId);
+          const items = (queue.items as unknown as Array<Record<string, unknown>>).map(item => {
+            if (item.kind === 'aggregate') return item;
+            const prefill = suggestions.get(String(item.id));
+            return prefill ? { ...item, prefill } : item;
+          });
+          return reply(res, 200, {
+            ...queue,
+            items,
+            note: `${queue.note} 聚合组（kind=aggregate）不提供建议：它代表同一签名的多次失败事实，不是一个可采纳的候选；`
+              + '组内每条成员的建议可在 /v1/proposals/get 或扁平列表上逐条取到。',
+          });
         }
         /**
          * One candidate, for the review page's approval form.
@@ -374,7 +469,35 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           const p = z.object({ projectId: z.string(), id: z.string().min(1) }).parse(body);
           const proposal = store.getProposal(p.id, p.projectId);
           const review = store.db.prepare('SELECT result FROM model_reviews WHERE proposal_id=? AND project_id=?').get(p.id, p.projectId);
-          return reply(res, 200, { ...proposal, modelReview: review ? JSON.parse(String(review.result)) : { status: 'awaiting_model', authority: 'advisory' } });
+          let stored: unknown;
+          if (review) { try { stored = JSON.parse(String((review as { result: unknown }).result)); } catch { /* reported as awaiting below */ } }
+          // The suggestion the form should open with, when the analyzer stored
+          // one. It is advisory by construction: `prefill` never carries the
+          // authority to approve, and its absence is reported by omission rather
+          // than by a manufactured default.
+          const prefill = reviewSuggestion(store, p.projectId, p.id);
+          /**
+           * The promotion verdict, always present on this read.
+           *
+           * Always, rather than only when something is required, because this is the
+           * field a client branches on: an absent field would be read as "the server has
+           * no opinion", and a client that treats "no opinion" as consent is the defect
+           * this whole change removes. `required: false` is the server saying, in so many
+           * words, that the stored verdict may promote itself.
+           *
+           * The verdict itself is computed by the store's own gate — the same function
+           * the write path enforces — so this response cannot promise something the
+           * approval would then refuse.
+           */
+          const classificationGate = classificationApprovalGate(
+            (proposal.payload as { classification?: unknown }).classification,
+          );
+          return reply(res, 200, {
+            ...proposal,
+            modelReview: stored ?? { status: 'awaiting_model', authority: 'advisory' },
+            ...(prefill ? { prefill } : {}),
+            classificationGate,
+          });
         }
         /**
          * Reopen an archived, rejected or expired candidate.
@@ -392,12 +515,66 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         // Approval carries the reviewer-supplied structured entry; the discovery text is never promoted as-is.
         // `allowGlobalScope` must be stated explicitly, because promoting a
         // project-scoped proposal to a global entry applies it everywhere.
+        //
+        // `prefillSource` is a statement of what the form was pre-filled from, not
+        // a substitute for the entry: a suggestion that arrived in `prefill` does
+        // not appear here as an approvable object, so "the model already decided
+        // this" can never become an approval. It only makes the reply say which
+        // suggestion the reviewer confirmed, because that is a fact about this
+        // decision and the entry itself has no field honest enough to hold it.
         case '/v1/proposals/approve': {
           const p = z.object({
             projectId: z.string(), id: z.string(), entry: knowledgeSchema,
             allowGlobalScope: z.boolean().default(false),
+            prefillSource: z.enum(['model', 'heuristic']).optional(),
+            /**
+             * The reviewer stating that they acknowledged this candidate's classification.
+             *
+             * Optional, so an existing caller never breaks on a missing field, and a
+             * candidate whose stored verdict may promote itself needs nothing new. Its
+             * absence is not neutral: for a candidate whose verdict cannot speak for
+             * itself, no field means no approval — never a quiet pass. Defaulting to
+             * `false` rather than leaving it undefined keeps that reading in the schema
+             * itself, so the two branches below cannot be reached by accident.
+             */
+            classificationAcknowledged: z.boolean().default(false),
           }).parse(body);
-          return reply(res, 200, { knowledgeRevision: store.approveProposal(p.id, p.entry, { allowGlobalScope: p.allowGlobalScope, actor: principal.id, projectId: p.projectId }) });
+          /**
+           * The gate, answered before anything is written.
+           *
+           * The verdict comes from the same function the write path enforces, so this
+           * refusal cannot disagree with the one the store would raise; the store still
+           * raises it, because a gate that lives only in the HTTP edge is the mistake
+           * being repaired here. A candidate that cannot be read is left to the write
+           * path's own error rather than being reported as a missing classification.
+           */
+          const preflight = (() => {
+            try {
+              return classificationApprovalGate(
+                (store.getProposal(p.id, p.projectId).payload as { classification?: unknown }).classification,
+              );
+            } catch { return null; }
+          })();
+          if (preflight?.required && !p.classificationAcknowledged) {
+            return reply(res, 409, {
+              code: preflight.code,
+              message: `该候选不能在没有人工确认的情况下采纳：${preflight.reason}`
+                + '请人工核对类别与作用域；确认后在请求体里带上 classificationAcknowledged: true 重试。',
+              requiredField: 'classificationAcknowledged',
+              classificationGate: preflight,
+            });
+          }
+          const knowledgeRevision = store.approveProposal(p.id, p.entry, {
+            allowGlobalScope: p.allowGlobalScope, actor: principal.id, projectId: p.projectId,
+            classificationAcknowledged: p.classificationAcknowledged,
+          });
+          return reply(res, 200, {
+            knowledgeRevision,
+            ...(p.prefillSource ? {
+              prefillNote: `本次采纳由审阅人确认；类别与作用域取自${p.prefillSource === 'model' ? '模型建议' : '规则分析建议'}的预填。`
+                + '建议本身不构成判定，条目的 provenance 仍按确认方记录。',
+            } : {}),
+          });
         }
         case '/v1/proposals/reject': { const p = z.object({ projectId: z.string(), id: z.string(), reason: z.string().max(500).optional() }).parse(body); store.rejectProposal(p.id, { reason: p.reason, actor: principal.id, projectId: p.projectId }); return reply(res, 200, { state: 'rejected' }); }
         /**
@@ -429,7 +606,37 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             entries: z.record(z.string(), knowledgeSchema).optional(),
             reason: z.string().min(1).max(500).optional(),
             allowGlobalScope: z.boolean().default(false),
+            /** See the single-approval endpoint: absent means "no acknowledgement given". */
+            classificationAcknowledged: z.boolean().default(false),
           }).parse(body);
+          /**
+           * A batch containing candidates that need confirmation is answered as a batch.
+           *
+           * The alternative — approving the ones that need nothing and failing the rest —
+           * would leave a reviewer holding a half-applied decision they never agreed to,
+           * and "5 approved, 12 refused" is exactly the report this endpoint's own note
+           * says teaches nothing. So the whole batch is refused before a single write,
+           * with the count and the reasons for the rows that need a person, and one
+           * explicit acknowledgement (after the person has actually looked) completes it.
+           *
+           * Read-only: the pre-check reads stored payloads and writes nothing, and the
+           * verdict comes from the store's own gate, so it cannot contradict the write
+           * path it protects.
+           */
+          const gateRequired = p.action === 'approve' ? store.classificationGateFor(p.projectId, p.ids) : [];
+          if (gateRequired.length && !p.classificationAcknowledged) {
+            return reply(res, 409, {
+              code: 'classification_confirmation_required',
+              message: `这批候选里有 ${gateRequired.length} 条需要人工确认后才能采纳，整批未执行（一条也没写）：`
+                + gateRequired.slice(0, 3).map(item => `${item.id}（${item.gate.reason}）`).join('；')
+                + (gateRequired.length > 3 ? `；另有 ${gateRequired.length - 3} 条同样需要确认，完整清单见 proposals` : '')
+                + '。请人工核对类别与作用域，确认后带上 classificationAcknowledged: true 重试；'
+                + '也可以先只提交不需要确认的那几条。',
+              requiredField: 'classificationAcknowledged',
+              count: gateRequired.length,
+              proposals: gateRequired.map(item => ({ id: item.id, reason: item.gate.reason, classificationGate: item.gate })),
+            });
+          }
           const result = store.reviewBatch(p.projectId, p);
           return reply(res, 200, {
             ...result,

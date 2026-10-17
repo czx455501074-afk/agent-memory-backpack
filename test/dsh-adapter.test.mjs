@@ -21,6 +21,7 @@ const state = {
   gateMode: 'allow',
   supersedeMode: 'ok',
   prepareMode: 'ok',
+  archiveMode: 'ok',
 }
 let server
 let endpoint
@@ -95,6 +96,25 @@ async function startServer() {
     }
     if (req.url === '/v1/events') {
       return json(res, 200, { id: 'event-1', stored: true, duplicate: false })
+    }
+    // The two endpoints the session-end archive uses. `checkpoint` is what gives
+    // the session its task id, exactly as the real core does when the agent
+    // records progress; `archive` answers the shape `/v1/tasks/archive` returns,
+    // and the failure branch is how "a failed archive never breaks the turn" is
+    // exercised.
+    if (req.url === '/v1/tasks/checkpoint') {
+      return json(res, 200, {
+        stored: true, taskId: 'task-fixture', journalId: 'journal-task-fixture', revision: 1,
+        replaced: false, outcome: 'unverified', duplicate: false, fingerprint: 'fixture',
+      })
+    }
+    if (req.url === '/v1/tasks/archive') {
+      if (state.archiveMode === 'fail') return json(res, 503, { error: 'archive unavailable' })
+      return json(res, 200, {
+        taskId: body?.taskId, projectId: body?.projectId, knowledgeId: `journal-task-${body?.taskId}`,
+        revision: 1, scope: { kind: 'task', projectId: body?.projectId, taskId: body?.taskId },
+        replaced: false, unchanged: false, archivedAt: 1,
+      })
     }
     if (req.url === '/v1/search') return json(res, 200, { workflows: [] })
     if (req.url === '/v1/expand') return json(res, 200, { workflow: {}, stage: {}, complete: true })
@@ -372,6 +392,44 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
   assert.ok(degraded.checks.find(c => c.id === 'core-reachable').hint, '失败项必须给出建议')
   assert.equal(degraded.checks.find(c => c.id === 'protocol-match').status, 'skip')
   state.prepareMode = 'ok'
+
+  // R5 W9: the host's own end-of-turn knowledge is what archives the task now.
+  // The core's idle rule is slow and the deployed core may predate it, so the
+  // session that just stopped was the only end signal a real library had left.
+  const archiveRequests = () => state.requests.filter((request) => request.path === '/v1/tasks/archive')
+  const checkpointReceipt = await registeredTools.get('amb_checkpoint_task').execute(
+    { status: 'in_progress', summary: '归档接线固定夹具' },
+    { agent, signal: new AbortController().signal },
+  )
+  assert.equal(checkpointReceipt.taskId, 'task-fixture', '夹具需要会话已与一个任务关联')
+  state.requests.length = 0
+  await ctx.serial('agent/turn-stopping', { agent, turn: 9, signal: new AbortController().signal })
+  await waitFor(() => archiveRequests().length > 0)
+  assert.equal(archiveRequests().length, 1, '会话结束必须发起一次归档')
+  assert.deepEqual(archiveRequests()[0].body, { projectId: 'fixture-project', taskId: 'task-fixture' })
+  assert.equal(archiveRequests()[0].protocol, '1', '归档调用必须带 x-amb-protocol: 1')
+
+  // Idempotent at this end as well: the same session and task are not asked
+  // twice. The core also answers `unchanged`, but a host that kept asking on every
+  // stop would turn a no-op into traffic, so the adapter remembers what it filed.
+  await ctx.serial('agent/turn-stopping', { agent, turn: 10, signal: new AbortController().signal })
+  await new Promise((resolveWait) => setTimeout(resolveWait, 150))
+  assert.equal(archiveRequests().length, 1, '同一会话同一任务不得重复归档')
+
+  // Failure isolation: an unreachable archive must not throw out of the hook, and
+  // must not be remembered as filed either — the next stop retries it.
+  state.archiveMode = 'fail'
+  const otherSession = { ...agent, id: 'fixture-session-archive-failure' }
+  await registeredTools.get('amb_checkpoint_task').execute(
+    { status: 'in_progress', summary: '第二个会话的归档夹具' },
+    { agent: otherSession, signal: new AbortController().signal },
+  )
+  await assert.doesNotReject(() => ctx.serial('agent/turn-stopping', {
+    agent: otherSession, turn: 11, signal: new AbortController().signal,
+  }), '归档失败不得影响会话结束流程')
+  await waitFor(() => archiveRequests().length > 1)
+  assert.equal(archiveRequests().length, 2, '失败的归档必须留待下次重试，而不是被记为已完成')
+  state.archiveMode = 'ok'
 
   await ctx.emit('session/event', {
     id: 'fixture-session', header: { cwd: process.cwd() },

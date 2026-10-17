@@ -106,7 +106,10 @@ test('有进展的、以及仍在活跃窗口内的任务都不被误收敛', ()
     const kept = result.kept.find(item => item.taskId === 'task-active');
     assert.ok(kept, '仍在窗口内的任务必须出现在 kept 里，而不是被静默跳过');
     assert.equal(kept.status, 'in_progress');
-    assert.match(kept.reason, /活跃阈值内/);
+    // The wording named the window by its nickname ("still within the active
+    // window"), which read as "within 12 hours" for a task idle for 42 hours. The
+    // receipt now names the threshold it did not reach.
+    assert.match(kept.reason, /未到 720 分钟收敛阈值/);
   } finally { store.close(); }
 });
 
