@@ -1483,11 +1483,40 @@ export class Store {
      * contract it already had.
      */
     const noIntent = options?.noRetrievalIntent === true;
+    /**
+     * Completeness, stated rather than left to be inferred.
+     *
+     * An agent handed three entries cannot tell whether the library holds three or three
+     * hundred, and the two cases call for opposite behaviour: with three it has what exists,
+     * with three hundred it has a sample and should search before concluding anything. Measured
+     * on a real library - 619 visible entries - a single query surfaced 3, and that 0.5% sample
+     * arrived with exactly the same confidence as a complete answer would have.
+     *
+     * `considered` is what this project can see at all, `shown` is what this receipt carries,
+     * and `hint` names which situation the caller is in. The fields are additive on purpose: a
+     * caller that compares receipts field by field still finds everything it expected.
+     */
+    const considered = this.scopedEntries(projectId).length;
+    const shownCount = workflows.length + knowledge.length;
+    // Rounding a 1-of-584 sample to "0%" reads as "nothing was given", which is the opposite of
+    // what happened. Say "under 1%" instead: the point of the number is to convey that this is a
+    // sample, and 0% conveys the wrong kind of small.
+    const sharePct = considered > 0 ? shownCount / considered * 100 : 0;
+    const shareText = sharePct < 1 ? '不足 1%' : Math.round(sharePct) + '%';
     const retrieval = {
       query,
       tokens: retrievalTokens,
       matchedTokens: [...matchedTokens],
       gaps: noIntent ? [] : gapTokens.filter(token => !matchedTokens.has(token)),
+      considered,
+      shown: shownCount,
+      hint: noIntent
+        ? '本次未做检索。'
+        : shownCount === 0
+          ? '库内 ' + considered + ' 条可见条目中没有本次要的内容；这不代表库内没有相近主题，换个说法再检索可能命中。'
+          : shownCount >= considered
+            ? '库内 ' + considered + ' 条可见条目已全部列出。'
+            : '库内 ' + considered + ' 条可见条目，本次给出 ' + shownCount + ' 条（' + shareText + '）。这是抽样而非全集：若这些不足以回答，用 amb_search_universal 按具体关键词再检索，或对命中的条目用 amb_read_knowledge 读全文。',
       selected: [
         ...workflows.map(w => ({ id: w.id, revision: w.revision, kind: 'workflow' as const, why: w.why })),
         ...knowledge.map(k => ({ id: k.id, revision: k.revision, kind: k.kind, why: k.why })),
