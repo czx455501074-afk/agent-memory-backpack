@@ -1,0 +1,165 @@
+{
+ "activeNorms": 7,
+ "kinds": "journal:95 material:95 memory:17 norm:7 skill:149",
+ "results": [
+  {
+   "id": "norm:29adc4ead699d040",
+   "projectId": "p",
+   "query": "# Agent 工作入口 默认中文，直接",
+   "selectedIds": [
+    "norm:29adc4ead699d040"
+   ],
+   "reason": "local_index:not_configured",
+   "containsNorm": true,
+   "fullTextHasNorm": true,
+   "fullTextTop": [
+    "norm:29adc4ead699d040",
+    "skill:12ea7fa0c4ac0b47",
+    "memory:122a9ba3bdd22674"
+   ],
+   "oldRank": [
+    "skill:577a28b2850ada49",
+    "skill:a5d03f880a7328a8",
+    "skill:52b29b1c3a27179a"
+   ],
+   "newRank": [
+    "norm:29adc4ead699d040",
+    "skill:577a28b2850ada49",
+    "skill:a5d03f880a7328a8"
+   ]
+  },
+  {
+   "id": "norm:7eefbdccc0ea236e",
+   "projectId": "p",
+   "query": "# Project memory ## ",
+   "selectedIds": [
+    "memory:480af6c0948a8c71",
+    "norm:7eefbdccc0ea236e",
+    "memory:578755cd1d3eb374"
+   ],
+   "reason": "local_index:not_configured",
+   "containsNorm": true,
+   "fullTextHasNorm": true,
+   "fullTextTop": [
+    "memory:122a9ba3bdd22674",
+    "memory:23f6e86dfeb3e68a",
+    "memory:5d72a8be021375bb"
+   ],
+   "oldRank": [
+    "memory:480af6c0948a8c71",
+    "memory:578755cd1d3eb374",
+    "memory:f86740e5d9b5ebee"
+   ],
+   "newRank": [
+    "memory:480af6c0948a8c71",
+    "norm:7eefbdccc0ea236e",
+    "memory:578755cd1d3eb374"
+   ]
+  },
+  {
+   "id": "norm:9861dfd810c7505b",
+   "projectId": "p",
+   "query": "# Codex 全局工作规范 ## 账号",
+   "selectedIds": [
+    "norm:9861dfd810c7505b"
+   ],
+   "reason": "local_index:not_configured",
+   "containsNorm": true,
+   "fullTextHasNorm": true,
+   "fullTextTop": [
+    "norm:9861dfd810c7505b",
+    "skill:577a28b2850ada49",
+    "skill:e3d144e19aeaf87c"
+   ],
+   "oldRank": [
+    "skill:f87d70a2299378d5",
+    "skill:18bcf44e7cc7202a",
+    "memory:fb876607cbafc1bc"
+   ],
+   "newRank": [
+    "norm:9861dfd810c7505b",
+    "skill:f87d70a2299378d5",
+    "skill:18bcf44e7cc7202a"
+   ]
+  },
+  {
+   "id": "norm:endpoint-latency-attribution",
+   "projectId": "p0-workflow",
+   "query": "排查接口超时必须带 x-amb-prot",
+   "selectedIds": [
+    "norm:endpoint-latency-attribution"
+   ],
+   "reason": "local_index:not_configured",
+   "containsNorm": true,
+   "fullTextHasNorm": true,
+   "fullTextTop": [
+    "norm:endpoint-latency-attribution",
+    "skill:13377605123e9791",
+    "skill:20ea3c61298cd66e"
+   ],
+   "oldRank": [
+    "node-event-loop-blocking-playbook-20261016",
+    "skill:1b3571928a125741",
+    "idemkit-idempotency-spec-20261016"
+   ],
+   "newRank": [
+    "norm:endpoint-latency-attribution",
+    "norm:timeout-budget-mode-verdict",
+    "norm:29adc4ead699d040"
+   ]
+  },
+  {
+   "id": "norm:log-window-comparability",
+   "projectId": "p0-workflow",
+   "query": "比对日志计数验证修复效果前必须先证明两窗",
+   "selectedIds": [
+    "norm:log-window-comparability"
+   ],
+   "reason": "local_index:not_configured",
+   "containsNorm": true,
+   "fullTextHasNorm": true,
+   "fullTextTop": [
+    "norm:log-window-comparability",
+    "skill:20ea3c61298cd66e",
+    "skill:27692ff193a605f8"
+   ],
+   "oldRank": [
+    "skill:c0cf985ad39d1ede",
+    "memory:3fde2126-c923-4a",
+    "memory:0755a40e3dacfa94"
+   ],
+   "newRank": [
+    "norm:log-window-comparability",
+    "norm:29adc4ead699d040",
+    "skill:c0cf985ad39d1ede"
+   ]
+  },
+  {
+   "id": "norm:package-syntax-gate",
+   "projectId": "p0-workflow",
+   "query": "打包发布脚本 scripts/packa",
+   "selectedIds": [
+    "norm:package-syntax-gate",
+    "journal-task-1eb114b07abc5c8f"
+   ],
+   "reason": "local_index:not_configured",
+   "containsNorm": true,
+   "fullTextHasNorm": true,
+   "fullTextTop": [
+    "norm:package-syntax-gate",
+    "material-auto-9e1067e7380c9935b972ab9ce908e5bd",
+    "material-auto-d99bb60683ef25332f948f25df9674f8"
+   ],
+   "oldRank": [
+    "journal-task-1eb114b07abc5c8f",
+    "material-cc-switch-tauri-source-20261016",
+    "opensource-codex-router-installer-20261016"
+   ],
+   "newRank": [
+    "norm:package-syntax-gate",
+    "journal-task-1eb114b07abc5c8f",
+    "material-cc-switch-tauri-source-20261016"
+   ]
+  }
+ ]
+}

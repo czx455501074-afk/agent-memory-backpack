@@ -1,0 +1,116 @@
+✖ 基线：一条规范必须能用它的准原文被内存索引命中 (51.2144ms)
+✖ 基线：短规范不得被引用了同一句话的长日记压在后面 (6.3686ms)
+ℹ {"query":"打包脚本必须包含全量语法扫描，并核对依赖安装顺序","ruleChars":69,"diaryChars":20735,"order":[{"id":"journal:long-tail","score":4,"strong":true},{"id":"norm:syntax-gate","score":2.0866,"strong":true}]}
+✖ 回执：传入 selectedIds 时命中片段必须真实，规范命中不得计为缺口 (45.9396ms)
+✖ 回执：selected 条目要标明选择来自哪条路径 (42.6933ms)
+✖ 两条入口：模型弃权时 autoRecall 与显式检索必须给出同一结论 (96.9126ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 0
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 420.0687
+
+✖ failing tests:
+
+test at dist\test\retrieval-norm-recall.test.js:59:1
+✖ 基线：一条规范必须能用它的准原文被内存索引命中 (51.2144ms)
+  Error: no such table: workflow_drafts
+      at file:///D:/huange-skill/dist/src/retrieval-service.js:35:36
+      at TestContext.<anonymous> (file:///D:/huange-skill/dist/test/retrieval-norm-recall.test.js:67:30)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1382:25)
+      at Test.start (node:internal/test_runner/test:1242:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:387:17) {
+    code: 'ERR_SQLITE_ERROR',
+    errcode: 1,
+    errstr: 'SQL logic error'
+  }
+
+test at dist\test\retrieval-norm-recall.test.js:75:1
+✖ 基线：短规范不得被引用了同一句话的长日记压在后面 (6.3686ms)
+  AssertionError [ERR_ASSERTION]: 准原文出自规范本身，规范就该排在引用它的长日记之前；实际顺序 journal:long-tail > norm:syntax-gate
+  + actual - expected
+  
+  + 'journal:long-tail'
+  - 'norm:syntax-gate'
+  
+      at TestContext.<anonymous> (file:///D:/huange-skill/dist/test/retrieval-norm-recall.test.js:84:12)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1382:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:960:18)
+      at Test.postRun (node:internal/test_runner/test:1522:19)
+      at Test.run (node:internal/test_runner/test:1447:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 'journal:long-tail',
+    expected: 'norm:syntax-gate',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at dist\test\retrieval-norm-recall.test.js:86:1
+✖ 回执：传入 selectedIds 时命中片段必须真实，规范命中不得计为缺口 (45.9396ms)
+  AssertionError [ERR_ASSERTION]: 选择来自模型/索引时仍要保留命中词；实际 matched=[]
+      at TestContext.<anonymous> (file:///D:/huange-skill/dist/test/retrieval-norm-recall.test.js:92:16)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1382:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:960:18)
+      at Test.postRun (node:internal/test_runner/test:1522:19)
+      at Test.run (node:internal/test_runner/test:1447:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at dist\test\retrieval-norm-recall.test.js:102:1
+✖ 回执：selected 条目要标明选择来自哪条路径 (42.6933ms)
+  AssertionError [ERR_ASSERTION]: 入选条目 memory:unrelated 未标明来源
+  + actual - expected
+  
+  + undefined
+  - 'model'
+  
+      at TestContext.<anonymous> (file:///D:/huange-skill/dist/test/retrieval-norm-recall.test.js:110:20)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1382:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:960:18)
+      at Test.postRun (node:internal/test_runner/test:1522:19)
+      at Test.run (node:internal/test_runner/test:1447:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: 'model',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at dist\test\retrieval-norm-recall.test.js:157:1
+✖ 两条入口：模型弃权时 autoRecall 与显式检索必须给出同一结论 (96.9126ms)
+  AssertionError [ERR_ASSERTION]: 同一查询的两条入口给出了不同结论：autoRecall=[] 显式=["norm:syntax-gate"]
+  + actual - expected
+  
+  + []
+  - [
+  -   'norm:syntax-gate'
+  - ]
+  
+      at TestContext.<anonymous> (file:///D:/huange-skill/dist/test/retrieval-norm-recall.test.js:165:12)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: [],
+    expected: [ 'norm:syntax-gate' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

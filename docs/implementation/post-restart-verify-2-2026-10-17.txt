@@ -1,0 +1,122 @@
+DSH post-restart verification (one-click approve deployment)
+Timestamp (Asia/Shanghai): 2026-10-17 13:40:37 +08:00
+
+=== Before restart: DeepSeek Harness processes (PID, start time, window title, path) ===
+
+Id              : 13604
+StartTime       : 2026/10/17 13:20:45
+MainWindowTitle : 
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id              : 18532
+StartTime       : 2026/10/17 13:30:15
+MainWindowTitle : 
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id              : 24276
+StartTime       : 2026/10/17 13:30:15
+MainWindowTitle : 
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id              : 25788
+StartTime       : 2026/10/17 13:40:08
+MainWindowTitle : 
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id              : 26464
+StartTime       : 2026/10/17 13:30:15
+MainWindowTitle : AMB 1.0 与 GitHub 发布 — DeepSeek Harness
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id              : 26928
+StartTime       : 2026/10/17 13:30:15
+MainWindowTitle : 
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id              : 30616
+StartTime       : 2026/10/17 13:30:15
+MainWindowTitle : 
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id              : 34100
+StartTime       : 2026/10/17 13:30:18
+MainWindowTitle : 
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+
+=== Termination check ===
+No DeepSeek Harness processes remained.
+=== Restart action ===
+Official executable: <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+Launch time: 2026-10-17 13:40:15 +08:00
+
+=== After restart: DeepSeek Harness processes ===
+
+Id               : 2936
+StartTime        : 2026/10/17 13:40:19
+MainWindowHandle : 0
+MainWindowTitle  : 
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id               : 11272
+StartTime        : 2026/10/17 13:40:19
+MainWindowHandle : 6358034
+MainWindowTitle  : AMB 1.0 与 GitHub 发布 — DeepSeek Harness
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id               : 11316
+StartTime        : 2026/10/17 13:40:19
+MainWindowHandle : 0
+MainWindowTitle  : 
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id               : 23084
+StartTime        : 2026/10/17 13:40:19
+MainWindowHandle : 0
+MainWindowTitle  : 
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id               : 29552
+StartTime        : 2026/10/17 13:40:22
+MainWindowHandle : 0
+MainWindowTitle  : 
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id               : 34092
+StartTime        : 2026/10/17 13:40:19
+MainWindowHandle : 0
+MainWindowTitle  : 
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+Id               : 36260
+StartTime        : 2026/10/17 13:40:22
+MainWindowHandle : 0
+MainWindowTitle  : 
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
+
+
+=== node scripts/amb-admin-verify.mjs (complete output) ===
+AMB panel management verification
+  host: http://127.0.0.1:19387
+
+  PASS  new code loaded  — admin route answered HTTP 200
+  PASS  admin credential present  — proposals-list answered ok:true
+  PASS  read: pending queue  — 303 proposal(s) returned
+  PASS  read: panel summary  — revision=1865 knowledge=324 and entries carry kind=yes
+  FAIL  write: export library  — HTTP 200 Agent Memory Backpack request rejected (HTTP 400, invalid_backup). Detail: Credential-shaped content refused
+  PASS  write: approve one proposal  — skipped (pass --write to attempt one real approval)
+  PASS  boundary: unlisted action refused  — unlisted action answered HTTP 404 (404 expected)
+
+1 of 7 checks failed: write: export library
+
+Import is intentionally not attempted; inspect its manifest and decide by hand.
+
+Exit code: 1
+
+=== Get-NetTCPConnection -LocalPort 47631 -State Listen ===
+
+LocalAddress LocalPort  State OwningProcess
+------------ ---------  ----- -------------
+127.0.0.1        47631 Listen         29552
+
+
