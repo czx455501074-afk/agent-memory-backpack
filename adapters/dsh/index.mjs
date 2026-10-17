@@ -348,7 +348,7 @@ const KNOWLEDGE_KIND_GUIDES = [
  * states the panel groups by are the core's own `status` values; the browser half
  * holds their labels, since nothing on this side branches on them.
  */
-const PANEL_DATA_PATHS = new Set(['/amb/summary', '/amb/search', '/amb/task'])
+const PANEL_DATA_PATHS = new Set(['/amb/summary', '/amb/search', '/amb/task', '/amb/ui-url'])
 
 /**
  * The panel's management surface, allow-listed by action name.
@@ -1064,6 +1064,22 @@ async function handlePanelRequest(req, res, { config, client, logger }) {
   }
   const deps = { config, client }
   try {
+    if (url.pathname === '/amb/ui-url') {
+      /**
+       * The console address, credential included, so the panel can show the real thing.
+       *
+       * The panel rendered its own reduced view - three routes, a few lists - while the core
+       * served a ten-tab console at /ui. That is the same split that put a four-button page in
+       * front of the desktop user: two surfaces existed, and the smaller one was the one being
+       * shown. Returning the address lets the panel embed the console instead of imitating it,
+       * so one change reaches web, desktop and panel together.
+       *
+       * The credential sits in the URL fragment, which the browser never puts in a request line,
+       * so it stays out of server logs. This route is already behind the panel's credential check.
+       */
+      panelJson(res, 200, { url: `${String(config.endpoint).replace(/\/$/, '')}/ui#${config.token}` })
+      return
+    }
     if (url.pathname === '/amb/summary') {
       panelJson(res, 200, await readPanelSummary(deps))
       return
