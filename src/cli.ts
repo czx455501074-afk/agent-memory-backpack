@@ -106,6 +106,7 @@ const parsed = (() => {
       port: { type: 'string', default: '47631' }, input: { type: 'string' },
       id: { type: 'string' }, revision: { type: 'string' }, roots: { type: 'string' },
       yes: { type: 'boolean', default: false }, revoke: { type: 'string' },
+      only: { type: 'string' },
       old: { type: 'string' }, 'new': { type: 'string' }, action: { type: 'string' },
       reason: { type: 'string' }, evidence: { type: 'string' }, 'rescan-interval': { type: 'string' },
       skill: { type: 'string' }, 'derived-by': { type: 'string' },
@@ -408,6 +409,30 @@ try {
         const report = discover(roots);
         const compared = diff(report.candidates, store.allEntries().map(entry => ({ id: entry.id, title: entry.content.title })));
         const pending = compared.filter(candidate => candidate.change === 'new');
+        /**
+         * `--only` is what makes a judgement actionable on this path.
+         *
+         * `--yes` adopts every new candidate in a single batch. The dry run does report what it
+         * would take (wouldAdopt / restored / skipped), but a report is only useful if the
+         * reader can act on it afterwards - and the only action available was "all of it". So an
+         * agent that read the list and decided eleven of twelve were worth keeping had to take
+         * the twelfth as well, or take nothing, which in practice means "adopt everything"
+         * regardless of judgement.
+         *
+         * Ids are validated against the pending set. An id that is not pending is a mistake in
+         * the request and says so; silently ignoring it would make a typo look like an entry
+         * that had already been adopted.
+         */
+        const onlyIds = values.only ? String(values.only).split(',').map(id => id.trim()).filter(Boolean) : null;
+        let selected = pending;
+        if (onlyIds) {
+          const pendingIds = new Set(pending.map(candidate => candidate.id));
+          const unknown = onlyIds.filter(id => !pendingIds.has(id));
+          if (unknown.length) {
+            throw new Error(`--only 里有 ${unknown.length} 个 id 不在待采纳清单中：${unknown.slice(0, 5).join('、')}。先不带 --yes 运行一次 amb adopt，看 wouldAdopt 里列出的 id。`);
+          }
+          selected = pending.filter(candidate => onlyIds.includes(candidate.id));
+        }
         if (values.yes !== true) {
           // Distinguish a first import from a restore. After a revoke the entry
           // still exists (retired, history preserved), so the same source is
@@ -418,17 +443,18 @@ try {
           console.log(JSON.stringify({
             dryRun: true,
             summary: summarize(report),
-            wouldAdopt: pending.length,
+            wouldAdopt: selected.length,
             restored: restored.map(candidate => ({ id: candidate.id, title: candidate.title })),
             skipped: compared.filter(candidate => candidate.change !== 'new')
               .map(candidate => ({ id: candidate.id, change: candidate.change, title: candidate.title })),
             note: 'Dry run: nothing was written. Re-run with --yes to adopt. Conflicts are never auto-resolved.'
+              + (onlyIds ? ` --only limited this run to ${selected.length} of ${pending.length} pending.` : '')
               + (restored.length ? ` ${restored.length} entr(y/ies) were previously revoked and will be restored, not created.` : ''),
           }, null, 2));
-        } else if (pending.length === 0) {
-          console.log(JSON.stringify({ adopted: 0, note: 'Nothing new to adopt.' }, null, 2));
+        } else if (selected.length === 0) {
+          console.log(JSON.stringify({ adopted: 0, note: pending.length === 0 ? 'Nothing new to adopt.' : `--only 选中的 id 都不在待采纳清单里（待采纳 ${pending.length} 条）。` }, null, 2));
         } else {
-          const batch = pending.map(candidate => ({
+          const batch = selected.map(candidate => ({
             source: { path: candidate.source.path, hash: candidate.source.hash },
             kind: candidate.kind,
             title: candidate.title,
