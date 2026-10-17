@@ -106,7 +106,17 @@ export function createRetrievalService(store: Store, dataDir: string) {
     // its highest-scoring topic.
     const bestOfObjective=new Map<number,number>();
     for(const hit of ranked) bestOfObjective.set(hit.objective,Math.max(bestOfObjective.get(hit.objective)??0,hit.score));
-    const localIds=ranked.filter(hit=>hit.score>=best*.6
+    // An absolute floor, not only a relative one.
+    //
+    // Truncation here was purely relative (`score >= best * 0.6`), and the index returns
+    // score 0 for an entry with no matching evidence at all. When nothing matched, `best`
+    // was 0, every entry satisfied `>= 0`, and the top three were handed back as hits. That
+    // is how a query about braised pork selected the "story outline" and "external channel"
+    // skills - scored 100/99/98 with `matched: []` and `coverage: 0` - and injected them.
+    // The relative threshold answers "how far below the best may I go"; this answers "is
+    // there a best at all". Without it, a degraded selection is indistinguishable from a
+    // confident one to the agent that receives it.
+    const localIds=best<=0?[]:ranked.filter(hit=>hit.score>=best*.6
       ||(hit.strong&&hit.score===bestOfObjective.get(hit.objective)&&hit.score>=best*.25))
       .slice(0,3).map(hit=>hit.candidate.id);
     const fallback=(reason:string)=>({mode:'index' as const,
