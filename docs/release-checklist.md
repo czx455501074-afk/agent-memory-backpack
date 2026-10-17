@@ -19,6 +19,7 @@ npm test                     # 全量；0 失败才能继续（prepublishOnly �
 node scripts/r5-acceptance.mjs        # 离线验收：检索可达规范 / 回执诚实
 node scripts/r5-live-verify.mjs       # 对运行中的核心验收（需核心在跑）
 node scripts/verify-deliverables.mjs  # 此前每一轮的交付是否还在（逐条契约检查）
+node scripts/verify-tool-surface.mjs  # MCP 工具面与服务端 admin 白名单对账
 node --test dist/test/clean-install.test.js   # 发布面不得含机器路径
 npm pack --dry-run --json             # 包内容：不得含 .pyc、凭据、本地库
 ```
