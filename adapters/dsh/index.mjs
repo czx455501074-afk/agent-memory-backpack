@@ -1957,7 +1957,7 @@ export async function apply(ctx) {
     },
   }))
 
-  client.tool(t => ({
+  registerTool(jsonTool({
     name: 'amb_retire_knowledge',
     description: 'Take an entry out of service after using it revealed that it is wrong or obsolete. Reversible: the entry and every revision stay, and it can be reopened. Use amb_supersede_experience instead when the right fix is to replace or extend the entry - retire is for entries that should stop being injected at all.',
     parameters: {
@@ -1969,7 +1969,7 @@ export async function apply(ctx) {
       }, required: ['id', 'baseRevision', 'reason'],
     },
     async execute(args, exec) {
-      return client.post('/v1/knowledge/retire', {
+      return await client.post('/v1/knowledge/retire', {
         projectId: config.projectId,
         id: requireString(args?.id, 'id'),
         baseRevision: Number(args?.baseRevision),

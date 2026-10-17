@@ -89,10 +89,10 @@ test('real DSH ToolRuntime loads, executes and disposes the adapter with a real 
   } });
   const fiber = await plugin(adapter);
   const ambToolNames = tools.schemas().filter(x => x.name.startsWith('amb_')).map(x => x.name).sort();
-  assert.equal(ambToolNames.length, 15);
+  assert.equal(ambToolNames.length, 16);
   assert.deepEqual(ambToolNames, [
     'amb_checkpoint_task', 'amb_inspect_archive', 'amb_knowledge_history', 'amb_prepare', 'amb_read_knowledge',
-    'amb_read_stage', 'amb_save_material', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
+    'amb_read_stage', 'amb_retire_knowledge', 'amb_save_material', 'amb_search_universal', 'amb_search_workflows', 'amb_self_check', 'amb_structure_skill',
     'amb_submit_experience', 'amb_supersede_experience', 'amb_task_activity', 'amb_unstructured_skills',
   ]);
   const injected = [];

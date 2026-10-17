@@ -435,7 +435,13 @@ async function main() {
     record('core-init', '初始化隔离数据目录', 'pass', `数据目录 ${relative(root, dataDir)}，端口 ${port}`);
 
     // A fresh install must hold no knowledge of its own.
-    const fresh = await run(process.execPath, [cli, 'status', '--data-dir', dataDir]);
+    //
+    // `--json` is not optional here: without it `status` prints the human-readable summary
+    // ("知识版本 0 / 知识条目 0"), JSON.parse throws, and the check records a failure whose
+    // message says "无法读取状态" - which reads like the core is unreachable when in fact it
+    // answered perfectly well. The flag is what makes the check test the library rather than
+    // the output format.
+    const fresh = await run(process.execPath, [cli, 'status', '--data-dir', dataDir, '--json']);
     try {
       const stats = JSON.parse(fresh.stdout);
       const empty = stats.entries === 0 && stats.knowledgeRevision === 0 && stats.adoptions === 0;
