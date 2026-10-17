@@ -141,6 +141,13 @@ if (adminHeaders) {
     ok: Boolean(candidate && candidate.attribution && 'described' in candidate.attribution),
     detail: candidate?.attribution ? `attribution=${JSON.stringify(candidate.attribution)}` : '没有候选可查',
   });
+  // The heading is the whole point of this group: without it, two FAILs sit in the same
+  // list as the checks that describe the current core, and "not deployed yet" reads as
+  // "the code is broken". The heading names the next action instead of leaving the reader
+  // to infer it.
+  console.log('\n以下检查需要运行中的核心包含本轮构建（部署之后才可能通过）：');
+  console.log('若它们 FAIL，先跑 node scripts/verify-host-deployment.mjs 确认在跑哪一版，再决定是否部署；');
+  console.log('请不要把"尚未部署"读成"代码坏了"。\n');
   for (const check of afterDeploy) {
     console.log(`${check.ok ? 'PASS' : 'FAIL'}  ${check.name}\n      ${check.detail}`);
   }
