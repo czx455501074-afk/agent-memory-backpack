@@ -1369,6 +1369,17 @@ export class Store {
     // session is how a project unrelated to any of them opened with five media
     // skills. Norms are unaffected — they are the standing rules and apply
     // whether or not anything was asked.
+    // What the request asks about, kept separate from what it merely mentions.
+    //
+    // `tokens` reports every word the query contained, and `noIntent` already covers a purely
+    // negative request on its own. But a request can exclude one subject while asking about
+    // another - 不要查询召回预算，解释一下光合作用 - and then the intent is real, so `noIntent`
+    // does not fire and `gaps` was computed from the whole string. It reported 召回 and 预算 as
+    // coverage gaps, which asserts the library cannot cover the very subject the request had
+    // explicitly excluded. The clause splitter is the one the index and the matcher use, so the
+    // gap baseline is now drawn from the words that were actually searched for.
+    const askedClauses = positiveRetrievalClauses(query);
+    const gapTokens = queryTokens(askedClauses.join(' '));
     const hasQuery = queryTokens(query).length > 0;
     const retrievalTokens = queryTokens(query);
     /**
@@ -1469,7 +1480,7 @@ export class Store {
       query,
       tokens: retrievalTokens,
       matchedTokens: [...matchedTokens],
-      gaps: noIntent ? [] : retrievalTokens.filter(token => !matchedTokens.has(token)),
+      gaps: noIntent ? [] : gapTokens.filter(token => !matchedTokens.has(token)),
       selected: [
         ...workflows.map(w => ({ id: w.id, revision: w.revision, kind: 'workflow' as const, why: w.why })),
         ...knowledge.map(k => ({ id: k.id, revision: k.revision, kind: k.kind, why: k.why })),
