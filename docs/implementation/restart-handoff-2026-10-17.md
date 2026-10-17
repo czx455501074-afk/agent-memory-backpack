@@ -12,7 +12,7 @@
 - 版本：插件各处声明均为 **1.0.0**。
 - 测试：`dist` **447 / pass 445 / 0 fail**，`test/*.test.mjs` **117 / 117 / 0 fail**。
 - 核心：`127.0.0.1:47631` 监听中（本轮重启过一次，pid 28216）。
-- 部署副本：`D:\harness\toolchains\DeepSeek-Harness-plugins\agent-memory-backpack\`，`client.js` 已含 `:focus-visible`。
+- 部署副本：`<HOST_PLUGIN_ROOT>`，`client.js` 已含 `:focus-visible`。
 
 ## 重启后请做的第一件事（界面层验证，共五项）
 
