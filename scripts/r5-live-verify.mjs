@@ -111,12 +111,42 @@ const scoped = db.prepare(`SELECT count(*) n FROM knowledge k JOIN revisions r O
   WHERE k.status = 'active' AND json_extract(r.content, '$.scope.kind') = 'task'`).get();
 const pendingNorm = db.prepare(`SELECT count(*) n FROM proposals WHERE state = 'pending'`).get();
 const reviews = db.prepare('SELECT count(*) n FROM model_reviews').get();
+// The classifier version (B2) is written into the stored decision, so it is visible
+// without asking the API. Counted here rather than asserted per row: a library where
+// none of the pending candidates carry a version is the pre-backfill state.
+const versioned = db.prepare(`SELECT count(*) n FROM proposals
+  WHERE state = 'pending' AND json_extract(payload, '$.classification.classifierVersion') IS NOT NULL`).get();
 db.close();
 record('任务不再无限期挂着', (tasks.in_progress ?? 0) < 49, `in_progress ${tasks.in_progress ?? 0} / paused ${tasks.paused ?? 0} / completed ${tasks.completed ?? 0}`);
 record('“本会话”作用域有内容', scoped.n > 0, `task 作用域条目 ${scoped.n}`);
 record('模型审核在真实库上有产出', reviews.n > 0, `model_reviews ${reviews.n} 条`);
+record('待审候选的判定带判定器版本（B2）', versioned.n > 0,
+  `带 classifierVersion 的待审候选 ${versioned.n} / ${pendingNorm.n}（为 0 表示回填尚未在本库执行）`);
 
-if (asJson) console.log(JSON.stringify({ projectId, checks, pending: pendingNorm.n }, null, 2));
+// 6. Checks that only a build containing this round's work can pass. They are reported
+//    separately because an older running core is a fact about deployment, not a defect
+//    in the code — `verify-host-deployment.mjs` answers which build is live.
+const afterDeploy = [];
+if (adminHeaders) {
+  const queue = await post('/v1/proposals/list', { projectId, view: 'queue', include: 'actionable' }, adminHeaders);
+  const items = queue.body?.items ?? [];
+  const candidate = items.find(item => item.kind !== 'aggregate');
+  afterDeploy.push({
+    name: '候选项显式声明自己的形状（W11）',
+    ok: Boolean(candidate && candidate.kind === 'candidate'),
+    detail: candidate ? `kind=${candidate.kind}` : '队列里没有可用的普通候选项',
+  });
+  afterDeploy.push({
+    name: '队列解释归属状态（W11）',
+    ok: Boolean(candidate && candidate.attribution && 'described' in candidate.attribution),
+    detail: candidate?.attribution ? `attribution=${JSON.stringify(candidate.attribution)}` : '没有候选可查',
+  });
+  for (const check of afterDeploy) {
+    console.log(`${check.ok ? 'PASS' : 'FAIL'}  ${check.name}\n      ${check.detail}`);
+  }
+}
+
+if (asJson) console.log(JSON.stringify({ projectId, checks, afterDeploy, pending: pendingNorm.n }, null, 2));
 else {
   console.log(`对运行中的核心验收（${base}，项目 ${projectId}）\n`);
   for (const check of checks) console.log(`${check.ok ? 'PASS' : 'FAIL'}  ${check.name}\n      ${check.detail}`);
