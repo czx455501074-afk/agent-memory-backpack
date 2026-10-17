@@ -1453,7 +1453,15 @@ export class Store {
         : []),
       ...emitted.map(n => `规范 ${n.id}@${n.revision}: ${n.kind === 'norm' ? n.body : ''}`),
       ...this.budgetNote(omitted),
-      ...workflows.map(w => `完整流程 ${w.id}@${w.revision} ${w.title}\n${w.overview}\n前提: ${w.preconditions.join('；')}\n阶段: ${w.stages.map(s => `${s.id}:${s.title}（检查:${s.checks.join('；')}）`).join(' → ')}\n完成: ${w.completion.join('；')}\n恢复: ${w.recovery}\n${w.ready ? '执行阶段前调用 amb_read_stage 读取完整阶段和必需依赖。' : `不可执行: ${w.unavailable}`}`),
+      // A workflow used to travel in full: every stage, every check, the completion and the
+      // recovery conditions. That contradicted the next line but one, which tells the agent to
+      // call amb_read_stage before executing a stage - the detail was being sent anyway, so the
+      // pointer was decoration. It is the same shape as adopted skills, which already travel as
+      // an entry point plus an excerpt for exactly this reason, and a workflow with many stages
+      // could silently consume the task's budget. What stays is what "is there a workflow for
+      // this, how does it start, and when is it done" needs; the per-stage checks and the
+      // recovery steps are one call away, and recovery is only needed once something failed.
+      ...workflows.map(w => `完整流程 ${w.id}@${w.revision} ${w.title}\n${w.overview}\n前提: ${w.preconditions.join('；')}\n阶段: ${w.stages.map(s => `${s.id}:${s.title}`).join(' → ')}\n完成: ${w.completion.join('；')}\n${w.ready ? `执行阶段前调用 amb_read_stage 读取该阶段的检查项与必需依赖（共 ${w.stages.length} 个阶段；失败时的恢复步骤也在其中）。` : `不可执行: ${w.unavailable}`}`),
       // Adopted skills and memories appear as entry points with a short excerpt.
       // Full text is one explicit call away, so a large adopted library cannot
       // silently consume the task's context budget.
