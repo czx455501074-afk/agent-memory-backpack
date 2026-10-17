@@ -1337,6 +1337,40 @@ export class Store {
       ? [`规范上下文预算 ${this.normBudgetChars} 字符：本条上下文省略 ${omitted.length} 条规范（${omitted.map(o => o.id).join('、')}）；省略不改变它们的约束判定，需要时按 id 展开读取。`]
       : [];
   }
+  /**
+   * What this project already did, newest first, as one line per diary entry.
+   *
+   * The diary has been written at every checkpoint since this project began, and nothing ever
+   * read it back on the way *in*: `prepare` recalled entries related to the query, and "what
+   * have we already built" is never related to the query. The measured consequence is exact -
+   * after a few rounds I reported that this project had no desktop shell, while `desktop-tauri/`
+   * had been in the tree the whole time with a built installer, a tray implementation and an
+   * autostart module. The information existed and was one call away; no path led there.
+   *
+   * Project scoping lives inside the content JSON (`scope.projectId`), not in a column, so the
+   * filter happens after parsing. Reading `head` rather than a revision column keeps this
+   * aligned with whatever the current version is.
+   */
+  recentProgress(projectId: string, limit = 3): string[] {
+    const rows = this.db.prepare(
+      `SELECT k.id AS id, k.head AS head, r.content AS content, r.created_at AS at
+         FROM knowledge k JOIN revisions r ON r.id = k.id AND r.revision = k.head
+        WHERE k.kind = 'journal' AND k.status = 'active'
+        ORDER BY r.created_at DESC LIMIT ?`).all(limit * 4) as { id: string; head: number; content: string; at: number }[];
+    const out: string[] = [];
+    for (const row of rows) {
+      let content: Record<string, unknown> = {};
+      try { content = JSON.parse(String(row.content)) as Record<string, unknown>; } catch { continue; }
+      const scope = content.scope as { kind?: string; projectId?: string } | undefined;
+      if (scope?.kind !== 'project' || scope.projectId !== projectId) continue;
+      const title = String(content.title ?? content.did ?? '（无标题）').replace(/\s+/g, ' ').slice(0, 90);
+      const outcome = String(content.outcome ?? 'unverified');
+      out.push(`${row.id}@${row.head} ${title}（结果：${outcome}；全文用 amb_read_knowledge 读取）`);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
   prepare(projectId: string, query: string, options?: { sessionId?: string; taskId?: string; platform?: 'dsh' | 'codex'; knownRevision?: number; selectedIds?: string[]; selectionSource?: 'model' | 'index' | 'local_index'; noRetrievalIntent?: boolean }) {
     if (options?.sessionId) {
       try {
@@ -1525,8 +1559,17 @@ export class Store {
         ? '本次没有检索意图（空查询、状态汇报或否定式请求），未做选择，因此不报告覆盖缺口；这不等于库中一定没有这些片段。'
         : '这是本次检索的理由与未命中片段，供日后排查漏检；未命中不等于库中一定该有。',
     };
+    const continuation = this.recentProgress(projectId, 3);
     const context = [
       `Agent Memory Backpack 当前知识版本 ${this.revision}。以下规范来自本地权威库；流程是经验，不授予额外操作权限。`,
+      // Continuity travels first and unconditionally. Everything else here is about what the
+      // library knows; this is about what *this project already did*, which is the one thing a
+      // fresh context cannot reconstruct from the repository alone. It sits before the norms
+      // because forgetting it has already cost real work: a desktop shell that existed, built,
+      // with an installer, was reported as missing.
+      ...(continuation.length
+        ? ['本项目此前的进展（来自日记。动手前先对照，避免重复已完成的工作或推翻既有决定）：', ...continuation]
+        : []),
       ...(hostProvided.length
         ? [`宿主已自行加载的规范（插件不重复注入，仅登记以便检索）：${hostProvided.map(n => `${n.id}@${n.revision}`).join('、')}`]
         : []),
@@ -1558,10 +1601,23 @@ export class Store {
     // task; the design asks for same-version reuse (§5.2) and forbids weakening a
     // rule, so the decision list still travels in full and only the prose repeats.
     const unchanged = options?.knownRevision !== undefined && options.knownRevision === this.revision;
+    /**
+     * Continuity is exempt from the same-version shortcut.
+     *
+     * The shortcut exists because re-sending 12,000 characters of unchanged norms on every turn
+     * is waste. Progress is not in that category: it changes as soon as anything is done, it is
+     * a handful of lines, and dropping it when the knowledge revision happens to be stable is
+     * exactly how "what did we already build" goes missing again. So it is appended to both
+     * branches, and also exposed as its own field so a caller can show it without the prose.
+     */
+    const continuationBlock = continuation.length
+      ? ['本项目此前的进展（来自日记。动手前先对照，避免重复已完成的工作或推翻既有决定）：', ...continuation]
+      : [];
     return {
       protocolVersion: 1, knowledgeRevision: this.revision, mode: 'Managed', norms, workflows, knowledge,
+      continuation,
       context: unchanged
-        ? `Agent Memory Backpack 当前知识版本 ${this.revision}（与上次注入相同，规范正文未重复发送）。`
+        ? [`Agent Memory Backpack 当前知识版本 ${this.revision}（与上次注入相同，规范正文未重复发送）。`, ...continuationBlock].join('\n')
         : context,
       contextUnchanged: unchanged,
       budget: {
