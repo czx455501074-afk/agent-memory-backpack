@@ -24,12 +24,15 @@ node --test dist/test/clean-install.test.js   # 发布面不得含机器路径
 npm pack --dry-run --json             # 包内容：不得含 .pyc、凭据、本地库
 ```
 
+**复核这类脚本时的一个坑（本清单的复核者踩过）**：`npm pack --dry-run --json` 的 `files` 数组里，文件名字段是 **`path`**，不是 `name`。按 `name` 取值会静默得到一列空字符串，于是"包里有 README"被判成"没有"——**检查写错字段名不会报错，只会给出错误结论**。
+
+
 判据与已知基线：
 
-- `npm test`：**645 项 / 643 通过 / 0 失败 / 2 跳过**（两项跳过是 opt-in 检索测量，需要调模型；跳过项必须带原因打印）。
-- `r5-acceptance`：两项都要 PASS。
-- `r5-live-verify`：11/11。其中 `mode=model` 证明走的是生产路径而不是降级路径——**这一项如果显示 `local_index`，说明验收脚本在测另一条路，结论作废**。
-- `npm pack --dry-run`：82 个文件左右、约 0.40MB、含 `README.md` / `CHANGELOG.md` / `LICENSE`，不含 `__pycache__`。
+- `npm test`：**685 项 / 683 通过 / 0 失败 / 2 跳过**（2026-10-17 实测；两项跳过是 opt-in 检索测量，需要调模型；跳过项必须带原因打印）。本清单此前记的是 645/643——**这个数字每轮都会变，引用前必须重跑，不要抄**。
+- `r5-acceptance`：两项都要 PASS（2026-10-17 实测均 PASS）。
+- `r5-live-verify`：**当前 11/12**，唯一 FAIL 是 B2（待审候选的判定带判定器版本），因为它读的是真实库里的存量数据，**回填执行前它必然 FAIL**（实测：待审候选 423 条）。其余检查里 `mode=model` 证明走的是生产路径而不是降级路径——**这一项如果显示 `local_index`，说明验收脚本在测另一条路，结论作废**。
+- `npm pack --dry-run`：**89 个文件、0.44MB**（2026-10-17 实测），含 `README.md`（25KB）/ `LICENSE`（1KB）/ `CHANGELOG.md`（10.6KB），不含 `__pycache__`。
 
 ## 三、版本与文档
 
