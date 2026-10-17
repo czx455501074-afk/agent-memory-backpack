@@ -219,6 +219,28 @@ function wireButtons() {
     const refreshButton = el('btn-refresh');
     if (refreshButton) refreshButton.addEventListener('click', () => void refresh());
 
+    // The console this shell used to ignore. The shell's own page is a status readout; the core
+    // serves a ten-tab console at /ui that the desktop never loaded, which is exactly why the
+    // user asked why the interface was missing so much. Opening it in the same webview keeps one
+    // console for both surfaces - a change to it reaches the desktop without being reimplemented
+    // here (which is how this 22KB page drifted out of date in the first place).
+    const consoleButton = el('btn-console');
+    if (consoleButton) {
+        consoleButton.addEventListener('click', async () => {
+            if (!invoke) { log('无法打开控制台：未连接桌面桥接'); return; }
+            try {
+                const response = await invoke('console_url');
+                const data = payload(response);
+                const url = data && typeof data.url === 'string' ? data.url : null;
+                if (!url) { log(`无法打开控制台：${failureCode(response) || '未取得地址'}`); return; }
+                log('正在打开完整控制台…');
+                window.location.replace(url);
+            } catch (error) {
+                log(`无法打开控制台：${String(error && error.message ? error.message : error)}`);
+            }
+        });
+    }
+
     const doctorButton = el('btn-doctor');
     if (doctorButton) doctorButton.addEventListener('click', () => void runDoctor());
 

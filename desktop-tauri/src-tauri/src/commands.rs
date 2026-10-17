@@ -45,6 +45,19 @@ pub async fn target() -> Reply {
     }
 }
 
+/// Address of the core's own console, credential fragment included.
+///
+/// Separate from `target` on purpose: `target` is a read-only description of where the core is,
+/// and it is surfaced in the UI. The console address carries a credential, so it is a distinct
+/// call that the shell makes only when it is about to navigate the webview.
+#[tauri::command]
+pub async fn console_url() -> Reply {
+    match CoreClient::from_config() {
+        Ok(client) => Ok(BridgeResponse::success(json!({ "url": client.console_url() }))),
+        Err(_) => Ok(BridgeResponse::failure("configuration", "Credential configuration is unavailable or invalid")),
+    }
+}
+
 #[tauri::command]
 pub async fn doctor() -> Reply {
     // A connectivity probe is not the existing Node doctor's full filesystem audit.

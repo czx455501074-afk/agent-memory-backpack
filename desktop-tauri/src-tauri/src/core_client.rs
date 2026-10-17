@@ -44,6 +44,21 @@ pub struct CoreClient {
 }
 
 impl CoreClient {
+    /// The core's own console, addressed the way the core itself publishes it.
+    ///
+    /// The desktop shell used to render its own front end from `desktop-tauri/src` (index.html,
+    /// main.js, app.css - about 22KB, four panels, four buttons) and never loaded the console the
+    /// core serves at `/ui` (ten tabs). That is why the user asked why the interface was missing
+    /// so much: both surfaces were real, and the desktop was showing the smaller one. Returning
+    /// this address lets the webview load the real console, so a change to the console reaches
+    /// the desktop and the browser at the same time instead of being implemented twice.
+    ///
+    /// The credential travels in the URL fragment, which is the part a browser never sends to a
+    /// server - it stays out of request lines and out of server-side logs.
+    pub fn console_url(&self) -> String {
+        format!("{}/ui#{}", self.endpoint.as_str().trim_end_matches('/'), self.credential.token)
+    }
+
     pub fn from_config() -> Result<Self, String> {
         let explicit = env::var_os("AMB_CONSOLE_CONFIG").or_else(|| env::var_os("AMB_CONFIG"));
         let path = match explicit {

@@ -63,6 +63,7 @@ pub fn run() {
             commands::view,
             commands::doctor,
             commands::target,
+            commands::console_url,
             commands::backup_export,
             commands::backup_inspect,
             commands::backup_import,
