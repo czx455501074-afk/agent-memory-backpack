@@ -19,6 +19,9 @@ const client = core.clients.find(c => c.id === 'dsh') ?? core.clients.find(c => 
 if (!client?.token) throw new Error('core.json 里没有适配器凭据。');
 const base = `http://127.0.0.1:${core.port}`;
 
+// Kept broad on purpose: cooking, weather, pets, sport, music, cars, drink, baking, finance,
+// law, medicine, travel, gardening, photography, chess, knitting. A rate computed from eight
+// queries is a hint; a rate from thirty-two can be quoted.
 const UNRELATED = [
   '红烧肉怎么做才好吃，要放多少冰糖',
   '明天上海的天气和气温',
@@ -28,6 +31,30 @@ const UNRELATED = [
   '怎么选一台适合露营的越野车',
   '葡萄酒开瓶后能放几天',
   '怎样用烤箱做戚风蛋糕不塌陷',
+  '指数基金和主动基金怎么选',
+  '租房合同里押金条款要注意什么',
+  '偏头痛发作时应该吃什么药',
+  '去冰岛自驾需要准备什么装备',
+  '阳台上种薄荷需要注意什么',
+  '拍星空要用什么参数',
+  '国际象棋开局应该学哪几套',
+  '毛线围巾起针要起多少针',
+  '怎么判断西瓜熟没熟',
+  '高铁上能不能带宠物',
+  '电饭锅煮糙米要加多少水',
+  '孩子换牙期间要注意什么',
+  '羽毛球拍磅数怎么选',
+  '汽车电瓶亏电了怎么应急启动',
+  '怎样把旧照片扫描成电子版',
+  '钢琴调律多久做一次',
+  '登山鞋要不要买大半码',
+  '怎么给绿萝换盆不伤根',
+  '煮咖啡的水温应该多少度',
+  '怎样去除衣服上的油渍',
+  '摩托车头盔怎么选尺寸',
+  '学游泳先学哪种泳姿',
+  '怎么挑选适合自己的跑鞋',
+  '冰箱冷藏室温度设多少合适',
 ];
 
 const RELATED = [
@@ -35,6 +62,14 @@ const RELATED = [
   '插件部署后宿主没有加载新代码',
   '知识库候选队列怎么审核',
   '检索超时怎么归因',
+  '候选采纳的服务端门禁',
+  '迁移包的导出与导入',
+  '知识条目的版本沿革',
+  '任务结束时的日记归档',
+  '待审候选的分类判定回填',
+  '适配器的凭据隔离',
+  '召回注入的字符预算',
+  '记忆检索的索引评分',
 ];
 
 async function ask(query) {
@@ -94,6 +129,14 @@ async function run(label, queries) {
     process.exit(2);
   }
   const pct = n => ok.length ? `${((n / ok.length) * 100).toFixed(0)}%` : 'n/a';
+  // How often the model actually answered, as opposed to the fallback carrying the decision.
+  // Without this number, "the fallback is noisy" says nothing about how often that matters.
+  const modes = new Map();
+  for (const row of ok) modes.set(row.mode, (modes.get(row.mode) ?? 0) + 1);
+  const reasons = new Map();
+  for (const row of ok) if (row.reason) reasons.set(row.reason, (reasons.get(row.reason) ?? 0) + 1);
+  console.log(`  mode 分布：${[...modes].map(([k, v]) => `${k}=${v}`).join(' ')}`);
+  if (reasons.size) console.log(`  降级原因：${[...reasons].map(([k, v]) => `${k}=${v}`).join(' ')}`);
   console.log(`  小结：注入 ${injected.length}/${ok.length}（${pct(injected.length)}）；`
     + `其中含零证据条目 ${unevidenced.length}/${ok.length}（${pct(unevidenced.length)}）`);
   return { injected: injected.length, unevidenced: unevidenced.length, total: ok.length };
