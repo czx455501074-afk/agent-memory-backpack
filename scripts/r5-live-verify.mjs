@@ -120,8 +120,16 @@ db.close();
 record('任务不再无限期挂着', (tasks.in_progress ?? 0) < 49, `in_progress ${tasks.in_progress ?? 0} / paused ${tasks.paused ?? 0} / completed ${tasks.completed ?? 0}`);
 record('“本会话”作用域有内容', scoped.n > 0, `task 作用域条目 ${scoped.n}`);
 record('模型审核在真实库上有产出', reviews.n > 0, `model_reviews ${reviews.n} 条`);
-record('待审候选的判定带判定器版本（B2）', versioned.n > 0,
-  `带 classifierVersion 的待审候选 ${versioned.n} / ${pendingNorm.n}（为 0 表示回填尚未在本库执行）`);
+// "Greater than zero" was the first version of this check, and it went green the moment a
+// single new submission carried a version - a green light for a backfill that had never run.
+// The question is not "does anything carry a version"; it is "has the stored population been
+// brought up to the current classifier". Ask that instead: a submission written by the
+// current code always carries one, so a ratio near 1 is the only evidence that the backlog
+// was actually converted.
+const versionedRatio = pendingNorm.n === 0 ? 1 : versioned.n / pendingNorm.n;
+record('待审候选的判定带判定器版本（B2）', versionedRatio >= 0.95,
+  `带 classifierVersion 的待审候选 ${versioned.n} / ${pendingNorm.n}（${(versionedRatio * 100).toFixed(1)}%）`
+  + `——回填未执行时，只有新提交的候选带版本，比例会远低于 1`);
 
 // 6. Checks that only a build containing this round's work can pass. They are reported
 //    separately because an older running core is a fact about deployment, not a defect
