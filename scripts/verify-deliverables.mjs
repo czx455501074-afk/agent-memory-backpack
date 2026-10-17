@@ -11,7 +11,7 @@
 //
 // Usage: node scripts/verify-deliverables.mjs [--json]
 // Exit code: 0 when every check passes, 1 otherwise.
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
@@ -115,8 +115,15 @@ const checks = [
   {
     id: 'B2 判定器版本可查',
     why: '不记版本时，判定器每次改进都会留下静默的新旧混用',
-    file: 'src/semantic.ts',
-    present: /classifierVersion|CLASSIFIER_VERSION/,
+    // Deliberately a directory search rather than a named file. The first version of
+    // this check named src/semantic.ts, because that is where a classifier feels like it
+    // belongs - and the constant actually lives in src/store.ts. So the check reported
+    // "missing" while the feature was fully implemented, and two rounds of reporting
+    // repeated that. The contract is "some source file records which classifier produced
+    // a verdict", not "this particular file". Binding a contract to an implementation
+    // detail is the failure mode this guard exists to catch, and it caught me instead.
+    dir: 'src',
+    present: /CLASSIFIER_VERSION|classifierVersion/,
   },
   {
     id: 'B2 回填入口',
@@ -133,12 +140,29 @@ const checks = [
 ];
 
 const results = checks.map(check => {
+  const test = (text) => {
+    if (check.present && !check.present.test(text)) return `缺少 ${check.present}`;
+    if (check.absent && check.absent.test(text)) return `仍存在应当移除的 ${check.absent}`;
+    return null;
+  };
+  // A directory check asserts the contract holds somewhere in that tree, which is the
+  // right granularity when the implementation is free to pick a file.
+  if (check.dir) {
+    const dirPath = join(root, check.dir);
+    if (!existsSync(dirPath)) return { ...check, ok: false, detail: `目录不存在：${check.dir}` };
+    const files = readdirSync(dirPath).filter(name => name.endsWith('.ts'));
+    const failures = [];
+    for (const name of files) {
+      const failure = test(readFileSync(join(dirPath, name), 'utf8'));
+      if (!failure) return { ...check, ok: true, detail: `${check.dir}/${name} 命中` };
+      failures.push(failure);
+    }
+    return { ...check, ok: false, detail: `${check.dir} 下 ${files.length} 个文件都没有：${failures[0] ?? '未知'}` };
+  }
   const path = join(root, check.file);
   if (!existsSync(path)) return { ...check, ok: false, detail: '文件不存在' };
-  const text = readFileSync(path, 'utf8');
-  if (check.present && !check.present.test(text)) return { ...check, ok: false, detail: `缺少 ${check.present}` };
-  if (check.absent && check.absent.test(text)) return { ...check, ok: false, detail: `仍存在应当移除的 ${check.absent}` };
-  return { ...check, ok: true, detail: 'ok' };
+  const failure = test(readFileSync(path, 'utf8'));
+  return failure ? { ...check, ok: false, detail: failure } : { ...check, ok: true, detail: 'ok' };
 });
 
 if (asJson) {
