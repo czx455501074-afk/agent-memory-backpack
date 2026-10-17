@@ -58,9 +58,33 @@ export function resolveRecallBudget(config = {}, env = process.env) {
   })
 }
 
+/**
+ * The dimensions that say how to read an entry, packed into a few words.
+ *
+ * The core attaches these precisely so a reader is not misled: `outcome` separates a failed
+ * attempt from a successful one, `stated` separates a habit the person actually stated from
+ * one the plugin inferred, and `expiresAt` says how long material stays valid. The recall
+ * path used to render none of them, which meant that after injection a failure and a success
+ * looked exactly alike - and treating a failed attempt as reusable experience is the error
+ * this system exists to prevent.
+ */
+function readMarker(value) {
+  const parts = []
+  if (value.outcome === 'failure') parts.push('结果=失败')
+  else if (value.outcome === 'success') parts.push('结果=成功')
+  else if (value.outcome === 'unverified') parts.push('结果=未验证')
+  if (value.stated === true) parts.push('由人明说')
+  else if (value.stated === false) parts.push('插件推断')
+  if (typeof value.expiresAt === 'number') {
+    const days = Math.round((value.expiresAt - Date.now()) / 86400000)
+    parts.push(days >= 0 ? `材料 ${days} 天后失效` : '材料已过保存期')
+  }
+  return parts.length ? ` · ${parts.join(' · ')}` : ''
+}
+
 /** One block per document, in the three disclosure forms the budget may pick. */
 function documentForms(doc, budget) {
-  const idLine = `### ${doc.title} (${doc.id}@${doc.revision})`
+  const idLine = `### ${doc.title} (${doc.id}@${doc.revision})${doc.marker}`
   const leavesLine = doc.leaves.length
     ? `\n参考文档：${doc.leaves.map(leaf => leaf.path).slice(0, 12).join('、')}；需要时用 amb_read_knowledge(includeLeaves:true) 读取。`
     : ''
@@ -149,6 +173,7 @@ export async function recallKnowledge({ client, config, logger, adapter, session
         bodyLength: value.body.length,
         leaves: Array.isArray(value.leaves) ? value.leaves : [],
         needsStructure: Boolean(value.needsStructure),
+        marker: readMarker(value),
       }
       let forms
       try {
