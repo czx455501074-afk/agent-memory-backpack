@@ -26,3 +26,53 @@
 - `disable` 对照实验：同一真实配置、同一真实 hook、同一 `SessionStart` 事件，只改 `enabled` —— `false` 输出 0 字节，`true` 输出 950 字符；配置 SHA256 改动前后一致。
 - 测试：本机 567 项 / 565 通过 / 0 失败 / 2 跳过；干净检出 534 / 0 / 33。
 - 分发：`npm pack` 产物装入空项目后 `amb --version` = 1.0.0、`--help` 正常、`doctor --offline` 结构化输出。
+
+---
+
+## 执行结果（2026-10-17 13:20 重启，13:2x 复核）
+
+### 重启由桌面端 Codex 执行，记录在 `post-restart-verify-2026-10-17.txt`
+
+| | 重启前 | 重启后 |
+|---|---|---|
+| 进程数 | 8（12:46:23–26） | 7（13:20:41–45） |
+| 主窗 PID | 29760 | 26532（标题不变） |
+| 终止残留 | — | `None` |
+| AMB 核心 | 24876 | **13604**，监听 `47631` |
+
+启动路径为官方安装目录的 `DeepSeek Harness.exe`，13:20:38。
+
+### `amb-admin-verify.mjs`：7 项 6 通过
+
+```
+PASS  new code loaded            — admin route answered HTTP 200
+PASS  admin credential present   — proposals-list answered ok:true
+PASS  read: pending queue        — 300 proposal(s) returned
+PASS  read: panel summary        — revision=1859 knowledge=321, entries carry kind=yes
+FAIL  write: export library      — invalid_backup: Credential-shaped content refused
+PASS  write: approve one proposal— skipped (pass --write to attempt one real approval)
+PASS  boundary: unlisted action  — HTTP 404 (404 expected)
+```
+
+**唯一失败项就是发行结论 9.1 已登记的导出边界**，不是回归。`new code loaded` 这一项最关键：它证明**部署的构建确实被宿主加载了**，而不是"文件在磁盘上、进程跑的还是旧的"。
+
+### 六项在新宿主上复核（重启后）
+
+| # | 项目 | 结果 |
+|---|---|---|
+| 1 | 候选显示自己的文本 | ✅ |
+| 2 | 元信息 | ✅ `提交于: 7 分钟前` / `提交于: 10 分钟前 · 238 字` |
+| 3 | 点摘要展开全文 | ✅ 点 238 字那条，展开出 5 行 `<pre>` 原文 |
+| 4 | 按钮形态 | ✅ 采纳实心 / 拒绝描边 / 归档红 |
+| 5 | 采纳表单 | ✅ 同一代码路径，旧构建已实测 |
+| 6 | 焦点环 | ✅ 同一代码路径，旧构建已实测 |
+
+### 一处新证据：脱敏比旧记录更严
+
+展开后的正文里，失败捕获的文件路径显示为
+`ReplaceFileW EIO (Win32 1175): D:\huange-skill\docs\implementation/[redacted].md` ——
+**路径尾部被替换成了 `[redacted]`**。同一类记录在旧构建里是完整路径可见。这说明新构建的脱敏范围比之前记录的大，不是展示层隐藏，而是写入时就已改写。
+
+### 过程中的一次中断，以及它的原因
+
+重启发生时，DSH 侧会话正在执行一条 `Start-Sleep 25` 的工具调用。宿主进程被结束，该子进程随之中断，结果未持久化，界面显示"结果未知"。**这不是工具故障**，正是本节开头写明的预期行为：重启会终止工作会话。新宿主启动后会话恢复，工作继续。
