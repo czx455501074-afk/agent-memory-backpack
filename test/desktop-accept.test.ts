@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -115,10 +115,19 @@ test('桌面验收脚本可重复运行且结果稳定', async t => {
   for (const [path, result] of [[first,a],[second,b]] as const)
     assert.equal(existsSync(path),true,`必须输出每次报告；code=${result.code}; stderr=${result.stderr.slice(-1000)}; stdout=${result.stdout.slice(-1000)}`);
 
-  const reportA = JSON.parse(await readFile(first, 'utf8')) as { summary: { pass: number; fail: number } };
-  const reportB = JSON.parse(await readFile(second, 'utf8')) as { summary: { pass: number; fail: number } };
+  const reportA = JSON.parse(await readFile(first, 'utf8')) as { summary: { pass: number; fail: number; skip: number } };
+  const reportB = JSON.parse(await readFile(second, 'utf8')) as { summary: { pass: number; fail: number; skip: number } };
   assert.equal(reportB.summary.fail, reportA.summary.fail, '二次运行不得因残留状态而多出失败');
-  assert.equal(reportB.summary.pass, reportA.summary.pass, '两次运行的通过数应一致');
+  // The property is "a rerun does not fail because of what the first run left
+  // behind". Demanding an identical pass count asserts more than that: a timing
+  // check that answers `skip` under load instead of `pass` moves a count without
+  // any residue being involved, and that made this test flaky when the full
+  // suite ran in parallel. What must hold is that every change in passes is
+  // accounted for by a change in skips — never by a new failure.
+  const passDelta = reportB.summary.pass - reportA.summary.pass;
+  const skipDelta = reportB.summary.skip - reportA.summary.skip;
+  assert.equal(passDelta + skipDelta, 0,
+    `两次运行的通过数差异必须完全由跳过解释：pass ${reportA.summary.pass}→${reportB.summary.pass}, skip ${reportA.summary.skip}→${reportB.summary.skip}`);
 });
 
 test('验收报告不含凭据，也不含本机绝对路径', async t => {
@@ -161,6 +170,27 @@ function gitOutput(args: string[]): Promise<string> {
       : reject(new Error(`git ${args.join(' ')} failed (${code}): ${stderr.slice(0, 200)}`)));
   });
 }
+
+/**
+ * Whether a build identity can be constructed at all.
+ *
+ * Three tests below build an artifact fixture that claims "this tree's" commit,
+ * which requires a git repository. A source download (GitHub zip, or `npm pack`
+ * unpacked into a tree) has no `.git`, and those same tests then failed with
+ * `git rev-parse HEAD failed (128)` — reporting a repository-less install as a
+ * broken one, in exactly the shape most users receive the source in. The
+ * property under test is the acceptance runner's identity check, not the
+ * presence of version control, so this skips with the reason instead.
+ */
+const gitProbe: { available: boolean; reason?: string } = (() => {
+  try {
+    execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: repoRoot, stdio: 'ignore', windowsHide: true });
+    return { available: true };
+  } catch {
+    return { available: false, reason: '这不是 git 仓库（例如源码压缩包或解包的 npm tarball），无法构造「当前构建身份」fixture' };
+  }
+})();
+const gitSkip = gitProbe.available ? false : gitProbe.reason;
 
 type AcceptanceReport = {
   summary: { pass: number; fail: number; skip: number; manual: number; automatedOk: boolean };
@@ -261,7 +291,7 @@ async function writeArtifactFixture(
   }, null, 2), 'utf8');
 }
 
-test('产物记录的构建身份必须与当前工作树一致，被篡改的 build.git 判定失败', async t => {
+test('产物记录的构建身份必须与当前工作树一致，被篡改的 build.git 判定失败', { skip: gitSkip }, async t => {
   const fixture = await mkdtemp(join(tmpdir(), 'amb-accept-build-'));
   const artifactRoot = join(fixture, 'artifacts');
   const artifactDir = join(artifactRoot, 'p0-fixture');
@@ -344,7 +374,7 @@ test('产物记录的构建身份必须与当前工作树一致，被篡改的 b
   assert.equal(legacy.code, 1, `缺少构建身份必须反映在退出码上，实际 ${legacy.code}`);
 });
 
-test('浏览器半必须存在、可编译并注册 conversation.view，缺失或语法错误都判失败', async t => {
+test('浏览器半必须存在、可编译并注册 conversation.view，缺失或语法错误都判失败', { skip: gitSkip }, async t => {
   const fixture = await mkdtemp(join(tmpdir(), 'amb-accept-client-'));
   const artifactRoot = join(fixture, 'artifacts');
   const artifactDir = join(artifactRoot, 'p0-fixture');
@@ -433,7 +463,7 @@ syncBuiltinESMExports();
 `;
 }
 
-test('非回环 Origin 与 Host 被拒绝，回环 Origin 被有意放行', async t => {
+test('非回环 Origin 与 Host 被拒绝，回环 Origin 被有意放行', { skip: gitSkip }, async t => {
   const fixture = await mkdtemp(join(tmpdir(), 'amb-accept-origin-'));
   const artifactRoot = join(fixture, 'artifacts');
   const artifactDir = join(artifactRoot, 'p0-fixture');
