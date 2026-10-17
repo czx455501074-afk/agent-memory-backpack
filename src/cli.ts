@@ -54,11 +54,41 @@ const USAGE = [
   '  seed --input FILE | retire --id ID --revision N | status',
   '',
   'Global: --data-dir DIR (default: ~/.agent-memory-backpack)',
+  '        --version, -v                    print the installed version and exit',
 ].join('\n');
+
+/**
+ * Repository root, derived from where this file actually is.
+ *
+ * Source runs from `src/` and the build runs from `dist/src/`, so one level up is
+ * the repository in the first case and the build directory in the second. Probing
+ * for the package manifest is what keeps this correct in both layouts; assuming
+ * one produced `dist/dist/src/cli.js` and a "run npm run build" error on a tree
+ * that was already built. A packaged artifact is the third layout: `core/runtime/cli.js`
+ * sits beside `core/package.json`, which the same probe also resolves.
+ *
+ * Declared before argument handling so `--version` can answer from it.
+ */
+const here = dirname(fileURLToPath(import.meta.url));
+const root = existsSync(join(here, '..', 'package.json')) ? resolve(here, '..') : resolve(here, '..', '..');
 
 const argv = process.argv.slice(2);
 if (argv.includes('--help') || argv.includes('-h')) {
   console.log(USAGE);
+  process.exit(0);
+}
+
+// `--version` has to answer before parseArgs: an unknown option throws there, and
+// "Invalid arguments" is a poor answer to "which build is installed". Reading the
+// manifest is best-effort — a missing one must not turn a version question into a
+// stack trace, so the fallback is the word `unknown` rather than an empty line.
+if (argv.includes('--version') || argv.includes('-v')) {
+  let version = 'unknown';
+  try {
+    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version?: string };
+    version = manifest.version ?? 'unknown';
+  } catch { /* fall through to the fallback above */ }
+  console.log(version);
   process.exit(0);
 }
 
@@ -93,18 +123,6 @@ const parsed = (() => {
 })();
 const { values, positionals } = parsed;
 const command = positionals[0]; const dir = resolve(values['data-dir'] ?? defaultDataDir());
-/** Repository root, derived from this file's own location rather than the cwd. */
-/**
- * Repository root, derived from where this file actually is.
- *
- * Source runs from `src/` and the build runs from `dist/src/`, so one level up is
- * the repository in the first case and the build directory in the second. Probing
- * for the package manifest is what keeps this correct in both layouts; assuming
- * one produced `dist/dist/src/cli.js` and a "run npm run build" error on a tree
- * that was already built.
- */
-const here = dirname(fileURLToPath(import.meta.url));
-const root = existsSync(join(here, '..', 'package.json')) ? resolve(here, '..') : resolve(here, '..', '..');
 /**
  * Candidate core entries, most trustworthy first.
  *

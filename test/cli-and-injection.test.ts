@@ -40,6 +40,20 @@ test('--help prints usage and exits cleanly instead of throwing', async () => {
   }
 });
 
+test('--version prints the manifest version and exits cleanly', async () => {
+  // The first question on any bug report is "which build?". parseArgs rejects an
+  // unknown option before that can be answered, so `--version` is handled ahead of
+  // it — and it must read the manifest rather than a constant, or it drifts.
+  const manifest = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8')) as { version: string };
+  for (const flag of ['--version', '-v']) {
+    const result = await runCli([flag]);
+    assert.equal(result.code, 0, `${flag} 应以状态 0 退出`);
+    assert.equal(result.stdout.trim(), manifest.version, `${flag} 必须打印 package.json 的版本`);
+    assert.equal(STACK_TRACE.test(result.stdout + result.stderr), false, `${flag} 不得抛栈追踪`);
+    assert.equal(/ERR_PARSE_ARGS/.test(result.stderr), false, `${flag} 不得出现解析器内部错误`);
+  }
+});
+
 test('usage lists every command the CLI actually implements', async () => {
   // Documentation drift is its own defect: a command that exists but is absent
   // from the help is one a user cannot discover.
