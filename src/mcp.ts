@@ -135,7 +135,7 @@ export function createMcp(client: CoreClient, logger?: Logger) {
     inputSchema: {}, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/unstructured', args));
   server.registerTool('amb_checkpoint_task', {
-    description: 'Persist task progress and a factual journal. Use paused for an interrupted turn. Completed requires verified text and verifiable evidence. Return the durable journal receipt.',
+    description: 'Persist task progress and a factual journal. Use paused for an interrupted turn. Completed requires verified text and verifiable evidence. Return the durable journal receipt. This is also the moment to audit what you used: did any entry you read or cited this turn turn out to be stale, incomplete, or contradicted by what you measured? If so, act on it before recording - amb_supersede_experience with action supplement (extend it) or supersede (replace it), or amb_retire_knowledge (take it out of service). A defect noticed and only written into the journal stays in the library.',
     inputSchema: { taskId: identifier.optional(), sessionId: z.string().min(1).max(256).optional(),
       title: z.string().min(1).max(2000).optional(), idempotencyKey: identifier.optional(),
       status: z.enum(['in_progress', 'paused', 'completed', 'failed', 'cancelled']).default('paused'),
