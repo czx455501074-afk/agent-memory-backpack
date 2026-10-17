@@ -96,7 +96,13 @@ export function createMcp(client: CoreClient, logger?: Logger) {
     inputSchema: { knowledgeId: referenceId, includeLeaves: z.boolean().default(false) }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/read', args));
   server.registerTool('amb_supersede_experience', {
-    description: 'After verifying in practice, replace or supplement an earlier experience. Both action values keep the earlier revision in history; a reason and evidence are required.',
+    // Admin-only on the core: this rewrites the effective library rather than adding
+    // a candidate, so it belongs to the user (src/server.ts ADMIN_ONLY). The adapter
+    // credential an MCP client holds is refused with 403, and the tool description
+    // says so because the failure is otherwise indistinguishable from a bug — and
+    // every one of these attempts would be captured as a failure fact and land in the
+    // queue a human is supposed to read.
+    description: 'Admin-only: after verifying in practice, replace or supplement an earlier experience. Both action values keep the earlier revision in history; a reason and evidence are required. The adapter credential is refused with 403 — ask the user to run this (for example `amb know supersede` or the desktop console) instead of retrying.',
     inputSchema: {
       oldId: identifier, newId: identifier,
       action: z.enum(['supersede', 'supplement']).default('supersede'),
@@ -109,7 +115,11 @@ export function createMcp(client: CoreClient, logger?: Logger) {
     inputSchema: { knowledgeId: identifier }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/history', args));
   server.registerTool('amb_structure_skill', {
-    description: 'Convert an adopted skill into a real workflow. The structure must be authored, not inferred from the Markdown; the raw skill is retired in the same transaction and kept in history.',
+    // Same admin-only reason as supersede above: the workflow body is authored by the
+    // caller, so letting an adapter write it would be a way into the effective library
+    // that skips the candidate queue. Reported in the description so an agent does not
+    // burn a call discovering it, and so the refusal is not mistaken for a malfunction.
+    description: 'Admin-only: convert an adopted skill into a real workflow. The structure must be authored, not inferred from the Markdown; the raw skill is retired in the same transaction and kept in history. The adapter credential is refused with 403 — ask the user to run this instead of retrying.',
     inputSchema: {
       skillId: identifier,
       // Reuse the shared workflow schema so the tool surface cannot drift from
