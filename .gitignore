@@ -2,6 +2,12 @@
 node_modules/
 dist/
 
+# A packaged core produced by an older layout. `scripts/package.mjs` now writes to
+# artifacts/p0-<id>/core and `deploy-plugin.mjs` reads it from there; the copy at
+# the repository root was left behind by the Electron-era build, had drifted from
+# src/ while still being committed. It is a build output, never a source tree.
+core/
+
 # Standalone console builds. The installer and portable exe this produces are
 # release assets, not source.
 dist-console-out/
@@ -65,6 +71,8 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+__pycache__/
+*.pyc
 
 # Internal planning records: the collaboration process behind the plan, not the
 # product documentation. Kept locally; excluded from the published surface.
@@ -75,4 +83,5 @@ docs/plans/
 
 # Export artefacts and their archives are user data, not source.
 *.ambpack
+*.tgz
 console.archived-electron/node_modules/
