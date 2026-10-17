@@ -402,7 +402,7 @@ src/
 adapters/
   dsh/            DSH 原生适配器（Cordis 插件，含 bundle 补丁与面板 client.js）
   codex/          Codex lifecycle hooks 与工作区插件
-test/             564 项测试（.ts 单元 + .mjs 端到端），覆盖协议、存储、归档、适配器
+test/             641 项测试（.ts 单元 + .mjs 端到端），覆盖协议、存储、归档、适配器
 scripts/
   package.mjs        打包（含全量 node --check 语法门与构建身份记录）
   deploy-plugin.mjs  部署到宿主 profile（读穿链接复核）

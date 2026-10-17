@@ -11,7 +11,10 @@
     "dist/src",
     "adapters",
     "scripts",
-    "README.md"
+    "!scripts/__pycache__",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "keywords": [
     "agent",
@@ -28,6 +31,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js test/*.test.mjs",
+    "prepublishOnly": "npm test",
     "start": "node dist/src/cli.js serve",
     "doctor": "node dist/src/cli.js doctor",
     "logs": "node dist/src/cli.js logs",
