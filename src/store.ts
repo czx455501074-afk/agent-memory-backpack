@@ -1379,7 +1379,14 @@ export class Store {
     // explicitly excluded. The clause splitter is the one the index and the matcher use, so the
     // gap baseline is now drawn from the words that were actually searched for.
     const askedClauses = positiveRetrievalClauses(query);
-    const gapTokens = queryTokens(askedClauses.join(' '));
+    // Strip the filler phrases before tokenising, exactly as `automaticRelevance` does above and
+    // for the reason its comment gives: cutting them after tokenisation leaves artificial
+    // cross-boundary fragments (检查功能 -> 查功), and `gaps` asserts that the library has no
+    // such fragment. Taking the clauses raw meant reporting 算怎 and 么设 as coverage gaps for
+    // "召回预算怎么设置" - fragments produced by cutting through 怎么, which no entry could ever
+    // contain, because every entry was tokenised the same way.
+    const gapTokens = queryTokens(askedClauses.join(' ').toLowerCase()
+      .replace(new RegExp([...recallStopWords].join('|'), 'gu'), ' '));
     const hasQuery = queryTokens(query).length > 0;
     const retrievalTokens = queryTokens(query);
     /**
