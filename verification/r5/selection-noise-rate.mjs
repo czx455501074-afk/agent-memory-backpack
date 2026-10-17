@@ -73,11 +73,13 @@ const RELATED = [
 ];
 
 async function ask(query) {
+  const started = Date.now();
   const response = await fetch(`${base}/v1/prepare`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-amb-protocol': '1', authorization: `Bearer ${client.token}` },
     body: JSON.stringify({ projectId: client.projectId, sessionId: 'noise-rate', query, adapter: 'dsh' }),
   });
+  const elapsed = Date.now() - started;
   const text = await response.text();
   if (!response.ok) throw new Error(`/v1/prepare -> HTTP ${response.status}: ${text.slice(0, 200)}`);
   const prepared = JSON.parse(text);
@@ -91,6 +93,7 @@ async function ask(query) {
   });
   return {
     query,
+    ms: elapsed,
     mode: selection.mode,
     reason: selection.reason ?? '',
     selected: selected.length,
@@ -137,6 +140,19 @@ async function run(label, queries) {
   for (const row of ok) if (row.reason) reasons.set(row.reason, (reasons.get(row.reason) ?? 0) + 1);
   console.log(`  mode 分布：${[...modes].map(([k, v]) => `${k}=${v}`).join(' ')}`);
   if (reasons.size) console.log(`  降级原因：${[...reasons].map(([k, v]) => `${k}=${v}`).join(' ')}`);
+  // The model budget is a fixed 2500ms and a timeout falls back to the weaker local path, so
+  // where the model's own latency sits relative to that number is the whole question. A median
+  // tells whether the budget is generous; the slowest cases tell how much of the tail it cuts.
+  const times = ok.map(row => row.ms).sort((a, b) => a - b);
+  const at = q => times.length ? times[Math.min(times.length - 1, Math.floor(times.length * q))] : 0;
+  console.log(`  prepare 耗时：中位 ${at(0.5)}ms  最快 ${times[0] ?? 0}ms  P90 ${at(0.9)}ms  最慢 ${times.at(-1) ?? 0}ms`);
+  const met = ok.filter(row => row.mode === 'model');
+  if (met.length) {
+    const answered = met.map(row => row.ms).sort((a, b) => a - b);
+    console.log(`  其中模型真正作答的 ${met.length} 次耗时：中位 ${answered[Math.floor(answered.length / 2)]}ms  最慢 ${answered.at(-1)}ms`);
+  }
+  const timedOut = ok.filter(row => row.reason === 'local_index:model_timeout');
+  if (timedOut.length) console.log(`  超时的 ${timedOut.length} 次耗时：${timedOut.map(row => `${row.ms}ms`).join(' ')}`);
   console.log(`  小结：注入 ${injected.length}/${ok.length}（${pct(injected.length)}）；`
     + `其中含零证据条目 ${unevidenced.length}/${ok.length}（${pct(unevidenced.length)}）`);
   return { injected: injected.length, unevidenced: unevidenced.length, total: ok.length };

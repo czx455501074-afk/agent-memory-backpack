@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { Script } from 'node:vm';
 import { Store } from '../src/store.js';
 import { createCoreServer } from '../src/server.js';
-import { createRetrievalService } from '../src/retrieval-service.js';
+import { createRetrievalService, MODEL_BUDGET_MS } from '../src/retrieval-service.js';
 import { UI_JS } from '../src/ui.js';
 
 const entry = { id: 'recovery-note', kind: 'memory' as const, title: 'Transport recovery',
@@ -188,10 +188,13 @@ test('exhausted model budget cancels the provider request and a late answer neve
   assert.equal(first.reason, 'local_index:model_timeout');
   assert.deepEqual(first.selectedIds, [entry.id], 'the deterministic local ranking is still an answer inside the budget');
   assert.equal(reached, true, 'the provider was actually asked before the budget expired');
-  // The budget is 2500ms while the abandoned fetch bounds itself at 4000ms, so
-  // observing the cancel before 4000ms proves the budget aborted it rather than
-  // the fetch giving up on its own.
-  while (Date.now() - started < 3200 && !cancelled) await delay(50);
+  // The budget is MODEL_BUDGET_MS while the abandoned fetch bounds itself at 4000ms, so
+  // observing the cancel after the budget but before 4000ms proves the budget aborted it
+  // rather than the fetch giving up on its own. Read the constant instead of copying the
+  // number: the previous version waited a hardcoded 3200ms, which was 700ms of slack against
+  // a 2500ms budget, and raising the budget turned a correct assertion red.
+  assert.ok(MODEL_BUDGET_MS < 4000, 'the fetch bound must stay longer than the budget, or this test proves nothing');
+  while (Date.now() - started < MODEL_BUDGET_MS + 400 && !cancelled) await delay(50);
   assert.equal(cancelled, true, 'the exhausted budget aborts the request it stopped waiting for');
   // Wait past that 4000ms bound: it is when the abandoned fetch used to fail and
   // write `local_index:timeout` with an empty selection into the query cache.

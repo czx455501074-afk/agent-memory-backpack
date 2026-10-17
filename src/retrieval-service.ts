@@ -16,6 +16,21 @@ import { digestSchema } from './workflow-draft.js';
  * second field carrying the same fact would be one more thing to keep in step.
  * `selectionSource()` derives it for the receipt.
  */
+/**
+ * How long the model gets before the local ranking carries the decision.
+ *
+ * Exported so the test proving that an exhausted budget aborts the abandoned request can wait
+ * for the real number instead of a copy of it. That test held a hardcoded 3200ms against a
+ * 2500ms budget; raising the budget made the assertion fail while the behaviour it checks
+ * stayed correct - a test reporting a change of constant as if it were a defect.
+ *
+ * The value is measured rather than chosen: across 12 related queries the model answered with
+ * a median of 2101ms and a slowest of 2787ms, while every request that timed out landed at
+ * 2871-2875ms - just past a 2500ms budget once the surrounding work is counted. 3500 covers
+ * the observed tail and stays inside the adapter's 5s abort.
+ */
+export const MODEL_BUDGET_MS = 3500;
+
 export type RetrievalSelection = { mode: 'model' | 'index' | 'lexical_fallback';
   selectedIds: string[]; reason?: string };
 /** Which path produced `selection`, read off the fields that already state it. */
@@ -174,7 +189,19 @@ export function createRetrievalService(store: Store, dataDir: string) {
       // `settled` is set before the abort on purpose: an abort-triggered rejection
       // is already queued when `abort()` returns, and that late handler must see
       // the budget verdict, not write itself into the cache.
-      const timer=setTimeout(()=>{settled=true;controller.abort();resolve(fallback('model_timeout'));},2500);
+      //
+      // 3500 rather than 2500, because the old budget sat inside the model's latency tail
+      // instead of beyond it. Measured over 12 related queries
+      // (verification/r5/selection-noise-rate.mjs): the model answered with a median of 2101ms
+      // and a slowest of 2787ms, while the four requests that timed out came in at
+      // 2871-2875ms - tens of milliseconds past a line that lands at ~2870ms once the
+      // surrounding work is counted. Cutting a third of the answers means choosing the weaker
+      // local fallback for them, and that fallback is precisely the path that needed an
+      // evidence floor. 3500 covers the observed tail and still fits inside the adapter's 5s
+      // abort, with ~370ms of surrounding work to spare.
+      // 3500 rather than 2500: the old budget sat inside the model's latency tail instead of
+      // beyond it. See MODEL_BUDGET_MS above for the measurement that set the value.
+      const timer=setTimeout(()=>{settled=true;controller.abort();resolve(fallback('model_timeout'));},MODEL_BUDGET_MS);
       timer.unref();
     });
     const promise=Promise.race([
