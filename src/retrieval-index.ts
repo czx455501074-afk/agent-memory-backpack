@@ -129,6 +129,24 @@ export function buildRetrievalIndex(candidates: RetrievalCandidate[]) {
       if (present.length < 2 && queryTermCount >= 3 && !signatures(query).length) return [];
       const presentIdf = idfSum(present);
       const coverage = (hits: string[]) => presentIdf ? idfSum(hits) / presentIdf : 0;
+      /**
+       * Length normalisation, so the score measures the evidence rather than the
+       * size of the text around it.
+       *
+       * `coverage = idfSum(hits)/presentIdf` alone systematically favours long
+       * documents: a 20 KB diary that quotes a rule's sentence also contains the
+       * words surrounding it, so it accumulates more of the query's terms than the
+       * 69-character rule that states them. Measured on the live distribution, with
+       * the rule's own wording as the query: diary 4.00 vs rule 2.09 - the rule lost
+       * to a document that merely cited it, which is how "a norm exists but cannot be
+       * found by its near-verbatim query" happens even once rules are indexed.
+       *
+       * The divisor is logarithmic in the document's own character count because the
+       * correction must be decisive without erasing genuinely long sources: 500
+       * characters cost a factor of 1.7, 5,000 cost 3.4, 20,000 cost 4.75. Two
+       * documents of comparable size are compared exactly as before.
+       */
+      const lengthFactor = (text: string) => 1 / (1 + Math.log(1 + Math.min(text.length, 48000) / 500));
       const normalizedQuery = normalize(clauses.join(' '));
       return rows.flatMap(row => {
         if (row.staleDigest) return [];
@@ -196,7 +214,9 @@ export function buildRetrievalIndex(candidates: RetrievalCandidate[]) {
         // generic verb that merely appears somewhere in another entry's body.
         const subjectHits = [...new Set(evidence.flatMap(item => item.titleHits))];
         const subject = presentIdf ? idfSum(subjectHits) / presentIdf : 0;
-        const score = (coverage(hits) + subject) * 3 + (strong ? 1 : 0);
+        // Only the evidence term is length-normalised: `strong` is a boolean verdict
+        // about the evidence, not a quantity that should shrink with document size.
+        const score = (coverage(hits) + subject) * 3 * lengthFactor(row.candidate.body) + (strong ? 1 : 0);
         // Which objective this candidate is the strongest evidence for, so a
         // two-topic request is not answered with only its single best topic.
         const primary = evidence.reduce((best, item) => item.local > best.local ? item : best);

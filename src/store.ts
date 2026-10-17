@@ -262,6 +262,116 @@ function matchIds(db: DatabaseSync, tokens: string[], floor = 0.5): string[] {
   return matchAll(db, tokens, floor).map(match => match.id);
 }
 
+/**
+ * The identity that makes repeated failures one fact instead of many.
+ *
+ * The adapter stores one candidate per failed tool call, and its idempotency key
+ * includes the session id, so the same error recurring in a new session is a *new*
+ * row by construction. The measured result was 98 auto-captured rows in three days
+ * in which 43 signatures accounted for all of them — `edit::replacefilew eio` twelve
+ * times, `pwsh::exit_code=1` fourteen times — with nothing in the queue able to tell
+ * "the same failure seen twice" from "two things that happened".
+ *
+ * This is that missing identity, derived from the stored text alone: the tool name
+ * plus the observation with the volatile parts (session id, absolute paths, uuids,
+ * long hex, numbers of three digits or more) replaced by placeholders. Two rows share
+ * a signature only when a reader would call them the same failure.
+ *
+ * Null means "not an auto-captured failure" — a human submission, which is never
+ * aggregated. The marker and the field layout are read from the text rather than from
+ * a new column so the rows already in a library are covered without a migration, and
+ * so a payload whose shape changes degrades to "not aggregated" rather than to a
+ * wrong merge.
+ */
+export interface FailureSignature {
+  /** `tool::normalised observation`, the grouping key. */
+  signature: string;
+  /** The tool as the adapter recorded it. */
+  tool: string;
+  /** The observation text before normalisation, for display. */
+  observation: string;
+  /** The adapter's own statement that the host gave it no usable error body. */
+  insufficient: boolean;
+}
+
+export function autoFailureSignature(discovery: string): FailureSignature | null {
+  if (typeof discovery !== 'string' || !discovery.includes('【自动捕获的失败事实')) return null;
+  const tool = /工具：([^。\n]+)/.exec(discovery)?.[1]?.trim() ?? '';
+  const observation = /观察：([\s\S]*?)(?:\n信息不足：|\n根因与修复：|$)/.exec(discovery)?.[1]?.trim() ?? '';
+  const normalised = observation
+    // The session id is the field that made these rows distinct in the first place,
+    // so it is the first thing removed: `会话 3f8c...` and `会话 91ab...` are the same
+    // failure, not two.
+    .replace(/会话\s+\S+/g, '«session»')
+    .replace(/[A-Za-z]:\\[^\s"'`]+/g, '«path»')
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '«id»')
+    .replace(/\b[0-9a-f]{16,}\b/gi, '«hash»')
+    // Bare numbers are kept below three digits so `exit_code=1` stays itself while a
+    // byte offset, a port and a length all collapse to the same placeholder.
+    .replace(/\d{3,}/g, '«n»')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  return {
+    signature: `${tool.toLowerCase()}::${normalised.slice(0, 200)}`,
+    tool,
+    observation,
+    insufficient: discovery.includes('信息不足：'),
+  };
+}
+
+/** How loudly a candidate asks for a reviewer's first minutes. */
+export type QueueBand = 'critical' | 'high' | 'normal' | 'low';
+
+export interface PriorityVerdict {
+  band: QueueBand;
+  /** Band weight plus the smaller signals; only ever compared within one project. */
+  score: number;
+  /** Why this band, in the reviewer's language, one sentence per signal. */
+  reasons: string[];
+}
+
+/**
+ * Order the queued candidates by what a person should look at first.
+ *
+ * The queue is 300 rows deep and four days old, so the only useful question the list
+ * can answer is "which few are worth my time". Four signals are available and none is
+ * sufficient alone, so they are combined into one band with the reasons kept beside it
+ * — a rank a reviewer cannot argue with is a rank they will not trust.
+ *
+ * Auto-captured failures rank last even when they carry `important: true`. That flag
+ * is set by the submission path's own regex, and its effect on these rows was measured:
+ * all 14 such rows were flagged because their text contains `ReplaceFileW` or similar
+ * words the rule reads as "conflict/supersede", not because anyone decided anything.
+ * Letting that decide the order would put machine noise at the top of a human queue.
+ */
+export function proposalPriority(input: {
+  important: boolean; relation: string; needsSplit: boolean; confidence: number;
+  hasEvidence: boolean; attributed: boolean; autoFailure: boolean;
+}): PriorityVerdict {
+  const band: QueueBand = input.autoFailure
+    ? 'low'
+    : input.important
+      ? 'critical'
+      : ['conflict', 'supersede'].includes(input.relation) || input.needsSplit
+        ? 'high'
+        : 'normal';
+  const reasons: string[] = [];
+  if (input.autoFailure) {
+    reasons.push('自动捕获的工具失败事实：无人工证据、未归属流程');
+    if (input.important) reasons.push('它的 important 标记来自失败文本里的 replace/重要 等词，不是人工裁决');
+  } else if (input.important) reasons.push('提交时被判定为需人工裁决的冲突，等待期内不会自动过期');
+  else if (input.needsSplit) reasons.push('正文混写了多种知识类型，需要拆分后再采纳');
+  else if (['conflict', 'supersede'].includes(input.relation)) reasons.push(`与已有知识的关系是 ${input.relation}，采纳前要核对冲突`);
+  else if (input.hasEvidence) reasons.push('提交者附带了可核对证据');
+  else if (input.attributed) reasons.push('候选已归属到具体流程与步骤');
+  else reasons.push('人工提交的可复用经验，未附证据');
+  const weight: Record<QueueBand, number> = { critical: 4000, high: 3000, normal: 2000, low: 1000 };
+  const score = weight[band] + Math.round(Math.max(0, Math.min(1, input.confidence)) * 100)
+    + (input.hasEvidence ? 50 : 0) + (input.attributed ? 30 : 0);
+  return { band, score, reasons };
+}
+
 /** Single SQLite authority for the P0 fixture; not a semantic auto-promotion engine. */
 export class Store {
   readonly db: DatabaseSync;
@@ -412,6 +522,25 @@ export class Store {
     // rather than guessed at; it stays reachable by id.
     this.db.exec(`UPDATE proposals SET project_id = COALESCE(json_extract(payload, '$.projectId'), '')
       WHERE project_id = '' AND payload <> '{}'`);
+    // Backfill the full-text index for anything active that has no row in it.
+    //
+    // Norms used to be excluded from that index, so every rule written before the
+    // change has no row and stays unsearchable until something rewrites it - which
+    // for a rule may be never. This is a no-op on a library that is already
+    // consistent, so it needs no version flag to stay correct: read what the index
+    // covers, index the difference. The id set is read once rather than joined
+    // against the FTS virtual table, whose join behaviour is not worth depending on.
+    const indexed = new Set(this.db.prepare('SELECT id FROM workflow_search').all()
+      .map(row => String((row as { id: string }).id)));
+    const heads = this.db.prepare(`SELECT k.id AS id, r.content AS content FROM knowledge k
+      JOIN revisions r ON r.id = k.id AND r.revision = k.head
+      WHERE k.status = 'active'`).all();
+    for (const row of heads) {
+      const id = String((row as { id: string }).id);
+      if (indexed.has(id)) continue;
+      this.db.prepare('INSERT INTO workflow_search VALUES(?,?)')
+        .run(id, searchable(String((row as { content: string }).content)));
+    }
   }
   close() { this.db.close(); }
   get revision(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='revision'").get()!.value); }
@@ -587,7 +716,13 @@ export class Store {
       // Workflows, skills and memories are all searchable. A workflow is indexed
       // whole; a skill is indexed together with its leaves so a search for a leaf
       // topic still finds the entry that owns it.
-      if (content.kind !== 'norm') this.db.prepare('INSERT INTO workflow_search VALUES(?,?)').run(content.id, searchable(JSON.stringify(content)));
+      //
+      // Norms are indexed too. They used to be skipped here, which made the one kind
+      // that states rules the only kind a search could never return: `searchUniversal`
+      // promises "all knowledge kinds", and a rule the agent cannot find is a rule it
+      // breaks silently. Injection still reads norms through `norms()`, so indexing
+      // them adds reach without duplicating what gets injected.
+      this.db.prepare('INSERT INTO workflow_search VALUES(?,?)').run(content.id, searchable(JSON.stringify(content)));
     }
     this.db.prepare("UPDATE meta SET value=value+1 WHERE key='revision'").run();
     this.jobs.enqueue('notify', `revision:${this.revision}`, { revision: this.revision });
@@ -1057,7 +1192,7 @@ export class Store {
       ? [`规范上下文预算 ${this.normBudgetChars} 字符：本条上下文省略 ${omitted.length} 条规范（${omitted.map(o => o.id).join('、')}）；省略不改变它们的约束判定，需要时按 id 展开读取。`]
       : [];
   }
-  prepare(projectId: string, query: string, options?: { sessionId?: string; taskId?: string; platform?: 'dsh' | 'codex'; knownRevision?: number; selectedIds?: string[] }) {
+  prepare(projectId: string, query: string, options?: { sessionId?: string; taskId?: string; platform?: 'dsh' | 'codex'; knownRevision?: number; selectedIds?: string[]; selectionSource?: 'model' | 'index' | 'local_index'; noRetrievalIntent?: boolean }) {
     if (options?.sessionId) {
       try {
         const querySnippet = query ? query.split('\n')[0]?.slice(0, 50) : '';
@@ -1091,10 +1226,31 @@ export class Store {
     // whether or not anything was asked.
     const hasQuery = queryTokens(query).length > 0;
     const retrievalTokens = queryTokens(query);
-    const automaticMatches = this.automaticMatches(projectId, query);
+    /**
+     * Local evidence for every entry, plus what the caller's selection adds.
+     *
+     * `selectedIds` decides which entries are candidates and in what order. It does
+     * not decide what the local evidence is, and it used to: clearing `matched` here
+     * made every prepare that arrived through the server report `matchedTokens: []`
+     * with the entire query listed as `gaps` - a receipt asserting that a query
+     * matched nothing at the moment it matched. That is worse than no receipt, since
+     * a reader who is told a real hit was a gap learns to distrust every later one.
+     * The hit words are therefore recomputed from the entry itself and only the
+     * score and ordering come from the caller. `source` records which path chose the
+     * entry, so a model decision stays distinguishable from a local ranking.
+     */
+    const automaticMatches: Map<string, { score: number; matched: string[]; coverage: number; source?: string }> =
+      this.automaticMatches(projectId, query);
     if(options?.selectedIds) {
+      const byId = new Map(this.liveEntries().map(entry => [entry.id, entry] as const));
+      const ranked = options.selectedIds.map((id,index) => {
+        const entry = byId.get(id);
+        const local = entry ? automaticRelevance(entry.content, query) : { score: 0, matched: [], coverage: 0 };
+        return [id, { score: 100 - index, matched: local.matched, coverage: local.coverage,
+          source: options.selectionSource ?? (local.score > 0 ? 'index' : 'explicit') }] as const;
+      });
       automaticMatches.clear();
-      options.selectedIds.forEach((id,index)=>automaticMatches.set(id,{score:100-index,matched:[],coverage:0}));
+      for(const [id,value] of ranked) automaticMatches.set(id,value);
     }
     const rankAutomatic = <T extends { id: string }>(entries: T[], limit: number) => entries
       .filter(entry => automaticMatches.has(entry.id))
@@ -1121,16 +1277,41 @@ export class Store {
      */
     const matchedTokens = new Set<string>();
     for (const item of [...workflows, ...knowledge]) for (const token of item.why?.matched ?? []) matchedTokens.add(token);
+    // An entry selected outside `workflows`/`knowledge` — a rule, which is injected
+    // through `norms()` rather than as a retrieved item — still matched this query.
+    // Counting its hit words as gaps would tell the reader the library has no such
+    // knowledge at the moment it was selected from it.
+    for (const id of options?.selectedIds ?? []) for (const token of automaticMatches.get(id)?.matched ?? []) matchedTokens.add(token);
+    /**
+     * A query that was never worth searching is not a search that found nothing.
+     *
+     * `gaps` means "no entry matched this fragment", and it is read that way by a
+     * person investigating a missed recall. When the caller had no retrieval intent at
+     * all — an empty query, a status acknowledgement, a purely negative request —
+     * nothing was searched, so listing every fragment as a coverage gap reports a
+     * search result that never happened and inflates the very signal this report
+     * exists to carry. The two facts are therefore stated apart: the tokens are still
+     * recorded and the `note` says the query was not searched, while a real search that
+     * came back empty still lists its fragments as gaps.
+     *
+     * Nothing is added to the receipt's shape. The flag changes what `gaps` and `note`
+     * say on this branch and nowhere else, so a caller that compares whole receipts —
+     * the retrieval-service tests compare selection objects field by field — keeps the
+     * contract it already had.
+     */
+    const noIntent = options?.noRetrievalIntent === true;
     const retrieval = {
       query,
       tokens: retrievalTokens,
       matchedTokens: [...matchedTokens],
-      gaps: retrievalTokens.filter(token => !matchedTokens.has(token)),
+      gaps: noIntent ? [] : retrievalTokens.filter(token => !matchedTokens.has(token)),
       selected: [
         ...workflows.map(w => ({ id: w.id, revision: w.revision, kind: 'workflow' as const, why: w.why })),
         ...knowledge.map(k => ({ id: k.id, revision: k.revision, kind: k.kind, why: k.why })),
       ],
-      note: '这是本次检索的理由与未命中片段，供日后排查漏检；未命中不等于库中一定该有。',
+      note: noIntent
+        ? '本次没有检索意图（空查询、状态汇报或否定式请求），未做选择，因此不报告覆盖缺口；这不等于库中一定没有这些片段。'
+        : '这是本次检索的理由与未命中片段，供日后排查漏检；未命中不等于库中一定该有。',
     };
     const context = [
       `Agent Memory Backpack 当前知识版本 ${this.revision}。以下规范来自本地权威库；流程是经验，不授予额外操作权限。`,
@@ -1463,9 +1644,32 @@ export class Store {
        * added here: a submission that says it conflicts with, replaces, or widens a
        * rule is held — better to keep one extra candidate for review than to drop the
        * one a human was meant to decide.
+       *
+       * The check reads the three subjects the design actually means — a conflict with
+       * stored knowledge, a supersession of an earlier conclusion, a request for a
+       * human ruling — and nothing else. It used to match bare substrings, so the
+       * exemption covered machine text. Measured read-only on the live library
+       * (2026-10-17): the queue held 334 pending rows, 97 of them `important` — 95 of
+       * 331 in the same day's earlier sample, 56 of those carrying no Chinese trigger
+       * word at all. The words responsible were `replace` (24 rows, mostly the tool name
+       * `ReplaceFileW`), `global` (6, as in a scope spelled in English), `conflict` /
+       * `important` / `supersede` inside technical identifiers such as
+       * `idempotency_conflict`, and `rule`. Replaying the narrowed rules over the same
+       * 334 rows drops 35 of those exemptions and grants none. Each false positive was a
+       * row that could never lapse, which is how a thirty-day archive stops being one.
+       *
+       * Two consequences are deliberate. The English side is word-bounded and narrowed,
+       * so `ReplaceFileW`, a path like `src/replace.ts` and the verb "replace" in an
+       * ordinary sentence are none of them a conflict — only `conflict(s)`,
+       * `contradict*` and `supersede*` are. And `替换` counts only when it names what
+       * it replaces: "把变量替换成新值" is an operation, while "用新做法替换旧的判断"
+       * is a supersession of stored knowledge and still waits for a person.
        */
       const text = payload.discovery;
-      const serious = /(冲突|矛盾|取代|替换|重要|待裁决|裁决|全局|conflict|important|global|replace|supersed|rule)/i.test(text);
+      const seriousZh = /(冲突|矛盾|取代|待裁决|裁决)/.test(text);
+      const seriousReplacement = /替换[^。；！？\n]{0,12}(?:旧|原有|原来|先前|之前|既有|已有|结论|规范|经验|做法|方案|流程|判断)/.test(text);
+      const seriousEn = /\b(?:conflicts?|conflicting|contradicts?|contradicted|contradiction|supersedes?|superseded|supersession)\b/i.test(text);
+      const serious = seriousZh || seriousReplacement || seriousEn;
       const conflict = serious
         || ['conflict', 'supersede', 'duplicate'].includes(classification.relation)
         || classification.needsSplit;
@@ -1656,6 +1860,181 @@ export class Store {
         } : null,
       };
     });
+  }
+  /**
+   * The review queue as a person can act on it, derived read-only from the rows.
+   *
+   * `listProposals` answers "what is queued" and is unchanged: it returns one record
+   * per stored row, newest first, and every existing caller (the console, the CLI,
+   * the adapter's admin path) keeps reading exactly that. What it could not answer is
+   * the question the queue was failing on — 301 pending rows in which 98 auto-captured
+   * failures are 43 signatures repeated, all shown as equals beside 203 experiences
+   * somebody actually wrote.
+   *
+   * So this method reads the same rows and derives a second view of them:
+   *
+   *  - rows sharing an auto-failure signature become ONE entry carrying `occurrences`,
+   *    `firstSeenAt`, `lastSeenAt` and sample references to the underlying records;
+   *  - entries are ordered by `proposalPriority`, so a human conflict outranks a
+   *    routine submission, which outranks machine noise;
+   *  - the low-value group is reported in `groups['failure-facts']` even when the
+   *    caller asked only for actionable items, with its counts and a preview — folded,
+   *    never dropped silently.
+   *
+   * Why derived rather than a stored aggregation: the rows must not change for this
+   * to be reversible, and they do not — nothing here writes. A materialised group
+   * would need a migration and a write path on a table a reviewer is deciding on
+   * concurrently, and its failure mode (a group pointing at a row that no longer
+   * holds what the group summarised) is exactly the kind of drift the underlying
+   * records are there to prevent. The cost of deriving is one pass over the project's
+   * rows, which this method already pays to read them.
+   *
+   * Every member stays reachable: `memberIds` lists all of them, `samples` carries the
+   * most recent few with their ids, and each id still answers to `getProposal` and to
+   * `listProposals` — the aggregate is a lens, not a replacement.
+   */
+  queueProposals(projectId: string, options: {
+    /** Defaults to `pending`: the review queue proper. */
+    state?: string;
+    /** Which slice to return; the other slice is still reported in `groups`. */
+    include?: 'actionable' | 'failure-facts' | 'all';
+    /** How many member records an aggregate carries inline. */
+    sampleLimit?: number;
+    /** Cap on returned items; `totals` still reports the whole queue. */
+    limit?: number;
+  } = {}) {
+    const state = options.state ?? 'pending';
+    const include = options.include ?? 'actionable';
+    const sampleLimit = Math.max(1, Math.min(20, Math.trunc(options.sampleLimit ?? 3)));
+    const limit = options.limit === undefined ? undefined : Math.max(1, Math.trunc(options.limit));
+    // Read in the same projection the flat view uses, so the two views cannot
+    // disagree about what a row says.
+    const rows = this.listProposals(projectId, state);
+    interface Member {
+      id: string; state: string; createdAt: number; expiresAt: number;
+      discovery: string; priority: PriorityVerdict;
+      attribution: { workflowId: string | null; stageId: string | null; resolved: boolean };
+      important: boolean; relation: string; confidence: number;
+    }
+    const actionable: Member[] = [];
+    const bySignature = new Map<string, { tool: string; members: Member[] }>();
+    for (const row of rows) {
+      const payload = (row.payload ?? {}) as Record<string, unknown>;
+      const classification = (payload.classification ?? {}) as Record<string, unknown>;
+      const relation = typeof classification.relation === 'string' ? classification.relation : 'unknown';
+      const confidence = typeof classification.confidence === 'number' ? classification.confidence : 0;
+      const needsSplit = classification.needsSplit === true;
+      const discovery = typeof row.discovery === 'string' ? row.discovery : '';
+      const attribution = row.attribution as { workflowId: string | null; stageId: string | null; resolved: boolean } | null;
+      const attributed = attribution?.resolved === true;
+      const hasEvidence = typeof payload.evidence === 'string' && payload.evidence.trim().length > 0;
+      const signature = autoFailureSignature(discovery);
+      const priority = proposalPriority({
+        important: payload.important === true, relation, needsSplit, confidence,
+        hasEvidence, attributed, autoFailure: signature !== null,
+      });
+      const member: Member = {
+        id: row.id, state: row.state, createdAt: Number(row.createdAt), expiresAt: Number(row.expiresAt),
+        discovery, priority,
+        attribution: attribution ?? { workflowId: null, stageId: null, resolved: false },
+        important: payload.important === true, relation, confidence,
+      };
+      if (!signature) { actionable.push(member); continue; }
+      const bucket = bySignature.get(signature.signature);
+      if (bucket) bucket.members.push(member);
+      else bySignature.set(signature.signature, { tool: signature.tool, members: [member] });
+    }
+    /**
+     * Newest first inside a group, with the id as the tie-break.
+     *
+     * Two rows written in the same millisecond would otherwise order by whatever the
+     * storage engine returned, which is how a "most recent" sample becomes unstable
+     * between two identical calls.
+     */
+    const byRecency = (a: Member, b: Member) => b.createdAt - a.createdAt || a.id.localeCompare(b.id);
+    for (const bucket of bySignature.values()) bucket.members.sort(byRecency);
+    const aggregates = [...bySignature.entries()].map(([signature, bucket]) => {
+      const members = bucket.members;
+      const newest = members[0]!;
+      const oldest = members[members.length - 1]!;
+      // The group inherits the strongest reason any of its members had; for these rows
+      // that is uniformly "low", which is the point of grouping them.
+      const best = members.reduce((acc, item) => (item.priority.score > acc.priority.score ? item : acc), newest);
+      return {
+        id: newest.id,
+        kind: 'aggregate' as const,
+        state: newest.state,
+        signature,
+        tool: bucket.tool,
+        occurrences: members.length,
+        firstSeenAt: oldest.createdAt,
+        lastSeenAt: newest.createdAt,
+        createdAt: newest.createdAt,
+        expiresAt: newest.expiresAt,
+        discovery: newest.discovery,
+        important: newest.important,
+        relation: newest.relation,
+        confidence: newest.confidence,
+        attribution: newest.attribution,
+        priority: {
+          ...best.priority,
+          reasons: [...best.priority.reasons, `同一签名出现 ${members.length} 次，这里取最近一条为代表`],
+        },
+        memberIds: members.map(item => item.id),
+        sampleIds: members.slice(0, sampleLimit).map(item => item.id),
+        samples: members.slice(0, sampleLimit).map(item => ({
+          id: item.id, createdAt: item.createdAt,
+          discovery: item.discovery.length > 240 ? `${item.discovery.slice(0, 240)}…` : item.discovery,
+        })),
+        aggregation: {
+          rule: 'tool + normalised observation', signature, occurrences: members.length,
+          sampleLimit, membersQueryable: true,
+        },
+      };
+    });
+    const byPriority = (a: { priority: PriorityVerdict; createdAt: number; id: string }, b: { priority: PriorityVerdict; createdAt: number; id: string }) =>
+      b.priority.score - a.priority.score || b.createdAt - a.createdAt || a.id.localeCompare(b.id);
+    const rankedActionable = [...actionable].sort(byPriority);
+    // Repeated failures first: twelve sightings of one error is a stronger reason to
+    // look than one sighting of another, and the queue is where that ordering belongs.
+    const rankedAggregates = [...aggregates].sort((a, b) =>
+      b.occurrences - a.occurrences || b.lastSeenAt - a.lastSeenAt || a.signature.localeCompare(b.signature));
+    const failureMembers = rankedAggregates.reduce((sum, group) => sum + group.occurrences, 0);
+    const chosen = include === 'actionable'
+      ? rankedActionable
+      : include === 'failure-facts'
+        ? rankedAggregates
+        : [...rankedActionable, ...rankedAggregates];
+    const items = limit === undefined ? chosen : chosen.slice(0, limit);
+    return {
+      projectId, state, include,
+      ordering: '人工裁决(important) > 冲突/取代/需拆分 > 人工提交 > 自动捕获的失败事实聚合组；组内按出现次数与最近时间',
+      items,
+      totals: {
+        inState: rows.length,
+        returned: items.length,
+        actionable: rankedActionable.length,
+        failureFacts: failureMembers,
+        failureSignatures: rankedAggregates.length,
+        /** Rows that the aggregate view represents as one entry. */
+        collapsed: failureMembers - rankedAggregates.length,
+      },
+      groups: {
+        actionable: { count: rankedActionable.length },
+        'failure-facts': {
+          count: rankedAggregates.length,
+          occurrences: failureMembers,
+          collapsedDuplicates: failureMembers - rankedAggregates.length,
+          /** What is in the folded group, so it can be judged without expanding it. */
+          preview: rankedAggregates.slice(0, 5).map(group => ({
+            signature: group.signature, tool: group.tool, occurrences: group.occurrences,
+            lastSeenAt: group.lastSeenAt, sampleId: group.id,
+          })),
+        },
+      },
+      membersQueryable: true,
+      note: '聚合是只读派生视图：底层 proposals 一条未删、状态未改，成员 id 见 memberIds，用 /v1/proposals/get 或按 state 过滤的列表可逐条取回。',
+    };
   }
   /**
    * One proposal, with the information a reviewer needs to decide it.
@@ -2234,6 +2613,64 @@ export class Store {
     });
   }
   /**
+   * How long a task may record nothing before the core stops calling it live.
+   *
+   * A session ends and its task stays `in_progress` forever, because nothing in
+   * the store ever read the passage of time: the only status writes came from a
+   * caller, so a session that simply stopped left a live-looking task behind. A
+   * real library showed the shape of that — 51 `in_progress` and 80 `paused`
+   * against 12 `completed`, i.e. the task list had stopped describing work and
+   * was accumulating it.
+   *
+   * Twelve hours is the threshold because it is longer than any ordinary break
+   * one session takes (a night, a long meeting, a build) and shorter than the
+   * spans that actually piled up: measured against this machine's library, every
+   * stalled task was already more than twelve hours old, so the rule converges
+   * the abandoned ones without touching the 6 that were still within the hour.
+   * Erring short would mislabel live work, and the cost of erring long is only
+   * that the list stays untidy a while longer — so the idle threshold is the
+   * conservative side of the trade.
+   */
+  taskIdleConvergeMs(): number {
+    return this.taskConvergenceThreshold('taskIdleConvergeMs', TASK_IDLE_CONVERGE_MS);
+  }
+  /**
+   * How long an ended task waits before its own diary is filed under it.
+   *
+   * The task scope is the "this time only" layer, and it had no data: 0 task-scoped
+   * entries in a real library against 143 tasks, because the core's own diary is
+   * written at project scope and no other core path ever emitted that scope. Two
+   * days after the last activity is long enough that the archive is not competing
+   * with a session that is merely paused overnight, and short enough that reading
+   * "what did that session leave behind" works on the same day the task dies.
+   */
+  taskArchiveAfterMs(): number {
+    return this.taskConvergenceThreshold('taskArchiveAfterMs', TASK_ARCHIVE_AFTER_MS);
+  }
+  private taskConvergenceThreshold(key: string, fallback: number): number {
+    const row = this.db.prepare('SELECT value FROM meta WHERE key=?').get(key) as { value: number } | undefined;
+    const value = row ? Number(row.value) : Number.NaN;
+    return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+  }
+  /** Both thresholds at once, so a caller reports the values it actually applied. */
+  taskConvergence(): { idleMs: number; archiveAfterMs: number } {
+    return { idleMs: this.taskIdleConvergeMs(), archiveAfterMs: this.taskArchiveAfterMs() };
+  }
+  setTaskConvergence(input: { idleMs?: number; archiveAfterMs?: number }) {
+    const current = this.taskConvergence();
+    const idleMs = input.idleMs ?? current.idleMs;
+    const archiveAfterMs = input.archiveAfterMs ?? current.archiveAfterMs;
+    if (!Number.isSafeInteger(idleMs) || idleMs < 60_000)
+      throw new DomainError('invalid_interval', 'Task idle threshold must be at least one minute', 400);
+    // Archiving before the task has been declared idle would file a diary for work
+    // that is still being recorded, so the two are ordered rather than independent.
+    if (!Number.isSafeInteger(archiveAfterMs) || archiveAfterMs < idleMs)
+      throw new DomainError('invalid_interval', 'Archive delay must not be shorter than the idle threshold', 400);
+    if (input.idleMs !== undefined) this.db.prepare('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)').run('taskIdleConvergeMs', idleMs);
+    if (input.archiveAfterMs !== undefined) this.db.prepare('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)').run('taskArchiveAfterMs', archiveAfterMs);
+    return this.taskConvergence();
+  }
+  /**
    * Task identity is a stable ID the caller owns; a task may span sessions and a
    * session may hold several tasks. Re-recording an existing ID only refreshes
    * state, so a retry never creates a duplicate diary entry.
@@ -2470,10 +2907,201 @@ export class Store {
     const proposals = this.listProposals(projectId).filter(proposal => task
       && (proposal.payload?.taskId === task.id || task.relatedProposals.includes(proposal.id)))
       .map(proposal => ({ id: proposal.id, state: proposal.state, createdAt: proposal.createdAt }));
-    const entry = task ? this.current().find(entry => entry.content.kind === 'journal' && entry.content.taskId === task.id) : undefined;
+    // The project-scoped diary only. Once a session ends, its diary is filed again at
+    // task scope (below), and without this filter `find` would return whichever id
+    // sorts first — the same content reported twice under two different scopes, or
+    // the wrong one depending on how the task happened to be named.
+    const entry = task ? this.current().find(entry => entry.content.kind === 'journal'
+      && entry.content.taskId === task.id && entry.content.scope.kind !== 'task') : undefined;
     return { task: task ?? null, events, proposals,
       journal: entry ? { id: entry.id, revision: entry.revision, outcome: entry.content.kind === 'journal' ? entry.content.outcome : 'unverified' } : null,
+      // The one place a task-scoped entry can be read. Retrieval refuses task scope
+      // when the caller has no task in hand — that refusal is the scope's point — and
+      // `getKnowledge`/`readKnowledge` go through the same rule, so without this the
+      // archive would exist and be unreachable. It is the state the task scope was
+      // already in before it had a write path.
+      taskScoped: task ? this.taskScopedEntries(projectId, task.id) : [],
+      convergence: this.taskConvergence(),
       knowledgeRevision: this.revision };
+  }
+  /**
+   * The convergence rule: what happens to a task whose session has ended.
+   *
+   * Deterministic and explainable, because the alternative — a task that stays
+   * `in_progress` forever — hides what actually happened. Two transitions, in
+   * order, decided only by recorded time and status:
+   *
+   *   - `in_progress` with nothing recorded for `idleMs` becomes `paused`, and the
+   *     reason the core acted is written into the task's own notes. Paused and not
+   *     completed: a session that stopped is not a session that finished, and
+   *     completion is only ever asserted with verified text plus a checkable
+   *     evidence level, which a clock cannot supply.
+   *   - anything with no activity for `archiveAfterMs` has its diary filed under
+   *     the task scope, so "this time only" has data and the task's facts outlive
+   *     the session. Archiving changes no status and deletes nothing.
+   *
+   * Terminal tasks are never rewritten: the rule that keeps a read path from
+   * reopening a closed task keeps the clock from doing it too. `dryRun` answers
+   * "what would change" without changing it, which is what makes the rule safe to
+   * apply to a library nobody has backed up.
+   */
+  convergeTasks(projectId?: string, options: { now?: number; dryRun?: boolean } = {}) {
+    const at = options.now ?? this.now();
+    const thresholds = this.taskConvergence();
+    // An unscoped call is the core's own timer, which serves every project; a
+    // scoped one is a credential acting inside its own project, as the envelope
+    // requires. Reading the project list from the table keeps the two identical in
+    // what they decide, so one project's rule cannot differ from another's.
+    const projects = projectId !== undefined ? [projectId]
+      : [...new Set(this.db.prepare('SELECT DISTINCT project_id FROM tasks').all()
+        .map(row => String((row as { project_id: string }).project_id)))];
+    const converged: Array<{ taskId: string; projectId: string; from: TaskStatus; to: TaskStatus; idleMs: number; lastActivityAt: number; reason: string }> = [];
+    const archived: Array<{ taskId: string; projectId: string; knowledgeId: string; revision: number; replaced: boolean; unchanged: boolean }> = [];
+    const kept: Array<{ taskId: string; projectId: string; status: TaskStatus; idleMs: number; reason: string }> = [];
+    for (const owner of projects) {
+      for (const task of this.tasks(owner)) {
+        const idleMs = at - task.updatedAt;
+        if (['completed', 'cancelled', 'failed'].includes(task.status)) {
+          kept.push({ taskId: task.id, projectId: owner, status: task.status, idleMs, reason: '终态任务不由时间规则改写' });
+          continue;
+        }
+        const converges = task.status === 'in_progress' && idleMs >= thresholds.idleMs;
+        const archives = idleMs >= thresholds.archiveAfterMs;
+        if (!converges && !archives) {
+          kept.push({ taskId: task.id, projectId: owner, status: task.status, idleMs,
+            reason: `距上次记录 ${Math.round(idleMs / 60000)} 分钟，仍在活跃阈值内` });
+          continue;
+        }
+        if (converges) {
+          const reason = `距上次记录已 ${(idleMs / 3600_000).toFixed(1)} 小时（阈值 ${(thresholds.idleMs / 3600_000).toFixed(1)} 小时），`
+            + '会话已结束且没有新的进展记录：按会话收敛规则置为 paused。'
+            + '这不是完成，也没有核实任何结果；继续这项工作时用同一 sessionId 即可找回该任务。';
+          if (!options.dryRun) this.recordTask(owner, {
+            id: task.id, title: task.title, status: 'paused',
+            notes: appendTaskNote(task.notes, `[自动收敛 ${new Date(at).toISOString()}] ${reason}`),
+          });
+          converged.push({ taskId: task.id, projectId: owner, from: 'in_progress', to: 'paused',
+            idleMs, lastActivityAt: task.updatedAt, reason });
+        }
+        if (archives) {
+          // Judged on the activity before this pass: convergence refreshes
+          // `updated_at`, but rewriting a status is bookkeeping, not progress.
+          const filed = options.dryRun
+            ? { knowledgeId: taskArchiveId(task.id), revision: 0, replaced: false, unchanged: false }
+            : this.archiveTaskScope(owner, task.id, { at });
+          archived.push({ taskId: task.id, projectId: owner, ...filed });
+        }
+      }
+    }
+    return { at, thresholds, dryRun: Boolean(options.dryRun), converged, archived, kept };
+  }
+  /**
+   * File a task's diary under its own task scope.
+   *
+   * This is the write path the task scope never had. A candidate can carry it — the
+   * adapter's classifier may say `scope: task`, and approval keeps the task id — but
+   * no core path ever produced one, which is why a real library held 143 tasks and
+   * 0 task-scoped entries. The diary is the honest subject: it is what the task
+   * actually recorded, it already exists at project scope, and filing it under the
+   * task is what makes "what did this session leave behind" answerable without
+   * widening a one-time note into a rule for all later work.
+   *
+   * Idempotent by construction: the entry id is derived from the task, and a call
+   * whose content has not moved writes nothing and reports `unchanged: true`. A call
+   * whose content *has* moved (a later checkpoint added facts) writes a new revision
+   * of the same entry, which is a revision rather than a duplicate.
+   */
+  archiveTaskScope(projectId: string, taskId: string, options: { at?: number } = {}) {
+    const at = options.at ?? this.now();
+    return this.transaction(() => {
+      const task = this.getTask(taskId, projectId);
+      if (!task) throw new DomainError('not_found', 'Task is unavailable', 404);
+      const id = taskArchiveId(taskId);
+      // `verification` is a diagnostic the generated journal returns to a caller
+      // inspecting it, not a field of the journal schema, so it is dropped here for
+      // the same reason `writeJournal` drops it.
+      const { verification: _verification, ...generated } = this.generateJournal(taskId, projectId);
+      const content = knowledgeSchema.parse({
+        ...generated, id,
+        title: `${generated.title}（本会话）`.slice(0, 200),
+        scope: { kind: 'task', projectId, taskId },
+        baseRevision: 0,
+        // The task's own remarks, without the lines the core wrote about converging
+        // and archiving it: see `stripConvergenceNotes`.
+        problems: stripConvergenceNotes(generated.problems),
+        did: `${generated.did}\n\n[本会话作用域] 本条归档到任务 ${taskId}，只在该任务内适用；`
+          + '要让它对项目以后的工作也生效，需要显式提升为项目条目——那是扩大适用范围，必须由人决定。',
+      });
+      const existing = this.head(id);
+      if (existing && stableContent(existing.content) === stableContent(content))
+        return { taskId, projectId, knowledgeId: id, revision: existing.revision, scope: content.scope, replaced: false, unchanged: true, archivedAt: at };
+      const revision = this.import([{ ...content, baseRevision: existing?.revision ?? 0 }]);
+      // The task record says the archive happened. An archive invisible from the
+      // task it came from is indistinguishable from a task that was dropped.
+      const marker = `[会话归档] ${id}`;
+      if (!task.notes.includes(marker))
+        this.recordTask(projectId, {
+          id: taskId, title: task.title, status: task.status,
+          notes: appendTaskNote(task.notes, `${marker} r${revision}：本会话事实已归档为 task 作用域条目`
+            + '（不是完成，也未核实结果；长期有效的内容需显式提升为项目条目）。'),
+        });
+      return { taskId, projectId, knowledgeId: id, revision, scope: content.scope, replaced: Boolean(existing), unchanged: false, archivedAt: at };
+    });
+  }
+  /**
+   * Task-scoped entries that belong to one task, with their text.
+   *
+   * Retrieval refuses task scope when the caller has no task in hand — that refusal
+   * is the scope's whole point — and `getKnowledge`/`readKnowledge` apply the same
+   * rule, so the task view is the only place a reader can reach the content. It
+   * therefore carries an excerpt of the entry's own prose rather than just its
+   * title: a list of names a reader cannot open is not "readable", it is the same
+   * unreachable state the scope was in before it had a write path.
+   */
+  taskScopedEntries(projectId: string, taskId: string) {
+    return this.current()
+      .filter(entry => entry.content.scope.kind === 'task'
+        && entry.content.scope.projectId === projectId && entry.content.scope.taskId === taskId)
+      .map(entry => {
+        const content = entry.content as { did?: string; problems?: string; outcome?: string };
+        const excerpt = (value: string | undefined) => {
+          const text = value ?? '';
+          return text.length > 400 ? `${text.slice(0, 400)}…` : text;
+        };
+        return {
+          id: entry.id, revision: entry.revision, status: entry.status, kind: entry.content.kind,
+          title: entry.content.title, scope: entry.content.scope, evidence: entry.content.evidence,
+          outcome: content.outcome ?? null,
+          excerpt: excerpt(content.did),
+          problems: excerpt(content.problems),
+          promotable: true as const,
+        };
+      });
+  }
+  /**
+   * Promote one task-scoped entry to project scope.
+   *
+   * A widening, so it is the human's decision rather than a timer's: the policy
+   * module already classifies task → project as the `user` tier, and this path asks
+   * it instead of deciding for itself. The earlier revision is kept, so what was
+   * originally recorded at the narrower scope stays readable afterwards.
+   */
+  promoteTaskScope(projectId: string, knowledgeId: string) {
+    return this.transaction(() => {
+      const entry = this.head(knowledgeId);
+      const scope = entry?.content.scope;
+      if (!entry || !scope || scope.kind !== 'task' || scope.projectId !== projectId)
+        throw new DomainError('not_found', `Task-scoped entry ${knowledgeId} is unavailable`, 404);
+      const decision = reviewDecision({
+        intent: 'widen-scope', provenance: 'user', evidence: entry.content.evidence,
+        scopeChange: { from: scope, to: { kind: 'project', projectId } },
+      });
+      if (decision.tier !== 'user')
+        throw new DomainError('invalid_widening', 'task 作用域只能按"扩大范围"的规则提升', 400);
+      const revision = this.import([{ ...entry.content, scope: { kind: 'project', projectId }, baseRevision: entry.revision }]);
+      return { knowledgeId, revision, from: scope, to: { kind: 'project', projectId }, widening: true as const,
+        reason: decision.reason, constraint: decision.constraint };
+    });
   }
   /**
    * Generate the diary for a task.
@@ -3464,4 +4092,73 @@ export class Store {
       outbox: { pending: Number(outbox.pending ?? 0), failed: Number(outbox.failed ?? 0), abandoned: Number(outbox.abandoned ?? 0) },
       lastRescanAt: Number(this.db.prepare("SELECT value FROM meta WHERE key='lastRescanAt'").get()!.value) };
   }
+}
+
+/**
+ * Task convergence defaults, overridable per library through `meta`.
+ *
+ * They live outside the class because they are policy numbers a test and an
+ * operator both need to name, and inside the same file as the rule that uses them
+ * so the two cannot drift apart. The values are argued where they are applied:
+ * see `taskIdleConvergeMs` and `taskArchiveAfterMs`.
+ */
+export const TASK_IDLE_CONVERGE_MS = 12 * 3600_000;
+export const TASK_ARCHIVE_AFTER_MS = 48 * 3600_000;
+/**
+ * How long the task record's `notes` may grow before the oldest lines are dropped.
+ *
+ * The column is free text a person reads, and convergence appends a line every
+ * time it acts. Trimming from the front keeps the newest explanation — which is
+ * the one a reader needs — and the archive marker near the tail, so the idempotency
+ * check that looks for it cannot be defeated by the trim itself.
+ */
+const TASK_NOTES_LIMIT = 4000;
+/** Append one line to a task's notes, keeping the most recent text. */
+function appendTaskNote(current: string, line: string): string {
+  const next = current ? `${current}\n${line}` : line;
+  return next.length <= TASK_NOTES_LIMIT ? next : next.slice(next.length - TASK_NOTES_LIMIT);
+}
+/**
+ * The bookkeeping lines convergence writes into a task's notes, and the filter that
+ * keeps them out of the archived diary.
+ *
+ * They are the core's record of what it did to the task, not something the session
+ * said. Leaving them in would be more than untidy: the archive decides whether to
+ * write by comparing the diary it would produce against the stored entry, and a
+ * diary that quotes the archive marker differs from itself on every pass — the
+ * archive would rewrite its own revision forever instead of being idempotent.
+ */
+const CONVERGENCE_NOTE_MARKERS = ['[自动收敛 ', '[会话归档] '];
+function stripConvergenceNotes(notes: string): string {
+  return notes.split('\n')
+    .filter(line => !CONVERGENCE_NOTE_MARKERS.some(marker => line.startsWith(marker)))
+    .join('\n').trim();
+}
+/**
+ * The id of the task-scoped diary for one task.
+ *
+ * Named after the task so the entry can be found without a lookup table, and
+ * hashed when the name would exceed the identifier limit: two long task ids can
+ * share a 120-character prefix, and silently colliding there would file one task's
+ * diary under another's id.
+ */
+export function taskArchiveId(taskId: string): string {
+  const named = `journal-task-${taskId}`;
+  return named.length <= 120 ? named : `journal-task-${createHash('sha256').update(taskId).digest('hex').slice(0, 16)}`;
+}
+/**
+ * A comparable form of an entry's content: key order and `baseRevision` removed.
+ *
+ * Convergence runs on a timer, so "did anything change since the last run" has to
+ * be answered without writing. Comparing the serialised content directly would
+ * answer "changed" for two identical entries whose keys were stored in a different
+ * order, and counting `baseRevision` would make every archive look new.
+ */
+function stableContent(value: unknown): string {
+  return JSON.stringify(value, (_key, inner) =>
+    inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? Object.fromEntries(Object.entries(inner as Record<string, unknown>)
+        .filter(([key]) => key !== 'baseRevision')
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : inner);
 }

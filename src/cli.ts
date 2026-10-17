@@ -1023,9 +1023,38 @@ try {
         }
       }, 60000); rescanTimer.unref();
 
+      /**
+       * Session convergence runs on the core's clock, for the same reason the rescan
+       * does: the session that just ended cannot be the thing that notices. Without a
+       * timer the rule only exists for whoever calls the endpoint by hand, which is
+       * how a real library reached 51 tasks stuck `in_progress` and 0 task-scoped
+       * entries — nobody was going to tidy that list manually.
+       *
+       * Every pass is idempotent, so the interval only decides how quickly a stopped
+       * session stops looking live. Five minutes is short enough that the task list
+       * reads true while a person is looking at it, and long enough that a library of
+       * any size is walked a handful of times an hour. A failure is logged and does
+       * not kill the core: the rule only pauses tasks and files diaries, so a missed
+       * pass costs a delay, never a loss.
+       */
+      const convergeTimer = setInterval(() => {
+        try {
+          const outcome = store.convergeTasks();
+          const filed = outcome.archived.filter(item => !item.unchanged).length;
+          if (outcome.converged.length || filed) {
+            logger.info('tasks.converged', {
+              converged: outcome.converged.length, archived: filed, thresholds: outcome.thresholds,
+            });
+            console.log(`amb tasks: converged=${outcome.converged.length} archived=${filed}`);
+          }
+        } catch (error) {
+          logger.error('tasks.converge_failed', { message: error instanceof Error ? error.message : 'unknown error' });
+        }
+      }, 300000); convergeTimer.unref();
+
       server.once('error', (error: Error) => {
         maintenance.stop(); clearInterval(maintenanceTimer);
-        clearInterval(cleanup); clearInterval(rescanTimer); store.close();
+        clearInterval(cleanup); clearInterval(rescanTimer); clearInterval(convergeTimer); store.close();
         logger.error('core.listen_failed', { code: (error as NodeJS.ErrnoException).code, message: error.message });
         console.error('Cannot start core. Check whether this configured port is already in use.');
         process.exitCode = 1;
@@ -1043,7 +1072,7 @@ try {
       const stop = () => {
         maintenance.stop(); clearInterval(maintenanceTimer);
         logger.info('core.stopping', { knowledgeRevision: store.revision });
-        clearInterval(cleanup); clearInterval(rescanTimer);
+        clearInterval(cleanup); clearInterval(rescanTimer); clearInterval(convergeTimer);
         // The lock goes with the process, in the order a restart expects: released
         // only after the socket is closed, so the next core does not take the lock
         // and then lose the port race to the one still shutting down.

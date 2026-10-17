@@ -63,6 +63,12 @@ export async function analyzeWithModel(text: string, entries: ReviewEntry[], con
     if (!content) return fallback('invalid_response');
     const analysis = analysisSchema.safeParse(JSON.parse(redact(content.replace(/^```(?:json)?\s*|\s*```$/g, ''))));
     if (!analysis.success || (analysis.data.conflictingEntryId && !entries.some(e => e.id === analysis.data.conflictingEntryId))) return fallback('invalid_response');
-    return { mode: 'model', status: 'analyzed', analysis: analysis.data, model: cfg.model, authority: 'advisory' };
+    // A model's classification is advisory, and it never carries authority to
+    // promote: the rule that keeps an agent's own submission out of the auto-adopt
+    // path applies to a model's opinion *about* that submission just as much.
+    // `false` here means "ask a person", which is the only honest answer an
+    // unverifiable analysis can give.
+    return { mode: 'model', status: 'analyzed', model: cfg.model, authority: 'advisory',
+      analysis: { ...analysis.data, autoPromotable: false, promotionBlockedReason: '模型判定不授予自动升格：需人工确认类别与作用域' } };
   } catch { return fallback('unavailable'); }
 }

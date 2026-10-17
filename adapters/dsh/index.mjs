@@ -599,6 +599,17 @@ export async function buildPanelAdminParams(action, body, config, admin) {
   const params = { ...body }
   if (typeof params.projectId !== 'string' || params.projectId === '') params.projectId = config.projectId
 
+  // The queue view is the panel's default read: same rows, ordered by what deserves
+  // attention, with repeated auto-captured failures folded into one entry per
+  // signature. The parameters are passed through rather than fixed here, because the
+  // panel offers both views and must be able to ask for the folded members back
+  // (`include: 'failure-facts'`) — a caller that can only see the fold and never its
+  // members has been shown a smaller queue, not an aggregated one.
+  if (action === 'proposals-list') {
+    if (params.view === undefined) params.view = 'queue'
+    if (params.include === undefined) params.include = 'actionable'
+  }
+
   if (action === 'backup-export' && (typeof params.file !== 'string' || params.file === '')) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
     const dir = join(DEFAULT_DATA_DIR(), 'exports')
@@ -628,9 +639,24 @@ export async function buildPanelAdminParams(action, body, config, admin) {
       // unapproved and stayed in the queue.
       const derived = entryFromClassification(payload, params.projectId, params.id)
       if (!derived) {
+        // Why the click was refused decides what the reviewer reads next. "The plugin
+        // has no opinion" and "the plugin's opinion is that this must not be automatic"
+        // are different instructions: the first asks for a classification, the second
+        // already has one and says what is wrong with it. The reason travels with the
+        // classification (`promotionBlockedReason`), so it is quoted verbatim instead
+        // of being paraphrased into something vaguer.
+        const classification = payload && isRecordValue(payload.classification)
+          ? payload.classification : null
+        const blocked = classification && classification.autoPromotable === false
+          ? (typeof classification.promotionBlockedReason === 'string' && classification.promotionBlockedReason !== ''
+            ? classification.promotionBlockedReason
+            : '该候选不得自动升格。')
+          : null
         throw new Error(
-          '该候选没有可用的分类判定，或它要成为全局知识，因此无法一键采纳。'
-          + '请在评审流程里选定类别与作用域后再采纳。',
+          blocked === null
+            ? '该候选没有可用的分类判定，或它要成为全局知识，因此无法一键采纳。'
+              + '请在评审流程里选定类别与作用域后再采纳。'
+            : `该候选不能一键采纳：${blocked}请在评审流程里人工选定类别与作用域后再采纳。`,
         )
       }
       params.entry = derived
@@ -667,6 +693,17 @@ export function entryFromClassification(payload, projectId, proposalId) {
   if (!isRecordValue(payload)) return null
   const classification = isRecordValue(payload.classification) ? payload.classification : null
   if (!classification) return null
+
+  // The classification itself may say one click is not enough. `autoPromotable:
+  // false` means the plugin declined to decide on its own — a norm whose evidence is
+  // self-reported, or whose text is an episode report, or a scope that widens to every
+  // project. Returning null routes the caller to the compose form, which is the
+  // existing path for "a human must pick the kind and the scope".
+  //
+  // Only an explicit `false` refuses: a candidate classified before this field
+  // existed carries no verdict, and treating "no opinion" as "refused" would break the
+  // ordinary one-click case for every stored candidate.
+  if (classification.autoPromotable === false) return null
 
   const kind = typeof classification.kind === 'string' ? classification.kind : ''
   if (!AUTO_PROMOTE_KINDS.has(kind)) return null
@@ -1483,6 +1520,11 @@ export async function apply(ctx) {
         sessionId: payload.agent.id,
         ...(rawTaskId ? { taskId: String(rawTaskId) } : {}),
         ...(query ? { query } : {}),
+        // The version this session already holds, so the core can answer with the
+        // pointer instead of the whole normative text on every turn. `revisions` is the
+        // same map the gate path uses, and a session with no entry sends nothing —
+        // which is what makes the first turn of a session get the full context.
+        ...(payload.agent && revisions.has(payload.agent) ? { knowledgeRevision: revisions.get(payload.agent) } : {}),
       }, { signal: payload.signal }))
       warnedDegraded.delete(payload.agent)
       /**

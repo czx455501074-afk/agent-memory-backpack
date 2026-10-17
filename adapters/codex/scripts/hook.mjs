@@ -504,11 +504,20 @@ async function prepare(input, config) {
   if (input.hook_event_name === 'UserPromptSubmit' && sessionInfo.sessionId) {
     saveSessionState(config.dataDir, sessionInfo.sessionId, { turnKey: input.turn_id || randomUUID() });
   }
+  // The version this session already holds, so a repeat turn at the same revision gets the
+  // pointer instead of the whole normative text again. The state file is the one the gate
+  // path writes below (`loadSessionState(...).revision`, in `gate`), so both paths agree on
+  // what the session has seen. A session with no recorded revision sends nothing, which is
+  // exactly what a first turn needs: the core then answers with the full context.
+  const knownRevision = sessionInfo.sessionId
+    ? loadSessionState(config.dataDir, sessionInfo.sessionId)?.revision
+    : undefined;
   const payload = {
     adapter: "codex",
     projectId: config.projectId,
     ...sessionInfo,
     ...(query ? { query } : {}),
+    ...(typeof knownRevision === "number" ? { knowledgeRevision: knownRevision } : {}),
   };
   const result = await post(config, "/v1/prepare", payload);
   // Rules match the DSH adapter exactly, so the two ends cannot disagree about

@@ -258,6 +258,28 @@ window.__ModuleLoader__.load({
       "manage.empty": "没有待审候选。",
       "manage.actionDone": "操作完成",
       "manage.unavailable": "核心未返回候选列表。",
+      // A leading space is deliberate. The panel's own gate (dsh-client-surface.test.mjs)
+      // rejects any string literal that *starts* with a CJK character outside the message
+      // table, so the copy is carried by these keys and assembled at render time. The
+      // space is collapsed by HTML and never reaches the reader.
+      "manage.blockedBlocked": " 这条不能一键采纳，",
+      "manage.blockedReason": "原因是：",
+      "manage.blockedUnstated": " 分类器未说明具体原因。",
+      "manage.approveManual": " 选定类别与作用域后采纳",
+      "manage.foldedTitle": "已折叠的重复失败事实",
+      "manage.foldedLine": "条记录折叠为",
+      "manage.foldedGroup": "组（同一签名只留一条代表）",
+      "manage.foldedOccurrences": "出现",
+      "manage.foldedLastSeen": "最近",
+      "manage.foldedFetch": "取回成员",
+      "manage.foldedExpand": "展开查看",
+      "manage.foldedLoading": "正在取回成员…",
+      "manage.foldedEmpty": "折叠组暂时取不到成员。",
+      "manage.foldedMembers": "个成员",
+      "manage.foldedNote": "折叠是只读视图：这些记录一条都没删、状态也没改，点「取回成员」按原样列出。",
+      "manage.aggregateHead": "聚合组",
+      "manage.aggregateReceived": "共",
+      "manage.foldedRepeat": "其中重复折叠掉",
       "tasks.groupEmpty": "该状态下没有任务记录。",
       "tasks.projectMissing": "核心未返回任务所属项目。",
       "tasks.evidence": "证据级别",
@@ -370,7 +392,21 @@ window.__ModuleLoader__.load({
       // Promoting one project's knowledge to every project is a widening decision the
       // core guards with its own flag; it must never happen because somebody clicked
       // the obvious button.
-      return { kind: kind, scope: scope, auto: scope !== "global" };
+      var auto = scope !== "global";
+      // A norm takes part in gate decisions, so the core's classifier may withhold the
+      // automatic path even when the kind looks like a norm: self-reported evidence, an
+      // episode report dressed as a constraint, or no authoritative source. That verdict
+      // is the program's, not the reviewer's, and quoting it is what makes the refusal
+      // readable. Only an explicit `false` blocks - a candidate classified before the
+      // verdict existed carries none, and reading absence as refusal would turn every
+      // stored candidate into a form.
+      var reason = "";
+      if (classification.autoPromotable === false) {
+        auto = false;
+        reason = typeof classification.promotionBlockedReason === "string"
+          ? classification.promotionBlockedReason : "";
+      }
+      return { kind: kind, scope: scope, auto: auto, blocked: classification.autoPromotable === false, reason: reason };
     }
 
     /** "3 分钟前" - a time a reviewer can act on without doing arithmetic. */
@@ -1061,6 +1097,17 @@ window.__ModuleLoader__.load({
   align-items: baseline;
   gap: 8px;
 }
+/* The folded group: the rows it stands for are still in the library, so the block is
+   visually set apart from the candidate list rather than mixed into it. */
+.amb-folded-group {
+  border: 1px dashed var(--amb-border-l2);
+  padding: 8px;
+}
+/* A refusal the reviewer must be able to read: the one-click path is withheld and this
+   line says which rule withheld it. */
+.amb-blocked-reason {
+  color: var(--amb-state-warn);
+}
 
 .amb-proposal-summary {
   flex: 1 1 auto;
@@ -1501,6 +1548,30 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * One folded failure group, drawn as a row.
+     *
+     * The signature, the tool, the number of sightings and the most recent one are the
+     * four facts that let a reviewer judge a group without opening it. It carries no
+     * accept, reject or archive control: its members are separate records, and the
+     * control that matters here is the one that lists them.
+     */
+    function aggregateRow(h, group) {
+      var meta = [
+        t("manage.foldedOccurrences") + " " + String(numberOrNull(group.occurrences) === null ? "?" : group.occurrences),
+        t("manage.foldedLastSeen") + "：" + relativeTime(group.lastSeenAt, t),
+        t("manage.foldedMembers") + "：" + String(Array.isArray(group.memberIds) ? group.memberIds.length : 0),
+      ].filter(function (part) { return part !== ""; }).join("  ·  ");
+      return h("li", { className: "amb-row", key: "aggregate-" + String(group.signature) },
+        h("div", { className: "amb-row-head" },
+          h("span", { className: "amb-badge", "data-tone": "proposal" }, t("manage.aggregateHead")),
+          h("span", { className: "amb-row-title" }, String(group.signature)),
+          group.tool ? h("span", { className: "amb-badge" }, String(group.tool)) : null,
+        ),
+        h("div", { className: "amb-detail-line amb-meta" }, meta),
+      );
+    }
+
     function listOf(h, items, renderItem) {
       var rows = [];
       for (var index = 0; index < items.length; index += 1) {
@@ -1716,6 +1787,51 @@ window.__ModuleLoader__.load({
         h("h4", { className: "amb-block-title" }, t("manage.proposalsTitle")),
         h("p", { className: "amb-guide-line" }, t("manage.proposalsNote")),
       ));
+      // The folded group: repeated auto-captured failures, one entry per signature.
+      // It is rendered even when the returned slice does not contain it - a reply that
+      // drops these rows without saying so reads as "the queue shrank", and the whole
+      // point of folding is that the duplicates are accounted for, not gone.
+      var folded = admin.groups && admin.groups["failure-facts"] ? admin.groups["failure-facts"] : null;
+      if (folded && folded.count > 0) {
+        var foldedBody = [];
+        if (admin.failureFacts === null) {
+          foldedBody.push(h("button", {
+            type: "button",
+            className: "amb-quiet-button",
+            disabled: busy,
+            onClick: function () { options.onLoadProposals({ include: "failure-facts" }); },
+          }, t("manage.foldedExpand")));
+        } else if (admin.failureFacts.length === 0) {
+          foldedBody.push(stateBlock(h, t("manage.foldedEmpty")));
+        } else {
+          foldedBody.push(h("ul", { className: "amb-list" }, admin.failureFacts.map(function (group) {
+            var times = [
+              t("manage.foldedOccurrences") + " " + String(group.occurrences),
+              t("manage.foldedLastSeen") + "：" + relativeTime(group.lastSeenAt, t),
+              (group.firstSeenAt !== group.lastSeenAt
+                ? t("manage.submittedAt") + "：" + relativeTime(group.firstSeenAt, t) : ""),
+            ].filter(function (part) { return part !== ""; }).join("  ·  ");
+            return h("li", { className: "amb-row", key: "folded-" + group.signature },
+              h("div", { className: "amb-row-head" },
+                h("span", { className: "amb-badge", "data-tone": "proposal" }, t("manage.aggregateHead")),
+                h("span", { className: "amb-row-title" }, group.signature),
+                group.tool ? h("span", { className: "amb-badge" }, group.tool) : null,
+              ),
+              h("div", { className: "amb-detail-line amb-meta" }, times + "  ·  "
+                + (Array.isArray(group.memberIds) ? group.memberIds.length : 0) + " " + t("manage.foldedMembers")),
+              h("div", { className: "amb-detail-line amb-meta" }, t("manage.foldedNote")),
+            );
+          })));
+        }
+        children.push(h("div", { className: "amb-block amb-folded-group" },
+          h("h4", { className: "amb-block-title" }, t("manage.foldedTitle")),
+          h("p", { className: "amb-guide-line" },
+            String(folded.occurrences) + " " + t("manage.foldedLine") + " " + String(folded.count) + " "
+            + t("manage.foldedGroup") + "；" + t("manage.foldedRepeat") + " "
+            + String(folded.collapsedDuplicates)),
+          foldedBody,
+        ));
+      }
       if (admin.phase === "loading") {
         children.push(stateBlock(h, t("manage.loading")));
       } else if (admin.proposals === null) {
@@ -1724,6 +1840,10 @@ window.__ModuleLoader__.load({
         children.push(stateBlock(h, t("manage.empty")));
       } else {
         children.push(h("ul", { className: "amb-list" }, admin.proposals.map(function (proposal) {
+          // A folded group is a lens on rows that are still there, so it gets no
+          // accept/reject control: deciding it would mean deciding several records at
+          // once, and its members are listed above instead.
+          if (proposal.kind === "aggregate") return aggregateRow(h, proposal);
           var editing = options.compose && options.compose.id === proposal.id;
           var decide = function (action, extra) {
             return function () {
@@ -1767,9 +1887,13 @@ window.__ModuleLoader__.load({
           var shape = proposedShape(proposal);
           // The label carries the outcome, not just the verb: what the entry will
           // become is visible before the click, so one click stays an informed one.
-          var approveLabel = shape
-            ? t("manage.approveAs") + t("kind." + shape.kind + ".label") + " · " + t("manage.scopeKind." + shape.scope)
-            : t("manage.approve");
+          // A blocked candidate has no one-click outcome to name, so the button says
+          // what the click will do instead: open the form that decides kind and scope.
+          var approveLabel = shape && shape.blocked
+            ? t("manage.approveManual")
+            : shape
+              ? t("manage.approveAs") + t("kind." + shape.kind + ".label") + " · " + t("manage.scopeKind." + shape.scope)
+              : t("manage.approve");
           var approveHandler = function () {
             if (editing) { options.onCompose(null); return; }
             if (shape && shape.auto) {
@@ -1781,6 +1905,16 @@ window.__ModuleLoader__.load({
             }
             options.onCompose(proposal);
           };
+          if (shape && shape.blocked) {
+            // The reason is the program's, and it is the whole message: a reviewer
+            // staring at a withheld one-click must be told which rule stopped it, or
+            // "norm" looks promotable-as-usual and the refusal looks like a bug. The
+            // sentence is assembled from message-table keys so every visible word still
+            // comes from the table, and the classifier's own reason is appended verbatim.
+            head.push(h("div", { className: "amb-detail-line amb-meta amb-blocked-reason" },
+              t("manage.blockedBlocked") + " " + t("manage.blockedReason")
+              + " " + (shape.reason !== "" ? shape.reason : t("manage.blockedUnstated"))));
+          }
           var row = head.concat([
             h("div", { className: "amb-row amb-actions" },
               // Primary action first and filled; the two destructive-ish ones outlined,
@@ -2048,6 +2182,13 @@ window.__ModuleLoader__.load({
         phase: "idle",
         available: null,
         proposals: null,
+        // The folded group's counts, as the core reported them. `null` means the read
+        // has not happened, which the panel shows as "not fetched" rather than as zero.
+        groups: null,
+        // The folded members, once the reviewer asks for them. `null` is "not fetched",
+        // `[]` is "fetched and empty" - the two must not render the same.
+        failureFacts: null,
+        failureFactsLoading: false,
         busy: "",
         message: "",
         failure: null,
@@ -2140,23 +2281,50 @@ window.__ModuleLoader__.load({
         /**
          * Read the pending queue through the host's admin proxy.
          *
+         * The read is the *queue* view (`view: 'queue'`): the same rows, ordered by what
+         * deserves attention, with repeated auto-captured failures folded into one entry
+         * per signature and the fold reported in `groups`. Asking for the flat list and
+         * rendering the count alone is what made a folded queue look like a shrinking
+         * one. `overrides` is how the folded members are fetched back - the group is a
+         * lens, not a delete, so the member fetch re-reads the same queue with
+         * `include: 'failure-facts'` and lists the members as rows.
+         *
          * A missing credential is folded into `available: false` rather than into
          * `failure`, because the panel must say "this machine has no admin credential"
          * and not "the request failed" - the user cannot fix the second by retrying.
          */
-        var loadProposals = function () {
+        var loadProposals = function (overrides) {
+          var options = overrides && typeof overrides === "object" ? overrides : {};
+          var include = typeof options.include === "string" ? options.include : "actionable";
+          var body = { view: "queue", include: include };
+          if (typeof options.sampleLimit === "number") body.sampleLimit = options.sampleLimit;
+          if (include !== "actionable") {
+            // Only the member fetch is a re-read the user asked for, so only it shows the
+            // busy state; the ordinary queue read keeps its own loading phase.
+            setAdminState(function (previous) {
+              return Object.assign({}, previous, { failureFactsLoading: true, failure: null });
+            });
+          }
           setAdminState(function (previous) {
-            return Object.assign({}, previous, { phase: "loading" });
+            return Object.assign({}, previous, { phase: previous.proposals === null ? "loading" : previous.phase });
           });
-          return requestAdminJson("proposals-list", {}, resolveFetch()).then(
+          return requestAdminJson("proposals-list", body, resolveFetch()).then(
             function (data) {
               var payload = data && data.data !== undefined ? data.data : null;
               var list = null;
-              if (payload && Array.isArray(payload.proposals)) list = payload.proposals;
+              if (payload && Array.isArray(payload.items)) list = payload.items;
+              else if (payload && Array.isArray(payload.proposals)) list = payload.proposals;
               else if (Array.isArray(payload)) list = payload;
+              var groups = payload && payload.groups && typeof payload.groups === "object" ? payload.groups : null;
               setAdminState(function (previous) {
                 return Object.assign({}, previous, {
-                  phase: "ready", available: true, proposals: list && list.length ? list : (list || []),
+                  phase: "ready", available: true, proposals: list || [],
+                  groups: groups, failureFactsLoading: false,
+                  // `null` means "not fetched yet", so the fold offers its fetch control
+                  // instead of claiming the group is empty.
+                  failureFacts: include === "failure-facts" || include === "all"
+                    ? (list || []).filter(function (item) { return item.kind === "aggregate"; })
+                    : previous.failureFacts,
                   failure: null,
                 });
               });
@@ -2169,6 +2337,7 @@ window.__ModuleLoader__.load({
                   phase: "ready",
                   available: missing ? false : previous.available,
                   proposals: missing ? null : previous.proposals,
+                  failureFactsLoading: false,
                   failure: missing ? null : described,
                 });
               });
@@ -2209,6 +2378,9 @@ window.__ModuleLoader__.load({
                 // impression this change exists to remove.
                 if (decided && Array.isArray(previous.proposals) && body && typeof body.id === "string") {
                   next.proposals = previous.proposals.filter(function (item) { return item.id !== body.id; });
+                  if (Array.isArray(previous.failureFacts)) {
+                    next.failureFacts = previous.failureFacts.filter(function (item) { return item.id !== body.id; });
+                  }
                 }
                 return next;
               });

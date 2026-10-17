@@ -242,6 +242,19 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
   assert.equal(preStep.messages[0].id, userMessage.id)
   assert.equal(state.requests.find((request) => request.path === '/v1/prepare').body.adapter, 'dsh')
 
+  // R5 W6-1: the second turn of the same session must tell the core which revision it
+  // already holds, so the core answers with the pointer instead of the whole normative
+  // text again. The first turn must send nothing — a version the session never received
+  // would make the core suppress norms it has not delivered yet.
+  const preparesBefore = state.requests.filter((request) => request.path === '/v1/prepare').length
+  await ctx.waterfall('agent/pre-step', {
+    agent, messages: [userMessage], turn: 2, step: 1, signal: new AbortController().signal,
+  }, async () => ({ kind: 'enter', messages: [userMessage] }))
+  const prepares = state.requests.filter((request) => request.path === '/v1/prepare')
+  assert.equal(prepares.length, preparesBefore + 1, '第二次 pre-step 应再次调用 prepare')
+  assert.equal(prepares[0].body.knowledgeRevision, undefined, '首次 prepare 不得携带版本')
+  assert.equal(prepares.at(-1).body.knowledgeRevision, 7, '第二次 prepare 必须带上会话已知版本')
+
   let delegated = false
   const execution = { name: 'ordinary_tool', agent, signal: new AbortController().signal }
   state.gateMode = 'deny'

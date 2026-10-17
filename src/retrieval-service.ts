@@ -7,12 +7,32 @@ import { selectRelevantKnowledge } from './semantic-retrieval.js';
 import { buildRetrievalIndex, positiveRetrievalClauses } from './retrieval-index.js';
 import { digestSchema } from './workflow-draft.js';
 
+/**
+ * The selection, with the path that produced it.
+ *
+ * `source` is deliberately absent: which path decided is already fully determined
+ * by `mode` and `reason` (`model` = the provider chose, `index` with a
+ * `local_index:` reason = the local ranking did, `exact_id` = a literal id), and a
+ * second field carrying the same fact would be one more thing to keep in step.
+ * `selectionSource()` derives it for the receipt.
+ */
+export type RetrievalSelection = { mode: 'model' | 'index' | 'lexical_fallback';
+  selectedIds: string[]; reason?: string };
+/** Which path produced `selection`, read off the fields that already state it. */
+export function selectionSource(selection: Pick<RetrievalSelection, 'mode' | 'reason'>)
+  : 'model' | 'index' | 'local_index' | undefined {
+  if(selection.mode==='model')return 'model';
+  if((selection.reason??'').startsWith('local_index:'))return 'local_index';
+  if(selection.mode==='index')return 'index';
+  return undefined;
+}
+
 /** Server-local cache; contains only relevance decisions, never provider credentials. */
 export function createRetrievalService(store: Store, dataDir: string) {
-  const cache=new Map<string,{at:number;result:Awaited<ReturnType<typeof selectRelevantKnowledge>>}>();
+  const cache=new Map<string,{at:number;result:RetrievalSelection}>();
   const indexes=new Map<string,{key:string;index:ReturnType<typeof buildRetrievalIndex>;candidates:Parameters<typeof buildRetrievalIndex>[0]}>();
-  const pending=new Map<string,Promise<Awaited<ReturnType<typeof selectRelevantKnowledge>>>>();
-  return async (projectId:string,query:string) => {
+  const pending=new Map<string,Promise<RetrievalSelection>>();
+  return async (projectId:string,query:string):Promise<RetrievalSelection> => {
     if(!query.trim())return {mode:'model' as const,selectedIds:[]};
     // A bare completion/status acknowledgement contains no new retrieval intent.
     if(/^(?:已|已经)(?:重启|重新启动|安装|更新|升级|保存|完成|恢复)(?:了)?\s*[a-z0-9_. -]{0,40}[。!！\s]*$/i.test(query.trim()))
@@ -22,7 +42,22 @@ export function createRetrievalService(store: Store, dataDir: string) {
     try { const file=join(dataDir,'model-review.json');stamp=statSync(file).mtimeMs;config=modelReviewConfigSchema.parse(JSON.parse(readFileSync(file,'utf8'))); }
     catch { config=undefined;stamp=0; }
     const revision=store.revision;
-    const scoped=store.scopedEntries(projectId).filter(e=>e.content.kind!=='norm');
+    /**
+     * Rules are candidates like every other entry.
+     *
+     * They used to be filtered out here, on the grounds that `norms()` already
+     * injects them in full and a retrieved copy would duplicate that context. The
+     * duplicate would have to be produced by the injection side, and it is not:
+     * `prepare()` reads rules only through `norms()` (`store.ts:1094`), while the
+     * retrieved entries are built by `knowledge()`, which returns nothing but
+     * skill/memory/preference/journal and skips every other kind (`store.ts:774`).
+     * Passing a rule id in `selectedIds` therefore adds it to neither `workflows`
+     * nor `knowledge` - asserted in `test/norm-searchable.test.ts:104`. Filtering
+     * here instead made the one kind that states rules the only kind that automatic
+     * retrieval and the model selector could never see, while the full-text path
+     * could return them: two answers to the same question inside one task.
+     */
+    const scoped=store.scopedEntries(projectId);
     const liveKey=scoped.map(e=>`${e.id}@${e.revision}`).sort().join('|');
     const digests=new Map<string,{revision:number;digest:{summary:string;whenToUse:string[];exclusions:string[];aliases:string[];versions:string[]}}>();
     for(const row of store.db.prepare("SELECT skill_id,result FROM workflow_drafts WHERE project_id=? AND result IS NOT NULL AND state!='stale' ORDER BY updated_at DESC").all(projectId)) {
@@ -93,7 +128,16 @@ export function createRetrievalService(store: Store, dataDir: string) {
       // was allowed to fall back. The reason string still carries the cause
       // (`model_timeout`, `busy`, `not_configured`), so a caller can always tell a
       // degraded local answer from a configured-model one.
-      selectedIds:reason==='not_configured'||reason==='model_timeout'||reason==='busy'?localIds:[],reason:`local_index:${reason}`});
+      //
+      // `model_abstained` belongs on this list for the same reason and not on the
+      // other side of the line: an unavailable provider is an availability answer
+      // (the caller is told the model could not speak), while a model that answered
+      // "nothing is relevant" has still left the local ranking in hand. Returning it
+      // is not a guess standing in for the model's judgement - the judgement was
+      // "none" - and without this the injection path received an empty selection and
+      // silently lost every hit the index had found.
+      selectedIds:reason==='not_configured'||reason==='model_timeout'||reason==='busy'||reason==='model_abstained'?localIds:[],
+      reason:`local_index:${reason}`});
     if(!config)return fallback('not_configured');
     if(pending.size>=2)return fallback('busy');
     // Small catalogs preserve a model opportunity for wholly novel paraphrases.
@@ -116,7 +160,7 @@ export function createRetrievalService(store: Store, dataDir: string) {
     // only a result produced inside the budget, before any abort, may be cached.
     const controller=new AbortController();
     let settled=false;
-    const modelBudget=new Promise<Awaited<ReturnType<typeof selectRelevantKnowledge>>>(resolve=>{
+    const modelBudget=new Promise<RetrievalSelection>(resolve=>{
       // `settled` is set before the abort on purpose: an abort-triggered rejection
       // is already queued when `abort()` returns, and that late handler must see
       // the budget verdict, not write itself into the cache.
@@ -129,8 +173,13 @@ export function createRetrievalService(store: Store, dataDir: string) {
         // neither a better answer nor a cacheable one, and it must not replace the
         // verdict already returned.
         if(settled)return fallback('model_timeout');
-        if(store.revision!==revision || store.scopedEntries(projectId).filter(e=>e.content.kind!=='norm').map(e=>`${e.id}@${e.revision}`).sort().join('|')!==liveKey)return {mode:'lexical_fallback' as const,selectedIds:[],reason:'knowledge_changed'};
-        const resolved=result.mode==='model'?result:fallback(result.reason??'unavailable');
+        if(store.revision!==revision || store.scopedEntries(projectId).map(e=>`${e.id}@${e.revision}`).sort().join('|')!==liveKey)return {mode:'lexical_fallback' as const,selectedIds:[],reason:'knowledge_changed'};
+        // A model that answered "nothing applies" has given a relevance verdict the
+        // caller must not lose the local ranking over; an unavailable or aborted
+        // provider keeps its own reason so the two stay distinguishable.
+        const resolved=result.mode==='model'&&result.selectedIds.length
+          ?result
+          :fallback(result.mode==='model'?'model_abstained':result.reason??'unavailable');
         cache.set(key,{at:Date.now(),result:resolved});if(cache.size>256)cache.delete(cache.keys().next().value!);
         return resolved;
       }),

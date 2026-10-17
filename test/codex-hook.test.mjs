@@ -603,3 +603,37 @@ test("F06: Codex hook 透传核心结构化错误（code + 业务 message），�
   assert.doesNotMatch(logText, new RegExp(TEST_TOKEN), "配置 token 严禁写入日志");
   assert.doesNotMatch(result.stdout + result.stderr, /c{40}/, "长 base64 串严禁回显到宿主输出");
 });
+
+test("prepare carries the revision the session already holds and sends nothing on a first turn", async () => {
+  // R5 W6-1. The core suppresses the repeated normative prose only when the caller says
+  // which revision it already has; without that field every turn re-sent the whole text.
+  // The value comes from the same session state the gate path below writes, so a session
+  // that has been through one tool call can dedup, while a brand-new session still sends
+  // nothing — a guessed version would make the core suppress norms it never delivered.
+  const service = await startServer((request, response) => {
+    if (request.url === "/v1/gate") {
+      return json(response, 200, { decision: "allow", reason: "", knowledgeRevision: 7, context: "gate context" });
+    }
+    if (request.url === "/v1/prepare") {
+      return json(response, 200, {
+        protocolVersion: 1, knowledgeRevision: 7, mode: "Managed", norms: [], workflows: [], context: "ctx",
+      });
+    }
+    return json(response, 404, { error: "not found" });
+  });
+  const config = await createConfig(service.endpoint);
+  const session = "dedup-session";
+
+  const first = await runHook({ hook_event_name: "UserPromptSubmit", session_id: session, prompt: "first" }, config);
+  assert.equal(first.status, 0, first.stderr);
+  const gate = await runHook({ hook_event_name: "PreToolUse", session_id: session, tool_name: "read", tool_input: {} }, config);
+  assert.equal(gate.status, 0, gate.stderr);
+  const second = await runHook({ hook_event_name: "UserPromptSubmit", session_id: session, prompt: "second" }, config);
+  assert.equal(second.status, 0, second.stderr);
+
+  const prepares = service.requests.filter((request) => request.url === "/v1/prepare");
+  assert.ok(prepares.length >= 2, `期望至少两次 prepare，实际 ${prepares.length}`);
+  assert.equal(Object.hasOwn(prepares[0].body, "knowledgeRevision"), false,
+    "首次 prepare 不得携带版本，否则核心会以为正文已经发过");
+  assert.equal(prepares.at(-1).body.knowledgeRevision, 7, "之后每次 prepare 都必须带上会话已知版本");
+});

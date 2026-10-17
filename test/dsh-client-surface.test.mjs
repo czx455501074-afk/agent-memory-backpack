@@ -214,6 +214,36 @@ function createFetchStub(routes) {
   return stub;
 }
 
+/**
+ * The same stub, plus the request bodies it was shown.
+ *
+ * The queue view is requested by *body*, not by URL: `view`, `include` and
+ * `sampleLimit` all travel in the POST payload. A stub that records only the URL
+ * therefore cannot tell the aggregated read from the old flat one, and a test written
+ * against it would pass whether or not the panel actually asked for the fold.
+ */
+function createFetchStubWithBody(routes) {
+  const calls = [];
+  const bodies = [];
+  const stub = async (url, init) => {
+    calls.push(String(url));
+    let parsed = null;
+    try { parsed = JSON.parse(String(init && init.body ? init.body : '{}')); } catch { parsed = null; }
+    bodies.push(parsed);
+    for (const route of routes) {
+      if (String(url).startsWith(route.match)) return route.respond(String(url));
+    }
+    return { ok: false, status: 404, statusText: 'Not Found', async text() { return 'no route'; } };
+  };
+  stub.calls = calls;
+  stub.bodies = bodies;
+  /** Every admin body sent to one action, in order. */
+  stub.adminBodies = action => bodies.filter((body, index) => (
+    body !== null && calls[index] === '/amb/admin/' + action
+  ));
+  return stub;
+}
+
 function findAll(tree, predicate, found = []) {
   if (tree === null || tree === undefined || typeof tree !== 'object') return found;
   if (Array.isArray(tree)) {
@@ -1003,6 +1033,164 @@ test('a candidate is identified by its own text, not by an id or a missing title
   findAll(tree, node => node.type === 'button' && node.props.className === 'amb-proposal-summary')[0].props.onClick();
   tree = await driver.settle(registrations[0].component);
   assert(textOf(tree).includes('这里是被折叠起来的补充细节'), '展开后必须显示全文');
+});
+
+/**
+ * The aggregated queue, as the panel sees it.
+ *
+ * The core derives this view on read: repeated auto-captured failures become one entry
+ * per signature, and the reply carries both the counts and the members. A panel that
+ * reads the flat list instead shows a queue that lost 66 rows and says nothing, which
+ * is indistinguishable from rows being deleted. These tests drive the real component
+ * through the real message table and assert on what is rendered.
+ */
+const FAILURE_QUEUE_FIXTURE = {
+  ok: true,
+  core: { reachable: true, endpoint: 'http://127.0.0.1:47631', projectId: 'p0' },
+  revision: 9,
+  counts: { knowledge: 12, pendingProposals: 316, outbox: { pending: 1, failed: 3, abandoned: 0 } },
+  knowledge: [],
+};
+
+const FOLDED_ACTION = {
+  id: 'feed0001-2345-6789-abcd-ef0123456789',
+  state: 'pending',
+  createdAt: Date.now() - 60 * 1000,
+  discovery: '只读命令的失败形态',
+  payload: {
+    projectId: 'p0',
+    discovery: '只读命令的失败形态',
+    classification: { kind: 'memory', scope: 'project', relation: 'new', confidence: 0.4, autoPromotable: true },
+  },
+};
+
+const FOLDED_GROUP = {
+  id: 'feed0009-2345-6789-abcd-ef0123456789',
+  kind: 'aggregate',
+  state: 'pending',
+  signature: 'Bash|exit=1|rg no such file',
+  tool: 'Bash',
+  occurrences: 67,
+  firstSeenAt: Date.now() - 6 * 3600 * 1000,
+  lastSeenAt: Date.now() - 120 * 1000,
+  createdAt: Date.now() - 120 * 1000,
+  discovery: 'Bash|exit=1|rg no such file',
+  memberIds: Array.from({ length: 67 }, (unused, index) => 'member-' + String(index).padStart(4, '0')),
+};
+
+const FOLDED_GROUPS = {
+  actionable: { count: 205 },
+  'failure-facts': { count: 45, occurrences: 67, collapsedDuplicates: 66, preview: [] },
+};
+
+test('the manage view reads the aggregated queue and shows the fold with its counts', async () => {
+  const fetchStub = createFetchStubWithBody([
+    { match: '/amb/summary', respond: () => jsonBody(FAILURE_QUEUE_FIXTURE) },
+    {
+      match: '/amb/admin/proposals-list',
+      respond: () => jsonBody({
+        ok: true, action: 'proposals-list',
+        data: { items: [FOLDED_ACTION], groups: FOLDED_GROUPS },
+      }),
+    },
+  ]);
+  const driver = createReactDriver();
+  const { registrations } = activate({ react: driver.api, fetch: fetchStub });
+  let tree = await driver.settle(registrations[0].component);
+  findButton(tree, '管理').props.onClick();
+  tree = await driver.settle(registrations[0].component);
+
+  // The aggregated read is asked for by body, not by URL: a stub that watches only the
+  // path cannot tell this read from the old flat one.
+  const first = fetchStub.adminBodies('proposals-list')[0] ?? {};
+  assert.equal(first.view, 'queue', '面板必须请求聚合视图，而不是扁平列表');
+  assert.equal(first.include, 'actionable', '默认切片必须是可操作条目');
+
+  const shown = textOf(tree);
+  assert(shown.includes('已折叠的重复失败事实'), '折叠必须有自己的区块标题');
+  assert(shown.includes('67'), '折叠区必须显示出现次数');
+  assert(shown.includes('45'), '折叠区必须显示折叠后的组数');
+  assert(shown.includes('66'), '折叠区必须显示被折叠掉的重复数');
+
+  // Fetching the members back is the other half of the semantics: the fold is a lens,
+  // and a group whose members cannot be listed is a deletion wearing a label.
+  assert(hasButton(tree, '展开查看'), '折叠区必须提供取回成员的入口');
+  findButton(tree, '展开查看').props.onClick();
+  tree = await driver.settle(registrations[0].component);
+  const second = fetchStub.adminBodies('proposals-list').slice(-1)[0] ?? {};
+  assert.equal(second.include, 'failure-facts', '取回成员必须显式请求折叠组');
+  assert.equal(fetchStub.adminBodies('proposals-list').length >= 2, true, '取回成员必须真的发出请求');
+});
+
+test('a folded group lists its members with signature, tool and time', async () => {
+  const fetchStub = createFetchStubWithBody([
+    { match: '/amb/summary', respond: () => jsonBody(FAILURE_QUEUE_FIXTURE) },
+    {
+      match: '/amb/admin/proposals-list',
+      respond: () => jsonBody({
+        ok: true, action: 'proposals-list',
+        data: { items: [FOLDED_GROUP], groups: FOLDED_GROUPS },
+      }),
+    },
+  ]);
+  const driver = createReactDriver();
+  const { registrations } = activate({ react: driver.api, fetch: fetchStub });
+  let tree = await driver.settle(registrations[0].component);
+  findButton(tree, '管理').props.onClick();
+  tree = await driver.settle(registrations[0].component);
+  findButton(tree, '展开查看').props.onClick();
+  tree = await driver.settle(registrations[0].component);
+
+  const shown = textOf(tree);
+  assert(shown.includes('Bash|exit=1|rg no such file'), '折叠成员必须显示签名');
+  assert(shown.includes('Bash'), '折叠成员必须显示工具');
+  assert(shown.includes('67 个成员'), '折叠成员必须显示成员总数');
+  assert(shown.includes('最近'), '折叠成员必须显示最近出现时间');
+  // A group is a lens on rows that are still there, so it carries no decision control.
+  assert.equal(hasButton(tree, '采纳'), false, '聚合组不得出现单条采纳按钮');
+});
+
+test('a candidate the classifier refused to auto-promote is not one-click', async () => {
+  const BLOCKED = {
+    id: 'feed0002-2345-6789-abcd-ef0123456789',
+    state: 'pending',
+    createdAt: Date.now() - 30 * 1000,
+    discovery: '证据等级不足的规范候选\n第二行细节',
+    payload: {
+      projectId: 'p0',
+      discovery: '证据等级不足的规范候选\n第二行细节',
+      classification: {
+        kind: 'norm', scope: 'project', relation: 'new', confidence: 0.8,
+        autoPromotable: false,
+        promotionBlockedReason: 'evidence=self-reported：证据等级不足，需人工显式确认类别与作用域',
+      },
+    },
+  };
+  const fetchStub = createFetchStubWithBody([
+    { match: '/amb/summary', respond: () => jsonBody(FAILURE_QUEUE_FIXTURE) },
+    { match: '/amb/admin/proposals-list', respond: () => jsonBody({ ok: true, action: 'proposals-list', data: { items: [BLOCKED] } }) },
+  ]);
+  const driver = createReactDriver();
+  const { registrations } = activate({ react: driver.api, fetch: fetchStub });
+  let tree = await driver.settle(registrations[0].component);
+  findButton(tree, '管理').props.onClick();
+  tree = await driver.settle(registrations[0].component);
+
+  const shown = textOf(tree);
+  assert(shown.includes('evidence=self-reported'), '拒绝理由必须原样呈现，不能只说「不能采纳」');
+  assert.equal(hasButton(tree, '采纳为规范 · 项目'), false, '被拦下的候选不得假装可以一键采纳');
+  // The label comes from the message table, whose copy carries a leading space (the
+  // panel's own literal gate rejects a CJK-initial literal outside the table), so the
+  // match is on the trimmed text rather than on an exact string.
+  const manual = findAll(tree, node => node.type === 'button' && textOf(node).trim() === '选定类别与作用域后采纳')[0];
+  assert(manual, '被拦下的候选必须退回人工选定类别与作用域的路径');
+
+  // Clicking never writes: it opens the compose form that decides kind and scope.
+  manual.props.onClick();
+  tree = await driver.settle(registrations[0].component);
+  assert(hasButton(tree, '确认采纳'), '被拦下的候选必须进入既有的人工表单');
+  assert.equal(fetchStub.calls.some(url => url.includes('/amb/admin/proposal-approve')), false,
+    '被拦下的候选不得发出采纳请求');
 });
 test('interactive controls show where the keyboard is', () => {
   // A tab order already exists - every control in this panel is a real button, input or

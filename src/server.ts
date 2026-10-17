@@ -10,7 +10,7 @@ import { capabilityManifest, operatingModeFromDisk } from './capabilities.js';
 import { UI_CSS, UI_HTML, UI_JS } from './ui.js';
 import { maintenanceStatus, initializeMaintenance } from './maintenance.js';
 import { enqueueWorkflowDraft, listWorkflowDrafts, readWorkflowDraft, approveWorkflowDraft, reviseWorkflowDraft } from './workflow-organization.js';
-import { createRetrievalService } from './retrieval-service.js';
+import { createRetrievalService, selectionSource } from './retrieval-service.js';
 import { relevantPassages } from './retrieval-excerpt.js';
 
 /**
@@ -89,6 +89,11 @@ const ADMIN_ONLY = new Set([
   '/v1/maintenance/retry',
   '/v1/workflow-drafts/list', '/v1/workflow-drafts/get', '/v1/workflow-drafts/generate', '/v1/workflow-drafts/approve',
   '/v1/workflow-drafts/revise',
+  // Widening a task-scoped entry to the whole project changes what every later
+  // session reads, which the design reserves for the user. Convergence and the
+  // per-task archive stay open to an adapter on purpose: they write only inside the
+  // task they concern, and the "session ended" rule needs a caller to run it.
+  '/v1/tasks/promote',
 ]);
 
 /**
@@ -214,9 +219,40 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         case '/v1/prepare': {
           const p = contextSchema.parse(body);
           const selection=await selectKnowledge(p.projectId,p.query);
+          /**
+           * An empty selection is two different facts, and the receipt must not merge them.
+           *
+           * `retrieval-service` answers with an empty `selectedIds` on several paths and
+           * only some of them mean "nothing was asked":
+           *
+           *   - an empty query, `status_without_task` (a bare completion/status
+           *     acknowledgement) and `no_positive_task` (a purely negative request, e.g.
+           *     "不要 Postgres restore") never consulted the library at all;
+           *   - `revision_mismatch`, a `local_index:*` verdict with no local hit, and
+           *     `knowledge_changed` did consult it and either refused to widen the
+           *     search or found nothing, which is a real coverage answer.
+           *
+           * Only the first group is reported as "no search was made". The distinction is
+           * forwarded explicitly rather than inferred downstream, because the receipt's
+           * `gaps` asserts "the library has no such fragment" — something the first group
+           * cannot support, and the one claim a later investigation reads most literally.
+           */
+          const noRetrievalIntent = selection.selectedIds.length === 0
+            && (!p.query.trim() || selection.reason === 'status_without_task' || selection.reason === 'no_positive_task');
           const prepared = store.prepare(p.projectId, p.query, {
             sessionId: p.sessionId, taskId: p.taskId, platform: p.adapter,
+            ...(noRetrievalIntent ? { noRetrievalIntent: true } : {}),
+            // The revision the caller already holds travels through, so a repeat call at the
+            // same revision gets the pointer instead of the whole normative text again. It is
+            // forwarded only when present: an absent version must still mean "send everything",
+            // which is what a session's first turn needs.
+            ...(p.knowledgeRevision !== undefined ? { knownRevision: p.knowledgeRevision } : {}),
             ...(selection.mode==='model'||selection.mode==='index'||selection.reason!=='not_configured'?{selectedIds:selection.selectedIds}:{}),
+            // Which path made the choice travels with it, so the receipt can say
+            // whether a model picked this entry or the local index did. Read off the
+            // selection's own fields rather than carried as a second copy that could
+            // drift out of step with them.
+            ...(selectionSource(selection)?{selectionSource:selectionSource(selection)}:{}),
           });
           // Organize the skill currently being used, asynchronously and once per source version.
           const selected=prepared.knowledge.find(item=>item.kind==='skill');
@@ -293,7 +329,38 @@ export function createCoreServer(store: Store, config: CoreConfig) {
               : '只清除了已送达或已放弃的条目；未送达条目仍在队列中。',
           });
         }
-        case '/v1/proposals/list': { const p = z.object({ projectId: z.string(), state: z.string().optional() }).parse(body); return reply(res, 200, { proposals: store.listProposals(p.projectId, p.state) }); }
+        /**
+         * The queue, in two views off the same rows.
+         *
+         * `flat` is the original reply and stays the default: one record per stored
+         * row, newest first, which is what the console and the CLI already parse.
+         * Changing that shape without a migration of its consumers would have made
+         * this endpoint's callers depend on a review feature they never asked for.
+         *
+         * `queue` is the review view: same rows, ordered by what deserves attention,
+         * with repeated auto-captured failures folded into one entry per signature.
+         * It is derived on read — the endpoint writes nothing, so a caller can switch
+         * between the two views and the batch actions below still act on the exact ids
+         * the aggregate reported.
+         *
+         * `include` decides which slice is returned. The slice *not* returned is still
+         * described in `groups`, so narrowing the reply never hides that the folded
+         * group exists.
+         */
+        case '/v1/proposals/list': {
+          const p = z.object({
+            projectId: z.string(),
+            state: z.string().optional(),
+            view: z.enum(['flat', 'queue']).default('flat'),
+            include: z.enum(['actionable', 'failure-facts', 'all']).default('actionable'),
+            sampleLimit: z.number().int().min(1).max(20).default(3),
+            limit: z.number().int().positive().max(500).optional(),
+          }).parse(body);
+          if (p.view === 'flat') return reply(res, 200, { proposals: store.listProposals(p.projectId, p.state) });
+          return reply(res, 200, store.queueProposals(p.projectId, {
+            state: p.state, include: p.include, sampleLimit: p.sampleLimit, limit: p.limit,
+          }));
+        }
         /**
          * One candidate, for the review page's approval form.
          *
@@ -460,8 +527,29 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           // this irrelevant" - those are different facts and lead to different fixes.
           const modelAbstained=(selection.mode==='model'||selection.mode==='index')&&selection.selectedIds.length===0;
           const effective=modelAbstained?{...selection,mode:'lexical_fallback' as const,reason:`model_abstained:${selection.reason??'no_selection'}`}:selection;
-          const results=p.kind==='norm'?store.searchUniversal(p.projectId,p.query,p.kind,p.limit):effective.mode==='model'||effective.mode==='index'||(p.autoRecall&&effective.reason!=='not_configured')?effective.selectedIds.flatMap(id=>catalog.filter(e=>e.id===id)).slice(0,p.limit??(p.autoRecall?3:100))
-            :p.autoRecall?store.autoRecall(p.projectId,p.query,p.kind,p.limit):store.searchUniversal(p.projectId,p.query,p.kind,p.limit);
+          const bySelection=effective.selectedIds.flatMap(id=>catalog.filter(entry=>entry.id===id)).slice(0,p.limit??(p.autoRecall?3:100));
+          /**
+           * One degradation rule for both branches of this endpoint.
+           *
+           * `autoRecall` decides how wide the local answer is, never whether there is
+           * one. Measured before this change: a query on which the model abstained
+           * returned an empty set with `autoRecall: true` and hits without it, so one
+           * endpoint answered the same question two ways. A local verdict that the
+           * index actually made - `mode: 'index'` - is still respected as it stands,
+           * including an empty one: the stale-revision guard and "the model could not
+           * speak" must not be softened into a broader search. Only an *undecided*
+           * selection (the model said "nothing applies", the query asked for literal
+           * text, the knowledge changed under it) is answered from the full-text
+           * ranking.
+           */
+          // `decided` reads the *original* selection, not the rewritten `effective`:
+          // an unavailable provider is rewritten to `lexical_fallback`, and treating
+          // that as undecided would answer with a local guess exactly where
+          // `retrieval-service` documents availability and relevance as different
+          // claims.
+          const decided=selection.mode==='model'||selection.mode==='index';
+          const results=p.kind==='norm'?store.searchUniversal(p.projectId,p.query,p.kind,p.limit)
+            :decided?bySelection:store.searchUniversal(p.projectId,p.query,p.kind,p.limit??(p.autoRecall?3:100));
           return reply(res,200,{results,selection:effective,knowledgeRevision:store.revision});
         }
         case '/v1/knowledge/get': {
@@ -631,6 +719,53 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         case '/v1/tasks/record': { const p = z.object({ projectId: z.string(), task: taskSchema }).parse(body); return reply(res, 200, store.recordTask(p.projectId, p.task)); }
         case '/v1/tasks/list': { const p = z.object({ projectId: z.string(), status: taskStatus.optional() }).parse(body); return reply(res, 200, { tasks: store.tasks(p.projectId, p.status) }); }
         case '/v1/tasks/handoff': { const p = z.object({ projectId: z.string(), taskId: z.string() }).parse(body); return reply(res, 200, store.handoff(p.taskId, p.projectId)); }
+        /**
+         * Run the session-end rule: converge stalled tasks, archive their diaries.
+         *
+         * One call because the two halves are one decision — a task with no recorded
+         * activity is either still inside the idle window or it is not. The envelope
+         * pins `projectId` to the credential's own project, so an adapter converges its
+         * own project and nothing else; the core's timer is what runs the unscoped form
+         * across all of them. `dryRun` exists so the rule can be shown to a user before
+         * it is applied to a library.
+         */
+        case '/v1/tasks/converge': {
+          const p = z.object({ projectId: z.string(), dryRun: z.boolean().default(false) }).parse(body);
+          return reply(res, 200, {
+            ...store.convergeTasks(p.projectId, { dryRun: p.dryRun }),
+            note: p.dryRun
+              ? '仅预演：只报告若执行会改变什么，未写入状态或条目。'
+              : '已按阈值收敛：无进展的任务置为 paused 并写明原因，超过归档时长的任务把日记存进 task 作用域。'
+                + '两者都是保留式处理：不删除内容，也不会自动标记 completed（完成需要核实依据）。',
+          });
+        }
+        /**
+         * File one task's diary under its own task scope.
+         *
+         * The single-task form of the archive inside `/v1/tasks/converge`, for a host
+         * that knows a session just ended and does not want to wait for the timer.
+         * Idempotent, so a host may call it on every stop.
+         */
+        case '/v1/tasks/archive': {
+          const p = z.object({ projectId: z.string(), taskId: z.string().min(1).max(120) }).parse(body);
+          return reply(res, 200, {
+            ...store.archiveTaskScope(p.projectId, p.taskId),
+            note: '本会话事实已归档为 task 作用域条目，可在任务活动里查到；它不是完成声明，也不改变任务状态。',
+          });
+        }
+        /**
+         * Widen a task-scoped entry to the project.
+         *
+         * Admin-only by the set above: this is the point at which "这一次" becomes a
+         * rule for later work, and the design reserves that decision for the user.
+         */
+        case '/v1/tasks/promote': {
+          const p = z.object({ projectId: z.string(), knowledgeId: z.string().min(1).max(120) }).parse(body);
+          return reply(res, 200, {
+            ...store.promoteTaskScope(p.projectId, p.knowledgeId),
+            note: '已提升为项目作用域：该项目以后的会话都能读到它；原来的任务作用域修订仍留在历史里。',
+          });
+        }
         /**
          * Compare a checkout's file states against what a task recorded.
          *

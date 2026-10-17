@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { Store } from '../src/store.js';
+import { createCoreServer } from '../src/server.js';
 import { type KnowledgeDraft } from '../src/schema.js';
 
 /**
@@ -108,4 +110,71 @@ test('已拒收的候选保留 90 天供查阅，之后正文失效但状态留�
     assert.equal(after.length, 1, '记录本身仍在');
     assert.equal(JSON.stringify(after[0]!.payload), '{}', '正文已失效');
   } finally { s.close(); }
+});
+
+/**
+ * An empty selection has two causes and they must not read alike.
+ *
+ * `retrieval-service` answers `selectedIds: []` both when nothing was asked (an empty
+ * query, a status acknowledgement, a purely negative request) and when a real search
+ * found nothing or refused to widen itself. `gaps` asserts "the library has no such
+ * fragment", so reporting the first case as a list of gaps invents a search result: the
+ * whole query is listed as a coverage miss at the moment no search was made, and that is
+ * the signal a later investigation reads most literally.
+ *
+ * The receipt is not reshaped to say so. A new field on the selection object would break
+ * the field-by-field comparisons in `retrieval-service.test.ts` (which assert the whole
+ * object, e.g. `{ mode: 'lexical_fallback', selectedIds: [], reason: 'knowledge_changed' }`),
+ * and the fact worth stating already has a place to be stated: `gaps` and `note`. The flag
+ * therefore travels from `/v1/prepare` into `prepare()` and changes those two fields on
+ * this branch only, leaving the receipt's shape — and every existing comparison — intact.
+ */
+test('没有检索意图的查询不报告覆盖缺口，真实检索无命中仍如实报缺口', async () => {
+  const token = 'w'.repeat(64);
+  const s = new Store(':memory:');
+  s.import([
+    { id: 'k-pg', kind: 'memory', title: 'Postgres 恢复', scope: { kind: 'global' }, baseRevision: 0,
+      body: 'Postgres 恢复失败时先检查权限，再重建 schema。' },
+  ] as KnowledgeDraft[]);
+  const server = createCoreServer(s, { protocolVersion: 1, port: 47631,
+    clients: [{ id: 'dsh', token, projectId: 'p', role: 'adapter' }] });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const post = async (query: string) => {
+    const res = await fetch(`http://127.0.0.1:${address.port}/v1/prepare`, { method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'x-amb-protocol': '1' },
+      body: JSON.stringify({ projectId: 'p', adapter: 'dsh', query }) });
+    assert.equal(res.status, 200, await res.clone().text());
+    return await res.json() as Record<string, any>;
+  };
+  try {
+    for (const query of ['不要 Postgres 恢复', '好的', '']) {
+      const prepared = await post(query);
+      assert.deepEqual(prepared.retrieval.selection.selectedIds, [], `${query || '(空查询)'}：本次没有做选择`);
+      assert.equal(prepared.retrieval.selection.reason, query === '' ? undefined : 'no_positive_task',
+        '回执仍如实说明为什么没有选择');
+      assert.deepEqual(prepared.retrieval.gaps, [], `${query || '(空查询)'}：没有检索过的查询不是覆盖缺口`);
+      assert.match(prepared.retrieval.note, /没有检索意图|未做选择/, '必须说明本次未做选择');
+    }
+    const negative = await post('不要 Postgres 恢复');
+    assert.ok(negative.retrieval.tokens.length > 0, '否定式查询仍分出了片段，只是没有检索意图');
+    assert.deepEqual(negative.retrieval.matchedTokens, [], '没有做过选择，就没有任何命中的片段');
+
+    // The contrast that makes the change meaningful: the same empty selection on a path
+    // that really did search still reports every unmatched fragment as a gap.
+    const searched = s.prepare('p', 'Postgres 恢复', { selectedIds: [] });
+    assert.ok(searched.retrieval.tokens.length > 0);
+    assert.deepEqual(searched.retrieval.gaps.length, searched.retrieval.tokens.length,
+      '缺少“无检索意图”标志时，空选择仍然表示检索后未命中，全部片段列为缺口');
+
+    // The shape is unchanged: only the content of `gaps` and `note` differs.
+    const untouched = await post('Postgres 恢复');
+    assert.deepEqual(Object.keys(untouched.retrieval).filter(key => key !== 'selection').sort(),
+      Object.keys(searched.retrieval).sort(), '回执字段集合不变，未新增必填字段');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(done => server.close(() => done()));
+    s.close();
+  }
 });

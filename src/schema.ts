@@ -283,6 +283,17 @@ export const outboxEntrySchema = z.object({
 export const contextSchema = z.object({
   adapter: z.enum(['codex', 'dsh']).optional(), projectId: identifier,
   taskId: identifier.optional(), sessionId: z.string().min(1).max(256).optional(), query: z.string().max(4000).default(''),
+  /**
+   * The revision the caller already holds, for the same-version pointer on the
+   * *prepare* path.
+   *
+   * `gateSchema` has carried this since the decision list was fixed, and `store.prepare`
+   * has read `knownRevision` for just as long, but no caller could send it here: the
+   * schema rejected the field, so every turn re-injected the whole normative text
+   * (594 characters on this machine, linear in the number of norms). Optional and
+   * `.strict()` is kept intact, so an unknown field is still a 400.
+   */
+  knowledgeRevision: z.number().int().nonnegative().optional(),
 }).strict();
 export const gateSchema = z.object({
   adapter: z.enum(['codex', 'dsh']).optional(), projectId: identifier,

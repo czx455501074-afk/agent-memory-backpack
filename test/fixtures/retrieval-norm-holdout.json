@@ -1,0 +1,105 @@
+{
+  "note": "含规范的检索语料。既有语料只有 skill/memory（retrieval-quality-holdout.json、retrieval-blind-v1.json），规范这一类的召回从来没有被测量过，而这正是'库里有、查不到'影响最大的类型。既有语料不改，本文件只新增。",
+  "documents": [
+    {
+      "id": "norm:package-gate",
+      "kind": "norm",
+      "title": "发布脚本全量语法门禁",
+      "body": "打包发布脚本 scripts/package.mjs 必须包含 node --check 全量语法扫描，防止语法错误的脚本逃逸到安装目录。"
+    },
+    {
+      "id": "norm:log-window",
+      "kind": "norm",
+      "title": "日志窗口可比性规范",
+      "body": "比对日志计数验证修复效果前必须先证明两窗口可比：对齐事件类型集合、用比率而非绝对数、核对时间分布而不是总数。"
+    },
+    {
+      "id": "norm:timeout-verdict",
+      "kind": "norm",
+      "title": "超时预算判定规范",
+      "body": "判断超时预算是否生效必须核对返回的 selection.mode 字段与 reason，不能仅凭总耗时推断；注意下游同步逻辑的未受控开销。"
+    },
+    {
+      "id": "norm:bulk-a",
+      "kind": "norm",
+      "title": "批量规范甲",
+      "body": "批量规范甲：处理流程甲必须逐条核对输入清单并记录处理结果，任何跳过记录的做法都算未完成。",
+      "repeat": 170
+    },
+    {
+      "id": "norm:bulk-b",
+      "kind": "norm",
+      "title": "批量规范乙",
+      "body": "批量规范乙：处理流程乙必须逐条核对输出清单并记录处理结果，任何跳过记录的做法都算未完成。",
+      "repeat": 170
+    },
+    {
+      "id": "norm:bulk-c",
+      "kind": "norm",
+      "title": "批量规范丙",
+      "body": "批量规范丙：处理流程丙必须逐条核对差异清单并记录处理结果，任何跳过记录的做法都算未完成。",
+      "repeat": 170
+    },
+    {
+      "id": "norm:bulk-d",
+      "kind": "norm",
+      "title": "批量规范丁",
+      "body": "批量规范丁：处理流程丁必须逐条核对遗留清单并记录处理结果，任何跳过记录的做法都算未完成。",
+      "repeat": 170
+    },
+    {
+      "id": "memory:color",
+      "kind": "memory",
+      "title": "颜色校正参数",
+      "body": "色彩空间与查找表设置，和构建流程无关。"
+    },
+    {
+      "id": "journal:long-diary",
+      "kind": "journal",
+      "title": "十月十七日工作记录",
+      "body": "2026-10-17 工作记录。打包脚本必须包含全量语法扫描，依赖安装顺序也要核对。今天还处理了无关的界面调整与会议记录。",
+      "repeat": 60
+    }
+  ],
+  "cases": [
+    {
+      "id": "norm-verbatim-1",
+      "dimension": "准原文规范查询",
+      "query": "打包脚本必须包含全量语法扫描",
+      "expectSelected": ["norm:package-gate"]
+    },
+    {
+      "id": "norm-verbatim-2",
+      "dimension": "准原文规范查询",
+      "query": "比对日志计数验证修复效果前必须先证明两窗口可比",
+      "expectSelected": ["norm:log-window"]
+    },
+    {
+      "id": "norm-verbatim-3",
+      "dimension": "准原文规范查询",
+      "query": "超时预算是否生效必须核对 selection.mode 与 reason",
+      "expectSelected": ["norm:timeout-verdict"]
+    },
+    {
+      "id": "norm-omitted-1",
+      "dimension": "超预算省略后仍可检索",
+      "query": "处理流程丙必须逐条核对差异清单",
+      "expectSelected": ["norm:bulk-c"],
+      "expectOmitted": ["norm:bulk-c"]
+    },
+    {
+      "id": "norm-omitted-2",
+      "dimension": "超预算省略后仍可检索",
+      "query": "处理流程丁必须逐条核对遗留清单",
+      "expectSelected": ["norm:bulk-d"],
+      "expectOmitted": ["norm:bulk-d"]
+    },
+    {
+      "id": "norm-gap-1",
+      "dimension": "规范命中不得计为缺口",
+      "query": "打包脚本必须包含全量语法扫描",
+      "expectSelected": ["norm:package-gate"],
+      "expectNotGap": ["打包", "脚本", "包含", "全量", "语法", "扫描"]
+    }
+  ]
+}
