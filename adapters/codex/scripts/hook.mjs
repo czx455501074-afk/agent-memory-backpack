@@ -134,8 +134,20 @@ function loadConfig(config, configPath) {
     token: config.token,
     projectId: config.projectId.trim(),
     projectRoot: config.projectRoot,
-    autoCaptureFailures: config.autoCaptureFailures !== false,
-    autoCaptureMaterial: config.autoCaptureMaterial !== false,
+    // Opt-in, not opt-out. These used to read `!== false`, so an absent setting meant "capture
+    // everything": every non-zero exit and every fetched page became a candidate without anyone
+    // deciding it should. Measured on a real library: 435 pending candidates, 142 of them
+    // auto-captured failure facts carrying no reusable judgement, and the queue growing about
+    // 20 per 20 minutes - including entries produced by an agent forgetting to read a file
+    // before editing it.
+    //
+    // Whether a failure is worth keeping is a judgement, and a hook triggered by an exit code
+    // cannot make it. The agent that actually hit the failure can, and it already has a channel
+    // for that: amb_submit_experience. Capture remains available - anyone wanting a raw failure
+    // log can set these to true - but the default becomes that nothing is submitted without a
+    // decision.
+    autoCaptureFailures: config.autoCaptureFailures === true,
+    autoCaptureMaterial: config.autoCaptureMaterial === true,
     // The credential's directory is where the shared database lives, which the
     // core needs when it has to be started.
     dataDir: dirname(configPath),

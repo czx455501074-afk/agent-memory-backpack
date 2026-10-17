@@ -101,7 +101,13 @@ export function failureCandidate({ adapter, projectId, sessionId, tool, result, 
 }
 
 export async function captureFailure(options, { config, client, logger }) {
-  if (config.autoCaptureFailures === false) return null
+  // Opt-in. This used to skip only on an explicit `false`, which meant an adapter that never
+  // set the field - the dsh adapter does not - captured every non-zero exit by default. Whether
+  // a failure deserves to become a candidate is a judgement; the agent that hit it can make
+  // that judgement and already has amb_submit_experience for it. A hook triggered by an exit
+  // code cannot, and the result is measurable: 142 of 435 pending candidates were captured
+  // failure facts with no reusable conclusion, produced faster than anyone could review them.
+  if (config.autoCaptureFailures !== true) return null
   const candidate = failureCandidate({ ...options, projectId: config.projectId, secret: config.token })
   if (!candidate) return null
   const fields = { adapter: options.adapter, sessionId: options.sessionId, tool: options.tool, key: candidate.idempotencyKey }

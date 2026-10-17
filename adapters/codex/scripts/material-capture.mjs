@@ -26,7 +26,10 @@ function enqueueMaterial(config, payload) {
 }
 
 export async function replayMaterials({ config, client, logger }) {
-  if (config.autoCaptureMaterial === false) return { replayed: 0, remaining: queuedFiles(config).length }
+  // Opt-in, same reason as failure capture: an absent setting used to mean "capture", so every
+  // adapter that never configured the field submitted by default. Deciding that a page is worth
+  // keeping is a judgement, and the agent that fetched it can make it.
+  if (config.autoCaptureMaterial !== true) return { replayed: 0, remaining: queuedFiles(config).length }
   let replayed = 0
   for (const file of queuedFiles(config).slice(0, 5)) {
     try {
@@ -101,7 +104,7 @@ export function materialCandidates({ projectId, sessionId, tool, result, taskId,
 }
 
 export async function captureMaterial(options, { config, client, logger }) {
-  if (config.autoCaptureMaterial === false) return []
+  if (config.autoCaptureMaterial !== true) return []
   await replayMaterials({ config, client, logger })
   const candidates = materialCandidates({ ...options, projectId: config.projectId, secret: config.token })
   const receipts = []
