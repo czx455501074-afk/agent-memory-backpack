@@ -913,6 +913,63 @@ test('approving a candidate asks what the text should become before anything is 
   assert(findButton(tree, '采纳'), '取消后必须回到可再次采纳的状态');
 });
 
+test('a classified candidate is approved in one click, and the queue drops it', async () => {
+  // The plugin classifies every candidate on submission. Asking the reviewer to
+  // restate that made the ordinary case a two-step form, and the second step was the
+  // one people missed - which looked like "approve did nothing" and left the row in
+  // the queue. So: one click, the button says what it will become, and the row goes.
+  const CANDIDATE = {
+    id: 'feed0001-2345-6789-abcd-ef0123456789',
+    state: 'pending',
+    createdAt: Date.now() - 60 * 1000,
+    payload: {
+      projectId: 'p0',
+      discovery: '只读命令也要探测真实的失败形态\n第二行是不可省略的细节',
+      classification: { kind: 'norm', scope: 'project', relation: 'new', confidence: 0.74 },
+    },
+  };
+  let listCount = 0;
+  const fetchStub = createFetchStub([
+    { match: '/amb/summary', respond: () => jsonBody(GROUPED_FIXTURE) },
+    {
+      match: '/amb/admin/proposals-list',
+      respond: () => {
+        listCount += 1;
+        // First read offers the candidate; after the decision the core no longer
+        // reports it, so the re-read must come back empty.
+        return jsonBody({
+          ok: true,
+          action: 'proposals-list',
+          data: { proposals: listCount === 1 ? [CANDIDATE] : [] },
+        });
+      },
+    },
+    { match: '/amb/admin/proposal-approve', respond: () => jsonBody({ ok: true, action: 'proposal-approve', data: { revision: 7 } }) },
+  ]);
+  const driver = createReactDriver();
+  const { registrations } = activate({ react: driver.api, fetch: fetchStub });
+  let tree = await driver.settle(registrations[0].component);
+  findButton(tree, '管理').props.onClick();
+  tree = await driver.settle(registrations[0].component);
+
+  // The button names the shape, so the click is informed without a second step.
+  const approve = findButton(tree, '采纳为规范 · 项目');
+  assert(approve, '有分类时按钮必须写明将要写入的形态');
+  assert.equal(hasButton(tree, '确认采纳'), false, '一键路径不得先展开表单');
+  assert.equal(findAll(tree, node => node.type === 'select').length, 0, '一键路径不得要求选择类别');
+  // The correction path stays reachable, just not in the way.
+  assert(hasButton(tree, '类别不对？改一下'), '必须保留改类别的入口');
+
+  approve.props.onClick();
+  tree = await driver.settle(registrations[0].component);
+
+  assert(fetchStub.calls.some(url => url.includes('/amb/admin/proposal-approve')),
+    `点击采纳必须真的提交：${fetchStub.calls.join(', ')}`);
+  assert.equal(findAll(tree, node => textOf(node).includes('只读命令也要探测真实的失败形态')).length, 0,
+    '采纳后该候选必须从待审列表消失');
+  assert.equal(listCount >= 2, true, '决定之后必须重新读取队列，而不是相信本地状态');
+});
+
 test('a candidate is identified by its own text, not by an id or a missing title', async () => {
   // Regression: this row used to render `proposal.title`, a field candidates do not
   // have, so every row showed only a badge and three buttons - a reviewer had nothing

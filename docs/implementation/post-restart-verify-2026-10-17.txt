@@ -6,48 +6,48 @@ Timestamp (Asia/Shanghai): 2026-10-17 13:21:00 +08:00
 Id              : 5164
 StartTime       : 2026/10/17 12:46:24
 MainWindowTitle : 
-Path            : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id              : 9484
 StartTime       : 2026/10/17 13:20:26
 MainWindowTitle : 
-Path            : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id              : 18148
 StartTime       : 2026/10/17 12:46:24
 MainWindowTitle : 
-Path            : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id              : 20792
 StartTime       : 2026/10/17 12:46:26
 MainWindowTitle : 
-Path            : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id              : 21872
 StartTime       : 2026/10/17 12:46:24
 MainWindowTitle : 
-Path            : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id              : 24876
 StartTime       : 2026/10/17 12:46:26
 MainWindowTitle : 
-Path            : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id              : 25200
 StartTime       : 2026/10/17 12:46:24
 MainWindowTitle : 
-Path            : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id              : 29760
 StartTime       : 2026/10/17 12:46:23
 MainWindowTitle : AMB 1.0 与 GitHub 发布 — DeepSeek Harness
-Path            : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path            : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 
 === Termination check (remaining processes after Stop-Process) ===
 None
 === Restart action ===
-Official executable: C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Official executable: <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 Launch time: 2026-10-17 13:20:38 +08:00
 
 === After restart: DeepSeek Harness processes ===
@@ -56,43 +56,43 @@ Id               : 5964
 StartTime        : 2026/10/17 13:20:41
 MainWindowHandle : 0
 MainWindowTitle  : 
-Path             : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id               : 7728
 StartTime        : 2026/10/17 13:20:41
 MainWindowHandle : 0
 MainWindowTitle  : 
-Path             : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id               : 13604
 StartTime        : 2026/10/17 13:20:45
 MainWindowHandle : 0
 MainWindowTitle  : 
-Path             : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id               : 21960
 StartTime        : 2026/10/17 13:20:42
 MainWindowHandle : 0
 MainWindowTitle  : 
-Path             : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id               : 26532
 StartTime        : 2026/10/17 13:20:41
 MainWindowHandle : 4983330
 MainWindowTitle  : AMB 1.0 与 GitHub 发布 — DeepSeek Harness
-Path             : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id               : 27256
 StartTime        : 2026/10/17 13:20:41
 MainWindowHandle : 0
 MainWindowTitle  : 
-Path             : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 Id               : 30960
 StartTime        : 2026/10/17 13:20:45
 MainWindowHandle : 0
 MainWindowTitle  : 
-Path             : C:\Users\czx\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe
+Path             : <USER_HOME>/AppData/… Harness\DeepSeek Harness.exe
 
 
 === node scripts/amb-admin-verify.mjs (complete output) ===

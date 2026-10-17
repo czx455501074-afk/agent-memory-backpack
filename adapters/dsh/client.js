@@ -244,6 +244,13 @@ window.__ModuleLoader__.load({
       "manage.hoursAgo": " 小时前",
       "manage.daysAgo": " 天前",
       "manage.approve": "采纳",
+      // The primary button names the shape the entry will take, so one click is still
+      // an informed click: the plugin decided the shape, the reviewer decides worth.
+      "manage.approveAs": "采纳为",
+      "manage.kindMismatch": "类别不对？改一下",
+      "manage.scopeKind.project": "项目",
+      "manage.scopeKind.task": "本次任务",
+      "manage.scopeKind.global": "全局",
       "manage.reject": "拒绝",
       "manage.archive": "归档",
       "manage.confirm": "此操作会改变有效知识库，确认执行？",
@@ -335,6 +342,35 @@ window.__ModuleLoader__.load({
       var payload = proposal.payload;
       if (payload && typeof payload.discovery === "string") return payload.discovery;
       return "";
+    }
+
+    /**
+     * The shape a candidate would take if it were approved as-is.
+     *
+     * The submission path already classifies every candidate (kind, scope, relation,
+     * confidence, reasoning), and that classification is what the review gate uses.
+     * Asking the reviewer to restate it was duplicate work for a decision the system
+     * had made, and the restatement step was easy to miss - which made an approved
+     * candidate look unapproved. So the panel reads the classification instead:
+     *
+     *   - `auto: true` means one click is enough, and the button says what it will
+     *     become, so the click is still an informed one.
+     *   - `auto: false` means the plugin will not answer alone (global scope, or no
+     *     classification at all) and the panel must ask.
+     */
+    function proposedShape(proposal) {
+      var payload = proposal && proposal.payload ? proposal.payload : null;
+      var classification = payload && payload.classification && typeof payload.classification === "object"
+        ? payload.classification : null;
+      if (!classification) return null;
+      var kind = typeof classification.kind === "string" ? classification.kind : "";
+      var known = KIND_GUIDE_KEYS.some(function (entry) { return entry.kind === kind; });
+      if (!known) return null;
+      var scope = typeof classification.scope === "string" ? classification.scope : "project";
+      // Promoting one project's knowledge to every project is a widening decision the
+      // core guards with its own flag; it must never happen because somebody clicked
+      // the obvious button.
+      return { kind: kind, scope: scope, auto: scope !== "global" };
     }
 
     /** "3 分钟前" - a time a reviewer can act on without doing arithmetic. */
@@ -841,12 +877,27 @@ window.__ModuleLoader__.load({
 }
 .amb-button:hover:enabled { background: var(--amb-bg-overlay); }
 .amb-button:disabled { opacity: 0.6; cursor: default; }
+/* A text-only button for the correction path: it must be reachable, but it must not
+   compete with the primary action - the whole point is that the ordinary case is one
+   click and this is the exception. */
+.amb-quiet-button {
+  border: 0;
+  background: none;
+  padding: 4px 6px;
+  color: var(--amb-label-secondary);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.amb-quiet-button:hover:enabled { color: var(--amb-label-primary); }
+.amb-quiet-button:disabled { opacity: 0.6; cursor: default; }
 /* A tab order already existed - every control in this panel is a real button, input or
    select - it was simply invisible. Without a focus ring the panel cannot be operated
    without a mouse, and it cannot be verified by anything other than aiming at pixels:
    with no visible focus there is no way to tell a hit from a miss. */
 .amb-button:focus-visible,
 .amb-input:focus-visible,
+.amb-quiet-button:focus-visible,
 .amb-proposal-summary:focus-visible {
   outline: 2px solid var(--amb-brand);
   outline-offset: 2px;
@@ -1713,6 +1764,23 @@ window.__ModuleLoader__.load({
             // Verbatim: the reviewer is approving *this* text, not a paraphrase of it.
             head.push(h("pre", { className: "amb-proposal-body" }, fullText));
           }
+          var shape = proposedShape(proposal);
+          // The label carries the outcome, not just the verb: what the entry will
+          // become is visible before the click, so one click stays an informed one.
+          var approveLabel = shape
+            ? t("manage.approveAs") + t("kind." + shape.kind + ".label") + " · " + t("manage.scopeKind." + shape.scope)
+            : t("manage.approve");
+          var approveHandler = function () {
+            if (editing) { options.onCompose(null); return; }
+            if (shape && shape.auto) {
+              // Deliberately no confirmation dialog: the shape is the plugin's call and
+              // the reviewer's decision is the click itself. A confirm step here would
+              // recreate the second button this change exists to remove.
+              options.onAction("proposal-approve", { id: proposal.id });
+              return;
+            }
+            options.onCompose(proposal);
+          };
           var row = head.concat([
             h("div", { className: "amb-row amb-actions" },
               // Primary action first and filled; the two destructive-ish ones outlined,
@@ -1722,10 +1790,20 @@ window.__ModuleLoader__.load({
                 type: "button",
                 className: "amb-button amb-primary",
                 disabled: busy,
-                onClick: function () { options.onCompose(editing ? null : proposal); },
-              }, editing ? t("manage.cancel") : t("manage.approve")),
+                onClick: approveHandler,
+              }, editing ? t("manage.cancel") : approveLabel),
               h("button", { type: "button", className: "amb-button", disabled: busy, onClick: decide("proposal-reject") }, t("manage.reject")),
               h("button", { type: "button", className: "amb-button amb-danger", disabled: busy, onClick: decide("proposal-archive") }, t("manage.archive")),
+              // The escape hatch stays, but out of the way: the common case is one click,
+              // and a wrong classification is corrected on the rare occasions it happens.
+              shape && shape.auto && !editing
+                ? h("button", {
+                  type: "button",
+                  className: "amb-quiet-button",
+                  disabled: busy,
+                  onClick: function () { options.onCompose(proposal); },
+                }, t("manage.kindMismatch"))
+                : null,
             ),
           ]);
           var body = row;
@@ -2122,10 +2200,19 @@ window.__ModuleLoader__.load({
               } else if (action === "backup-import") {
                 message = t("manage.importDone");
               }
+              var decided = action === "proposal-approve" || action === "proposal-reject" || action === "proposal-archive";
               setAdminState(function (previous) {
-                return Object.assign({}, previous, { busy: "", message: message, failure: null });
+                var next = Object.assign({}, previous, { busy: "", message: message, failure: null });
+                // A decided candidate leaves the pending queue in the core, so it leaves
+                // this list at the same moment. Waiting for the re-read kept the row on
+                // screen for a beat, which reads as "my click did nothing" - the exact
+                // impression this change exists to remove.
+                if (decided && Array.isArray(previous.proposals) && body && typeof body.id === "string") {
+                  next.proposals = previous.proposals.filter(function (item) { return item.id !== body.id; });
+                }
+                return next;
               });
-              if (action === "proposal-approve" || action === "proposal-reject" || action === "proposal-archive") {
+              if (decided) {
                 return loadProposals();
               }
               return null;
@@ -2204,12 +2291,16 @@ window.__ModuleLoader__.load({
               scope.projectId = payload.projectId;
             }
             return {
-              id: compose.kind + ":" + String(proposal.id).slice(0, 16),
+              id: compose.kind + ":" + String(proposal.id),
               baseRevision: 0,
               kind: compose.kind,
               title: compose.title,
               body: text,
               scope: scope,
+              // Chosen by a person through the correction path, so the stored entry
+              // says so - and the one-click path says `agent`. Which of the two
+              // happened is worth keeping.
+              provenance: "user",
             };
           },
           confirm: function (question) {

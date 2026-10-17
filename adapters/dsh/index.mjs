@@ -595,7 +595,7 @@ async function readPanelAdminBody(req, maxBytes = 65_536) {
  *     the core approves a knowledge object. The entry is read back from the
  *     candidate first, so the page never has to hold it.
  */
-async function buildPanelAdminParams(action, body, config, admin) {
+export async function buildPanelAdminParams(action, body, config, admin) {
   const params = { ...body }
   if (typeof params.projectId !== 'string' || params.projectId === '') params.projectId = config.projectId
 
@@ -618,19 +618,93 @@ async function buildPanelAdminParams(action, body, config, admin) {
     if (payload && isRecordValue(payload.entry)) {
       params.entry = payload.entry
     } else {
-      // A captured candidate carries *text* (`payload.discovery`), not a knowledge
-      // object: the core's approve verb wants a full entry, because a human review
-      // is precisely the act of deciding what that text should become. Refusing is
-      // the honest answer here - inventing a kind, title and scope on the reviewer's
-      // behalf would write an entry nobody chose, and a wrong guess would look like
-      // a successful review.
-      throw new Error(
-        '该候选只有待核实的文本，还没有知识条目形态，无法一键采纳。'
-        + '请在评审流程里选定它要成为的类别与标题后再采纳。',
-      )
+      // A captured candidate carries *text* (`payload.discovery`) rather than a
+      // knowledge object - but it also carries the classification the plugin has
+      // already computed for it (kind, scope, relation, confidence, reasoning).
+      // Reviewing is the human saying "this belongs in the library"; deciding what
+      // shape it takes is the plugin's job. Demanding it again turned the ordinary
+      // case into a two-step form for a judgement the system had already made, and
+      // the second step was the one people missed - the candidate then looked
+      // unapproved and stayed in the queue.
+      const derived = entryFromClassification(payload, params.projectId, params.id)
+      if (!derived) {
+        throw new Error(
+          '该候选没有可用的分类判定，或它要成为全局知识，因此无法一键采纳。'
+          + '请在评审流程里选定类别与作用域后再采纳。',
+        )
+      }
+      params.entry = derived
     }
   }
   return params
+}
+
+/** Kinds a candidate may be promoted into without asking the reviewer to retype it. */
+const AUTO_PROMOTE_KINDS = new Set(['skill', 'journal', 'material', 'memory', 'norm'])
+
+/** The first non-empty line, which is what a candidate uses as its handle. */
+function firstLineOf(text) {
+  return String(text).split('\n').map((line) => line.trim()).find((line) => line !== '') ?? ''
+}
+
+/**
+ * Build the knowledge entry a candidate should become, from the classification the
+ * plugin already computed.
+ *
+ * Returns null when the plugin cannot answer on its own, and the caller then falls
+ * back to asking. Two cases are deliberately refused rather than guessed:
+ *
+ *  - `scope: global` - promoting one project's knowledge to every project is a
+ *    widening decision, and the store requires `allowGlobalScope` for exactly that
+ *    reason. A silent guess here would apply one project's experience everywhere.
+ *  - a candidate with no classification - there is nothing to derive from, and
+ *    inventing a kind would produce a review nobody performed.
+ *
+ * `provenance: 'agent'` records who decided the shape: the plugin, not the person
+ * who clicked. That distinction survives in the stored entry.
+ */
+export function entryFromClassification(payload, projectId, proposalId) {
+  if (!isRecordValue(payload)) return null
+  const classification = isRecordValue(payload.classification) ? payload.classification : null
+  if (!classification) return null
+
+  const kind = typeof classification.kind === 'string' ? classification.kind : ''
+  if (!AUTO_PROMOTE_KINDS.has(kind)) return null
+
+  const text = typeof payload.discovery === 'string' ? payload.discovery : ''
+  const title = firstLineOf(text).slice(0, 120)
+  if (title === '') return null
+
+  const scopeKind = typeof classification.scope === 'string' ? classification.scope : 'project'
+  if (scopeKind === 'global') return null
+
+  const owner = typeof payload.projectId === 'string' && payload.projectId !== ''
+    ? payload.projectId : projectId
+  if (typeof owner !== 'string' || owner === '') return null
+
+  let scope
+  if (scopeKind === 'task') {
+    const taskId = typeof payload.taskId === 'string' ? payload.taskId : ''
+    if (taskId === '') return null
+    scope = { kind: 'task', projectId: owner, taskId }
+  } else {
+    scope = { kind: 'project', projectId: owner }
+  }
+
+  return {
+    // The full id, not a prefix: two candidates of the same kind must never collide
+    // on a truncated uuid.
+    id: `${kind}:${String(proposalId)}`,
+    baseRevision: 0,
+    kind,
+    title,
+    body: text,
+    scope,
+    provenance: 'agent',
+    // A captured candidate is unverified by definition; the review does not change
+    // what the text is worth.
+    evidence: 'unverifiable',
+  }
 }
 
 /**
