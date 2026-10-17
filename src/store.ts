@@ -1363,9 +1363,13 @@ export class Store {
       try { content = JSON.parse(String(row.content)) as Record<string, unknown>; } catch { continue; }
       const scope = content.scope as { kind?: string; projectId?: string } | undefined;
       if (scope?.kind !== 'project' || scope.projectId !== projectId) continue;
-      const title = String(content.title ?? content.did ?? '（无标题）').replace(/\s+/g, ' ').slice(0, 90);
+      const title = String(content.title ?? '（无标题）').replace(/\s+/g, ' ').slice(0, 90);
+      // `did` is the one-line account of what the round actually produced, and it is the whole
+      // point of this line: a title alone told the next round that work happened but not what it
+      // built, which is precisely the gap that made a shipped desktop shell invisible.
+      const did = String(content.did ?? '').replace(/\s+/g, ' ').slice(0, 130);
       const outcome = String(content.outcome ?? 'unverified');
-      out.push(`${row.id}@${row.head} ${title}（结果：${outcome}；全文用 amb_read_knowledge 读取）`);
+      out.push(`${row.id}@${row.head} ${title}${did ? `：${did}` : ''}（结果：${outcome}；全文用 amb_read_knowledge 读取）`);
       if (out.length >= limit) break;
     }
     return out;
