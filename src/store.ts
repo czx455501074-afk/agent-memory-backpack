@@ -1381,7 +1381,27 @@ export class Store {
         const local = entry ? automaticRelevance(entry.content, query) : { score: 0, matched: [], coverage: 0 };
         return [id, { score: 100 - index, matched: local.matched, coverage: local.coverage,
           source: options.selectionSource ?? (local.score > 0 ? 'index' : 'explicit') }] as const;
-      });
+      })
+      /**
+       * A local fallback has to carry local evidence.
+       *
+       * When the model times out or abstains, the caller's `selectedIds` is the local index's
+       * own ranking - and the index scores from a looser evidence chain than the one above
+       * (clause terms, purpose hits, fact windows) while this function matches query tokens
+       * against title, description and body. The two disagree, and the disagreement reaches
+       * the agent as an injected entry with nothing connecting it to the request.
+       *
+       * Measured on the live library (verification/r5/selection-noise-rate.mjs): eight queries
+       * sharing nothing with the library injected entries four times, and every one of those
+       * four carried an empty strict match; four related queries injected zero unevidenced
+       * entries. Both groups injected at the same rate, so the rate alone would not have shown
+       * it - the zero-evidence count is what separates them.
+       *
+       * A model's choice is left alone on purpose. Semantic relevance is exactly what a model
+       * can see and this matcher cannot, so requiring a literal token match here would throw
+       * away the one path that works.
+       */
+      .filter(([, value]) => value.source === 'model' || value.matched.length > 0 || value.coverage > 0);
       automaticMatches.clear();
       for(const [id,value] of ranked) automaticMatches.set(id,value);
     }
