@@ -19,7 +19,7 @@ function lexicalText(text:string) {
   for(const [pattern,term] of concepts)value=value.replace(pattern,` ${term} `);
   return value;
 }
-const negation = /(?:不要|不需要|无需|不用|不想|排除|\bnot\b|\bwithout\b|don't)/i;
+const negation = /(?:不要|不需要|无需|不用|不想|不做|不查|不改|不写|不涉及|不考虑|排除|\bnot\b|\bwithout\b|don't)/i;
 // A bare "别" is a negation only when it directly precedes a verb. Matching the
 // character alone rejected "分**别**处理…", turning a two-objective task into
 // "no positive task". The lookahead deliberately excludes words that merely

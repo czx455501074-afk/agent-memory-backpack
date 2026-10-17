@@ -5,6 +5,7 @@ import { reviewDecision, type ReviewDecision } from './policy.js';
 import { classifyCandidate, type SemanticAnalysis } from './semantic.js';
 import { DurableJobs } from './jobs.js';
 import { MATERIAL_TTL_DAYS, expiryFrom, isLive, materialEntry, renew, type MaterialInput } from './material.js';
+import { positiveRetrievalClauses } from './retrieval-index.js';
 
 type Row = Record<string, unknown>;
 type Entry = { id: string; revision: number; status: string; content: Knowledge };
@@ -234,7 +235,18 @@ function automaticRelevance(content: Knowledge, query: string): { score: number;
   if (query.trim().replace(/@\d+$/, '') === content.id) return { score: 100, matched: [content.id], coverage: 1 };
   // Strip whole filler phrases before bigram tokenization; filtering afterwards
   // leaves artificial cross-boundary fragments (检查功能 -> 查功).
-  const substantive = query.toLowerCase().replace(new RegExp([...recallStopWords].join('|'), 'gu'), ' ');
+  // Only the parts of a request that ask for something are searchable.
+  //
+  // The index and the retrieval service already make this decision (`positiveRetrievalClauses`),
+  // but this matcher took the whole string: "不要查询 Docker Compose，解释量子自旋" kept
+  // "Docker Compose" as a topic and returned the compose entries it had just been told to skip,
+  // and "这次不做 PostgreSQL 备份，只讨论花卉浇水" returned the backup entry. The blind fixture
+  // scored that as five of seven should-have-abstained cases answering anyway. Reusing the same
+  // clause splitter keeps one definition of "what is this request asking for" rather than two
+  // that drift apart.
+  const clauses = positiveRetrievalClauses(query);
+  if (!clauses.length) return { score: 0, matched: [], coverage: 0 };
+  const substantive = clauses.join(' ').toLowerCase().replace(new RegExp([...recallStopWords].join('|'), 'gu'), ' ');
   const tokens = queryTokens(substantive);
   if (!tokens.length) return { score: 0, matched: [], coverage: 0 };
   const description = content.kind === 'skill' ? /^description:\s*(.+)$/m.exec(content.body)?.[1] ?? '' : '';
