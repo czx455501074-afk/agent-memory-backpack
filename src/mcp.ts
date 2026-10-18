@@ -158,10 +158,10 @@ export function createMcp(client: CoreClient, logger?: Logger) {
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, args => call('/v1/material/save', args));
   server.registerTool('amb_submit_experience', {
-    description: 'Submit a candidate experience with its parent workflow and observed revision. Provide verbatim discovery insight text without conversational framing or platform prefixes to preserve cross-client deduplication. Reuse idempotencyKey only for an identical retry.',
+    description: 'Submit a candidate experience with its parent workflow and observed revision. Write a normalized description first: one claim per entry, when it applies and when it does not, the check that makes it verifiable, and evidence as pointers (commands, files, numbers) instead of pasted output. Do not put raw transcripts, tool logs or whole source files into the body - raw text competes with real entries in retrieval and spends the injection budget, so it lowers the accuracy of every later call. Keep it free of conversational framing and platform prefixes so cross-client deduplication still works. Reuse idempotencyKey only for an identical retry.',
     inputSchema: {
       idempotencyKey: identifier,
-      discovery: z.string().trim().min(1).max(12000).describe('Verbatim discovery text without conversational framing or client prefixes'),
+      discovery: z.string().trim().min(1).max(12000).describe('Normalized description: the claim, when it applies, the check that makes it verifiable, and evidence as pointers. No raw transcripts, tool logs or whole source files'),
       workflowId: identifier.optional(),
       baseRevision: z.number().int().positive().optional(),
       taskId: identifier.optional(),

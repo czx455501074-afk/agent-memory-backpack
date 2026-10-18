@@ -408,7 +408,11 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
   await ctx.serial('agent/turn-stopping', { agent, turn: 9, signal: new AbortController().signal })
   await waitFor(() => archiveRequests().length > 0)
   assert.equal(archiveRequests().length, 1, '会话结束必须发起一次归档')
-  assert.deepEqual(archiveRequests()[0].body, { projectId: 'fixture-project', taskId: 'task-fixture' })
+  // The turn boundary also asks the core to distil. It travels on this call because the adapter is
+  // not allowed to run the distiller itself — `/v1/evolution/run` is admin-only by design — so the
+  // signal is what makes a candidate exist by the time the human looks, instead of at the next
+  // six-hour window.
+  assert.deepEqual(archiveRequests()[0].body, { projectId: 'fixture-project', taskId: 'task-fixture', distill: true })
   assert.equal(archiveRequests()[0].protocol, '1', '归档调用必须带 x-amb-protocol: 1')
 
   // Idempotent at this end as well: the same session and task are not asked

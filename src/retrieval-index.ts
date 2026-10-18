@@ -123,10 +123,19 @@ export function buildRetrievalIndex(candidates: RetrievalCandidate[]) {
       // "…只想学习钢琴踏板技巧"). Answering it from that single shared word
       // returns an unrelated entry that merely shares a name. A genuinely short
       // query ("备份", an error code) is not judged this way.
-      const queryTermCount = new Set(clauses.flatMap(clause => tokens(clause))).size;
+      //
+      // The count has to be *words*, not tokens. `tokens()` splits a Han run into
+      // bigrams, so a two-word Chinese query produces three "terms" and tripped a guard
+      // meant for long requests: measured against one library, "日志损坏" returned 0 rows
+      // while "log corrupt" returned 1 with score 6.264 — same library, same evidence,
+      // only the language differed. `store.ts` removed the same absolute floor for the
+      // same reason (its comment: "导出设备" was discarded because 设备 was unknown), so
+      // the two retrieval paths had been answering the same question differently.
+      const queryWordCount = clauses.reduce(
+        (total, clause) => total + clause.trim().split(/\s+/).filter(Boolean).length, 0);
       // A named failure mode is itself the topic, so it is never treated as an
       // unrecognised request even when it is the only term the library knows.
-      if (present.length < 2 && queryTermCount >= 3 && !signatures(query).length) return [];
+      if (present.length < 2 && queryWordCount >= 3 && !signatures(query).length) return [];
       const presentIdf = idfSum(present);
       const coverage = (hits: string[]) => presentIdf ? idfSum(hits) / presentIdf : 0;
       /**

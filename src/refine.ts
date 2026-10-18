@@ -270,14 +270,21 @@ export interface ProposalSource {
  * a source that only knows how to `SELECT` cannot. `projects` narrows to the projects
  * the caller is allowed to see, because a maintenance pass is not a reason to read
  * across project boundaries.
+ *
+ * **Every state, not just the queue.** This used to read `pending`/`needs_evidence` only,
+ * which meant a failure whose candidate was rejected or expired became invisible at exactly
+ * the point its evidence was strongest — it kept recurring. The pipeline in `evolve.ts` was
+ * widened for that reason; this source kept the old filter, so the two tools that exist to
+ * find repetitions disagreed about where to look. `collect` never branches on state, so the
+ * wider read changes only which rows it can see, not what it concludes about them.
  */
 export function proposalSourceFrom(db: {
   prepare: (sql: string) => { all: (...params: unknown[]) => unknown[] };
 }, projects: string[] = []): ProposalSource {
-  const where = projects.length > 0 ? ` AND project_id IN (${projects.map(() => '?').join(',')})` : '';
+  const where = projects.length > 0 ? ` WHERE project_id IN (${projects.map(() => '?').join(',')})` : '';
   return {
     all() {
-      const rows = db.prepare(`SELECT id,state,created_at,payload FROM proposals WHERE state IN ('pending','needs_evidence')${where}`)
+      const rows = db.prepare(`SELECT id,state,created_at,payload FROM proposals${where}`)
         .all(...projects) as Array<Record<string, unknown>>;
       return rows.map(row => {
         let payload: Record<string, unknown> = {};

@@ -181,7 +181,11 @@ test('shared DSH sessions read one library and capture failed tools as one pendi
     clients: [{ id: 'dsh', token, projectId: 'shared' }, { id: 'codex', token: 'c'.repeat(64), projectId: 'shared' }] });
   await new Promise(done => server.listen(0, '127.0.0.1', done));
   const endpoint = `http://127.0.0.1:${server.address().port}`;
-  await writeFile(process.env.AMB_DSH_CONFIG, JSON.stringify({ endpoint, token, projectId: 'shared' }));
+  // Capture is opt-in: an absent setting now means "do not capture", so a suite that exists
+  // to prove the capture path works has to switch it on by name — the same convention the
+  // failure-capture and codex-hook suites follow. Without this the test would pass only if
+  // the parser silently defaulted to on, which is the bug that was just fixed.
+  await writeFile(process.env.AMB_DSH_CONFIG, JSON.stringify({ endpoint, token, projectId: 'shared', autoCaptureFailures: true }));
   const root = new Context();
   const fibers = [];
   t.after(async () => {

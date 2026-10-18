@@ -125,9 +125,26 @@ test('a tampered archive is refused and leaves the destination untouched', () =>
   assert.deepEqual(snapshot(destination.store), before);
 });
 
+/**
+ * Seed a body the way a library written **before ingest-time redaction** holds it.
+ *
+ * `store.import` now sanitises on the way in, so it cannot create the state this test is about;
+ * the export guard's job is to refuse text that is *already* stored, which is a real situation
+ * (the live library held 46 such hits when this was measured).
+ */
+function seedRaw(store: Store, draft: KnowledgeDraft, body: string) {
+  store.import([draft]);
+  const revision = (draft.baseRevision ?? 0) + 1;
+  const row = store.db.prepare('SELECT content FROM revisions WHERE id=? AND revision=?').get(draft.id, revision) as { content: string } | undefined;
+  assert.ok(row, `夹具条目 ${draft.id} 应当已写入，否则下面的注入是空操作`);
+  const parsed = JSON.parse(row.content) as Record<string, unknown>;
+  parsed.body = body;
+  store.db.prepare('UPDATE revisions SET content=? WHERE id=? AND revision=?').run(JSON.stringify(parsed), draft.id, revision);
+}
+
 test('credential-shaped content is refused on the archive path too', () => {
   const source = open();
-  source.store.import([memory('secret', 0, 'api_key=sk-abcdefghijklmnopqrstuvwxyz')]);
+  seedRaw(source.store, memory('secret'), 'api_key=sk-abcdefghijklmnopqrstuvwxyz');
   const file = join(root(), `secret${ARCHIVE_EXTENSION}`);
   assert.throws(() => exportArchive(source.store, { file }), /Credential-shaped content/);
   assert.equal(existsSync(file), false, '被拒绝的导出不得留下半个文件');

@@ -76,6 +76,23 @@ export function createMaintenanceWorker(store: Store, dataDir: string, projectId
         jobs.enqueue('model_review', `proposal:${row.id}${changed ? ':' + inputHash : ''}`, { proposalId: row.id, projectId: row.project_id });
       }
       jobs.enqueue('notify', `revision:${store.revision}`, { revision: store.revision });
+      /**
+       * Evolution runs on a six-hour window, and only as far as consolidation.
+       *
+       * It reads the whole candidate table, so running it on every tick would be work whose
+       * input had not changed; the window is part of the idempotency key, which means a core
+       * that restarts every minute still runs it at most once per window. The window is
+       * derived from the clock rather than from a stored "last run", so no state can drift.
+       *
+       * `promote` is deliberately absent: distilling and relating candidates is observation,
+       * while promoting them files proposals a person then has to review. The first is safe
+       * to automate, the second is somebody's decision — that boundary is the whole reason
+       * the eight-entry `FORBIDDEN_AUTOMATIC` list exists.
+       */
+      const evolveWindow = Math.floor(Date.now() / (6 * 3_600_000));
+      for (const projectId of new Set(projectIds)) {
+        jobs.enqueue('evolve', `evolve:${projectId}:${evolveWindow}`, { projectId });
+      }
       const exportConfigFile = join(dataDir, 'maintenance.json');
       if (existsSync(exportConfigFile)) {
         try {
@@ -138,6 +155,20 @@ export function createMaintenanceWorker(store: Store, dataDir: string, projectId
           store.db.prepare('INSERT OR IGNORE INTO revision_notifications(revision,payload,created_at) VALUES(?,?,?)')
             .run(Number(job.payload.revision), JSON.stringify(job.payload), Date.now());
           return { revision: job.payload.revision, availableForPolling: true };
+        },
+        evolve(job) {
+          // Stage one and two only. Promotion is not called here on purpose: it files
+          // proposals, which is a decision, and this worker runs unattended.
+          const projectId = String(job.payload.projectId);
+          const distilled = store.runEvolution({ projectId, dryRun: false });
+          const consolidated = store.consolidateEvolution({ projectId, dryRun: false });
+          return {
+            scanned: distilled.scanned,
+            candidates: distilled.candidates.length,
+            links: consolidated.linked,
+            stale: consolidated.stale.length,
+            knowledgeUnchanged: store.revision === distilled.knowledgeRevision,
+          };
         },
       }, 2);
     } finally { busy = false; }

@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync, rmSync } from 'node:fs';
 import { dirname, join, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -202,6 +202,88 @@ writeFileSync(join(out, 'artifact-manifest.json'), JSON.stringify({
   copiedTreesVerified: copiedPairs.map(([source, artifact]) => ({ source, artifact })),
   build,
 }, null, 2));
-writeFileSync(join(root, 'artifacts/latest.json'), JSON.stringify({ directory: out, phase: 'P0', desktopVerified: false, build }, null, 2));
+/**
+ * Desktop verification, measured instead of asserted.
+ *
+ * This field used to be the literal `false`. The desktop acceptance suite existed and could run,
+ * but nothing called it, so the artifact manifest recorded "desktop not verified" forever - and
+ * a value nobody reads is indistinguishable from a value nobody wants. The desktop app is one of
+ * this product's two surfaces; leaving its verification outside the build is how it drifted into
+ * a 22KB shell that loaded its own front end while the real console lived elsewhere.
+ *
+ * Skipping is allowed but must be asked for by name, and the result says which happened, so
+ * `desktopVerified: false` always means "we tried and it failed" rather than "we did not look".
+ */
+const skipDesktop = process.argv.includes('--skip-desktop-accept');
+// Point latest.json at this artifact *before* acceptance runs. The desktop suite compares the
+// recorded artifact against the working tree, so running it while the record still names the
+// previous build made it report "artifact older than source" - true of the record, false about
+// this build. Measured: 19 pass / 1 fail inside the build, 20 / 0 when run immediately after,
+// with the only difference being whether this line had already been written.
+writeFileSync(join(root, 'artifacts/latest.json'), JSON.stringify({ directory: out, phase: 'P0', desktopVerified: null, desktop: null, build }, null, 2));
+let desktop = { verified: false, reason: 'skipped: --skip-desktop-accept', passed: null, failed: null };
+if (!skipDesktop) {
+  const acceptance = spawnSync(process.execPath, [join(root, 'scripts/desktop-accept.mjs')], {
+    cwd: root, encoding: 'utf8', windowsHide: true,
+  });
+  const tail = String(acceptance.stdout ?? '').split('\n').filter(line => line.includes('自动项')).pop() ?? '';
+  const nums = /通过=(\d+)\s+失败=(\d+)/.exec(tail);
+  desktop = {
+    verified: acceptance.status === 0,
+    reason: acceptance.status === 0 ? 'all automatable desktop checks passed' : 'desktop acceptance reported failures',
+    passed: nums ? Number(nums[1]) : null,
+    failed: nums ? Number(nums[2]) : null,
+  };
+  if (acceptance.status !== 0) {
+    console.log(`Desktop acceptance FAILED (${desktop.passed} pass / ${desktop.failed} fail) — artifact recorded as desktopVerified: false`);
+    console.log(tail.trim());
+  } else {
+    console.log(`Desktop acceptance passed (${desktop.passed} checks)`);
+  }
+}
+writeFileSync(join(out, 'artifact-manifest.json'), JSON.stringify({
+  format: 'agent-memory-backpack-artifact-hashes-v1', packageVersion: manifest.version,
+  sourceFiles: sourceInventory, artifactFiles: inventory,
+  copiedTreesVerified: copiedPairs.map(([source, artifact]) => ({ source, artifact })),
+  build, desktop,
+}, null, 2));
+writeFileSync(join(root, 'artifacts/latest.json'), JSON.stringify({ directory: out, phase: 'P0', desktopVerified: desktop.verified, desktop, build }, null, 2));
 console.log(`Local artifacts: ${out}`);
 console.log(`Relative artifact root: ${relative(root, out)}`);
+
+/**
+ * Keep the newest few artifacts instead of every artifact ever built.
+ *
+ * This directory had accumulated **107 pack copies / 1.16 M files / 5.4 GB**: each `pack:local`
+ * writes a complete copy of the core, both adapters and the desktop bundle, and nothing ever
+ * removed the previous one. The deployment script already rotates its own backups (`BACKUP_KEEP`
+ * in deploy-plugin.mjs, added after the same class of accumulation was found there) — the pack
+ * side had no equivalent, so the pile simply grew in a different directory.
+ *
+ * Matching is strict — `p0-<timestamp>` only, the exact shape written above — so nothing else
+ * under `artifacts/` (the audit and provenance directories) is ever a candidate. The newest
+ * `limit` are kept, which always includes the copy just written, so the previous build stays
+ * available for rollback. A copy that cannot be removed is reported rather than fatal: the pack
+ * itself succeeded, and failing here would turn a cleanup problem into a broken build.
+ */
+const ARTIFACT_KEEP = Number(process.env.AMB_ARTIFACT_KEEP ?? 3);
+function pruneArtifacts(limit = ARTIFACT_KEEP) {
+  const artifacts = join(root, 'artifacts');
+  let names;
+  try { names = readdirSync(artifacts).filter(name => /^p0-\d+$/.test(name)).sort(); }
+  catch { return { removed: [], kept: [] }; }
+  const keep = names.slice(-Math.max(1, limit));
+  const removed = [];
+  for (const name of names) {
+    if (keep.includes(name)) continue;
+    const full = join(artifacts, name);
+    // The pointer file names a directory that is about to disappear; drop the record with it
+    // rather than leaving a pointer into nothing (deploy-plugin falls back to the newest copy).
+    try { rmSync(full, { recursive: true, force: true }); removed.push(name); } catch { /* report below */ }
+  }
+  return { removed, kept: keep };
+}
+const pruned = pruneArtifacts();
+if (pruned.removed.length) {
+  console.log(`Pruned ${pruned.removed.length} older artifact copy(ies), kept ${pruned.kept.length} (AMB_ARTIFACT_KEEP=${ARTIFACT_KEEP}): ${pruned.kept.join(', ')}`);
+}

@@ -378,6 +378,10 @@ const PANEL_ADMIN_ACTIONS = Object.freeze({
   'proposal-approve': '/v1/proposals/approve',
   'proposal-reject': '/v1/proposals/reject',
   'proposal-archive': '/v1/proposals/archive',
+  // One action for a whole folded group. The core recomputes the members from the
+  // signature, so this endpoint acts on the group rather than on the three samples the
+  // queue shows inline.
+  'proposal-group': '/v1/proposals/group',
   'proposal-reopen': '/v1/proposals/reopen',
   'proposal-request-evidence': '/v1/proposals/request-evidence',
   'backup-export': '/v1/backup/export',
@@ -406,7 +410,7 @@ const PANEL_ADMIN_ACTIONS = Object.freeze({
  * writes, which are the only entries worth keeping.
  */
 const PANEL_ADMIN_WRITES = new Set([
-  'proposal-approve', 'proposal-reject', 'proposal-archive', 'proposal-reopen',
+  'proposal-approve', 'proposal-reject', 'proposal-archive', 'proposal-reopen', 'proposal-group',
   'proposal-request-evidence', 'backup-import', 'knowledge-delete', 'knowledge-supersede',
   'material-renew', 'material-purge', 'outbox-purge', 'maintenance-retry',
   'rescan-mark', 'workflow-draft-approve', 'workflow-draft-revise',
@@ -598,6 +602,15 @@ async function readPanelAdminBody(req, maxBytes = 65_536) {
 export async function buildPanelAdminParams(action, body, config, admin) {
   const params = { ...body }
   if (typeof params.projectId !== 'string' || params.projectId === '') params.projectId = config.projectId
+  /**
+   * Did a person fill in the compose form for this approval?
+   *
+   * Read before the fallback below fills `params.entry` itself: an entry the reviewer
+   * typed (kind changed, title kept or edited, confirm pressed) is evidence that the
+   * judgement happened; an entry this function derived is not, and must not be treated
+   * as one. The two look identical by the time they reach the core.
+   */
+  const reviewerSuppliedEntry = action === 'proposal-approve' && isRecordValue(params.entry)
 
   // The queue view is the panel's default read: same rows, ordered by what deserves
   // attention, with repeated auto-captured failures folded into one entry per
@@ -676,6 +689,23 @@ export async function buildPanelAdminParams(action, body, config, admin) {
       }
       params.entry = derived
     }
+  }
+  /**
+   * Carry the reviewer's confirmation to the core.
+   *
+   * The gate exists to stop a candidate from promoting *itself* — not to stop a person.
+   * A reviewer who opened the form, saw the kind and the scope, and pressed confirm has
+   * made exactly the judgement the gate asks for, so that intent has to travel with the
+   * request. It did not: the panel sent the entry without `classificationAcknowledged`,
+   * the core refused with 409, and the panel answered with guidance telling the reviewer
+   * to do the thing they had just done. A withheld candidate could therefore be opened,
+   * confirmed, and refused again — forever, which reads as "the button is broken".
+   *
+   * Only the form path sets this. A derived entry leaves the field alone, so anything
+   * that reaches the core without a person behind it is still refused.
+   */
+  if (reviewerSuppliedEntry && params.classificationAcknowledged === undefined) {
+    params.classificationAcknowledged = true
   }
   return params
 }
@@ -1341,9 +1371,12 @@ export async function apply(ctx) {
     // No request signal on purpose: at this boundary the turn's own signal may
     // already be aborted, and an archive cancelled for that reason would have
     // nothing left to retry it.
-    void client.post('/v1/tasks/archive', { projectId: config.projectId, taskId }).then(receipt => {
+    void client.post('/v1/tasks/archive', { projectId: config.projectId, taskId, distill: config.autoDistill !== false }).then(receipt => {
       logger.info('task.archived', { adapter: 'dsh', sessionId: agent.id, taskId,
-        knowledgeId: receipt?.knowledgeId, revision: receipt?.revision, unchanged: receipt?.unchanged })
+        knowledgeId: receipt?.knowledgeId, revision: receipt?.revision, unchanged: receipt?.unchanged,
+        // The turn boundary is where a candidate becomes visible; logging the pass is what makes
+        // "it ran and found nothing" distinguishable from "it never ran".
+        distilled: receipt?.distilled })
     }).catch(error => {
       // A failed attempt must stay retryable, so the claim is released instead of
       // being remembered as done.
@@ -2134,7 +2167,7 @@ export async function apply(ctx) {
 
   registerTool(jsonTool({
     name: 'amb_submit_experience',
-    description: 'Submit a discovered experience as a pending candidate for human review. Provide verbatim discovery insight text without conversational framing or platform prefixes to preserve cross-client deduplication.',
+    description: 'Submit a discovered experience as a pending candidate for human review. Write a normalized description first: one claim per entry, when it applies and when it does not, the check that makes it verifiable, and evidence as pointers (commands, files, numbers) instead of pasted output. Do not put raw transcripts, tool logs or whole source files into the body - raw text competes with real entries in retrieval and spends the injection budget, so it lowers the accuracy of every later call. Keep it free of conversational framing and platform prefixes so cross-client deduplication still works.',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {

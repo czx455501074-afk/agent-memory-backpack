@@ -4,8 +4,64 @@ import { createHash } from 'node:crypto';
 import type { Store } from './store.js';
 import { modelReviewConfigSchema } from './model-review.js';
 import { selectRelevantKnowledge } from './semantic-retrieval.js';
-import { buildRetrievalIndex, positiveRetrievalClauses } from './retrieval-index.js';
+import { buildRetrievalIndex, positiveRetrievalClauses, type IndexedHit } from './retrieval-index.js';
 import { digestSchema } from './workflow-draft.js';
+import { cosine, embedTexts, rrf, type EmbeddingConfig } from './embeddings.js';
+
+/**
+ * Fuse the lexical ranking with the optional vector ranking.
+ *
+ * Off unless configured, and *silently* off in that case: with no embedding endpoint this returns the
+ * lexical ids untouched, so an unconfigured install behaves exactly as it did before the layer
+ * existed — same ids, same order, same receipt.
+ *
+ * On, it still refuses to fuse on thin coverage. A handful of vectors deciding the order of hundreds
+ * of entries is a worse answer than the lexical one, and — the part that matters — it would arrive
+ * looking exactly as confident. The threshold is stated rather than tuned: at least half the eligible
+ * entries must carry a vector, and there must be enough of them to rank at all.
+ *
+ * The two rankings are merged by reciprocal rank, not by normalised score: a cosine and an
+ * IDF-weighted lexical score are not on a comparable scale, and rescaling one against the other would
+ * make the result depend on the score distribution of the moment. Ranks are already comparable.
+ *
+ * Every failure mode returns the lexical answer with a reason, never an error: retrieval that
+ * degrades is still retrieval, and the receipt says which half answered.
+ */
+export async function fuseWithVectors(input: {
+  store: Store; projectId: string; query: string; ranked: IndexedHit[]; lexicalIds: string[];
+  config?: EmbeddingConfig | null; embed?: typeof embedTexts;
+}): Promise<{ ids: string[]; vector: { used: boolean; reason: string; embedded: number; eligible: number } }> {
+  const lexical = { ids: input.lexicalIds };
+  const off = (reason: string, coverage = { eligible: 0, embedded: 0 }) =>
+    ({ ...lexical, vector: { used: false, reason, ...coverage } });
+  if (!input.config) return off('not_configured');
+  const config = input.config;
+  const coverage = input.store.embeddingCoverage(input.projectId, String(config.model));
+  if (coverage.eligible < 5 || coverage.embedded / Math.max(1, coverage.eligible) < 0.5) return off('coverage_too_thin', coverage);
+  const embed = input.embed ?? embedTexts;
+  const queryVector = (await embed([input.query], config))?.[0];
+  if (!queryVector) return off('unavailable', coverage);
+  const candidateIds = input.ranked.map(hit => hit.candidate.id);
+  /**
+   * The vector ranking sees **every embedded entry**, not the lexical shortlist.
+   *
+   * Measured: with the shortlist, the case the layer exists for — a query whose words match nothing —
+   * produced `no_vectors` and fused nothing, because the lexical ranking it was restricted to was
+   * empty. A ranking that can only reorder what word-overlap already found adds nothing.
+   */
+  const stored = input.store.embeddingsForProject(String(config.model));
+  if (!stored.size) return off('no_vectors', coverage);
+  // The vector ranking sees only what has a vector; entries without one keep their lexical rank
+  // rather than being pushed to the end, because "not embedded yet" is not a relevance judgement.
+  const byVector = [...stored.entries()]
+    .map(([id, vector]) => ({ id, score: cosine(queryVector, vector) }))
+    .sort((left, right) => right.score - left.score);
+  const fused = new Map<string, number>();
+  input.lexicalIds.forEach((id, index) => fused.set(id, (fused.get(id) ?? 0) + rrf(index)));
+  byVector.forEach((entry, index) => fused.set(entry.id, (fused.get(entry.id) ?? 0) + rrf(index)));
+  const ids = [...fused.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0])).map(([id]) => id).slice(0, 3);
+  return { ids, vector: { used: true, reason: 'fused', ...coverage } };
+}
 
 /**
  * The selection, with the path that produced it.
@@ -32,7 +88,16 @@ import { digestSchema } from './workflow-draft.js';
 export const MODEL_BUDGET_MS = 3500;
 
 export type RetrievalSelection = { mode: 'model' | 'index' | 'lexical_fallback';
-  selectedIds: string[]; reason?: string };
+  selectedIds: string[]; reason?: string;
+  /**
+   * Whether the optional vector half took part, and if not, why not.
+   *
+   * Present on every selection so "the layer is off" is distinguishable from "the layer ran and was
+   * ignored": `used: false, reason: 'not_configured'` and `used: true, reason: 'fused'` are different
+   * facts about the answer the caller just received, and a receipt that omitted the field would leave
+   * the reader guessing which one they got.
+   */
+  vector?: { used: boolean; reason: string; embedded: number; eligible: number } };
 /** Which path produced `selection`, read off the fields that already state it. */
 export function selectionSource(selection: Pick<RetrievalSelection, 'mode' | 'reason'>)
   : 'model' | 'index' | 'local_index' | undefined {
@@ -43,7 +108,7 @@ export function selectionSource(selection: Pick<RetrievalSelection, 'mode' | 're
 }
 
 /** Server-local cache; contains only relevance decisions, never provider credentials. */
-export function createRetrievalService(store: Store, dataDir: string) {
+export function createRetrievalService(store: Store, dataDir: string, options: { embeddings?: EmbeddingConfig | null; embed?: typeof embedTexts } = {}) {
   const cache=new Map<string,{at:number;result:RetrievalSelection}>();
   const indexes=new Map<string,{key:string;index:ReturnType<typeof buildRetrievalIndex>;candidates:Parameters<typeof buildRetrievalIndex>[0]}>();
   const pending=new Map<string,Promise<RetrievalSelection>>();
@@ -75,7 +140,16 @@ export function createRetrievalService(store: Store, dataDir: string) {
     const scoped=store.scopedEntries(projectId);
     const liveKey=scoped.map(e=>`${e.id}@${e.revision}`).sort().join('|');
     const digests=new Map<string,{revision:number;digest:{summary:string;whenToUse:string[];exclusions:string[];aliases:string[];versions:string[]}}>();
-    for(const row of store.db.prepare("SELECT skill_id,result FROM workflow_drafts WHERE project_id=? AND result IS NOT NULL AND state!='stale' ORDER BY updated_at DESC").all(projectId)) {
+    /**
+     * Workflow drafts are **optional data**: the backup layer exports them only when the table
+     * exists, and a library that has never organised a skill simply has no such table. Reading it
+     * without that guard threw `no such table` on the retrieval path — the third table to make that
+     * mistake — and the fix is the guard rather than always creating the table: making it always
+     * exist would turn "optional" into "always present, always empty" and change what a backup
+     * package contains.
+     */
+    const hasDrafts = Boolean(store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_drafts'").get());
+    for(const row of hasDrafts ? store.db.prepare("SELECT skill_id,result FROM workflow_drafts WHERE project_id=? AND result IS NOT NULL AND state!='stale' ORDER BY updated_at DESC").all(projectId) : []) {
       try {
         const result=JSON.parse(String(row.result)), skillId=String(row.skill_id);
         const parsed=digestSchema.safeParse(result.digest), revision=result.source?.revision;
@@ -101,13 +175,35 @@ export function createRetrievalService(store: Store, dataDir: string) {
     });
     snapshot={key:sourceKey,index:buildRetrievalIndex(candidates),candidates};
     indexes.set(projectId,snapshot);
+    // Evict the least **recently used**, not the least recently *built*.
+    //
+    // A `Map` preserves insertion order, so deleting `keys().next()` removed whatever was
+    // built first — which is the project that has been used longest, not the one that is
+    // idle. With 32 slots and a handful of projects that never mattered; the moment the
+    // working set exceeds the cap, the entry being rebuilt on every turn is the one that
+    // keeps getting thrown away. `indexes.set` on a hit (below) moves a project to the end,
+    // so the eviction order becomes recency of use.
     if(indexes.size>32)indexes.delete(indexes.keys().next().value!);
+    } else {
+      // Re-insert on hit: same snapshot, moved to the end of the map's insertion order.
+      indexes.delete(projectId);indexes.set(projectId,snapshot);
     }
     const exact=snapshot.index.exact(query);
     if(exact.length)return {mode:'index' as const,selectedIds:exact.slice(0,5).map(e=>e.id),reason:'exact_id'};
     // A requested stale revision cannot be broadened into a different source.
     if(snapshot.candidates.some(e=>query.includes(`${e.id}@`)))return {mode:'index' as const,selectedIds:[],reason:'revision_mismatch'};
-    const ranked=snapshot.index.rank(query);
+    // The pool the ranking may consider grows with the library, and is capped.
+    //
+    // `rank(query)` used a fixed default of twelve, so a library of 800 entries answered
+    // every query from the same top twelve — the "don't send the whole catalogue" guard
+    // below described a branch that could never run. More importantly, the relative
+    // threshold right after this could only choose among what survived: with twelve
+    // candidates the second topic of a two-topic request was frequently already cut. Ten
+    // percent with a floor of 24 and a ceiling of 60 keeps the work per query bounded while
+    // giving the threshold something to choose from. Scoring is unchanged — `rank` scores
+    // every candidate and only the sort-and-truncate sees this number.
+    const poolSize = Math.min(60, Math.max(24, Math.ceil(snapshot.candidates.length * 0.1)));
+    const ranked = snapshot.index.rank(query, poolSize);
     // The index already refuses stale, excluded, version-mismatched and
     // evidence-free rows, so the local answer is its ranking rather than only
     // the subset that reached strong evidence (requiring `strong` here made the
@@ -131,9 +227,23 @@ export function createRetrievalService(store: Store, dataDir: string) {
     // The relative threshold answers "how far below the best may I go"; this answers "is
     // there a best at all". Without it, a degraded selection is indistinguishable from a
     // confident one to the agent that receives it.
-    const localIds=best<=0?[]:ranked.filter(hit=>hit.score>=best*.6
+    const lexicalIds=best<=0?[]:ranked.filter(hit=>hit.score>=best*.6
       ||(hit.strong&&hit.score===bestOfObjective.get(hit.objective)&&hit.score>=best*.25))
       .slice(0,3).map(hit=>hit.candidate.id);
+    /**
+     * The optional vector half runs *here*, on the lexical ranking, so both callers below (the
+     * degraded path and the model shortlist) see the same fused order.
+     *
+     * The unconfigured case does **not** await anything, and that is not an optimisation: adding an
+     * await point to the default path changes how concurrent requests interleave. Measured — an
+     * unconditional `await` here broke "identical concurrent decisions merge into one model call",
+     * because the second request reached the merge check after yielding instead of before. A layer
+     * that is switched off must be off in timing as well as in behaviour.
+     */
+    const fused = options.embeddings
+      ? await fuseWithVectors({ store, projectId, query, ranked, lexicalIds, config: options.embeddings, embed: options.embed })
+      : { ids: lexicalIds, vector: { used: false, reason: 'not_configured', embedded: 0, eligible: 0 } };
+    const localIds = fused.ids;
     const fallback=(reason:string)=>({mode:'index' as const,
       // A configured model that fails outright must not be silently replaced by a
       // lexical guess: only the unconfigured path is *defined* as deterministic
@@ -162,6 +272,7 @@ export function createRetrievalService(store: Store, dataDir: string) {
       // "none" - and without this the injection path received an empty selection and
       // silently lost every hit the index had found.
       selectedIds:reason==='not_configured'||reason==='model_timeout'||reason==='busy'||reason==='model_abstained'?localIds:[],
+      vector: fused.vector,
       reason:`local_index:${reason}`});
     if(!config)return fallback('not_configured');
     if(pending.size>=2)return fallback('busy');

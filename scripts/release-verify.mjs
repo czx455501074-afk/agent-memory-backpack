@@ -72,6 +72,13 @@ const results = [
   step('打包内容', 'npm pack --dry-run', { pattern: /package size: ([^\n]*)/ }),
   step('真实库状态（只读）', 'node scripts/r5-live-state.mjs', { pattern: /(\d+) 条 pending/ }),
   step('对运行中的核心验收', 'node scripts/r5-live-verify.mjs', { live: true, pattern: /(\d+\/\d+) 通过/ }),
+  // The desktop app is one of this product's two surfaces, and until now the release chain did
+  // not look at it at all: package.mjs wrote `desktopVerified: false` as a literal, so a build
+  // could ship while the desktop acceptance suite went unrun and unreported. It is `required`,
+  // not advisory - "we did not check" and "we checked and it passed" must not look the same on
+  // release day. `--skip-desktop-accept` on package.mjs still exists for a quick local build, and
+  // the artifact records 'skipped' in that case; this line is what makes skipping visible.
+  step('桌面端验收（Tauri）', 'node scripts/desktop-accept.mjs', { pattern: /自动项\s+通过=(\d+)/ }),
 ];
 
 const failed = results.filter(row => row.required && row.ok === false);

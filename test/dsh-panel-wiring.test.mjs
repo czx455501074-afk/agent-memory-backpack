@@ -138,3 +138,52 @@ test('entryFromClassification refuses a verdict-bearing candidate on its own', (
   }, PROJECT, 'c5');
   assert.equal(allowed.kind, 'norm', '明确允许时必须给出条目');
 });
+
+/**
+ * The compose form is the way past the gate, so the request has to say so.
+ *
+ * Reported from a live panel: a withheld candidate was opened, the kind and scope were
+ * confirmed, "确认采纳" was pressed — and the core refused with `classification_confirmation_required`,
+ * while the panel's own guidance told the reviewer to do what they had just done. The
+ * panel never sent `classificationAcknowledged`, so the route the guidance described did
+ * not exist. These three cases pin who may claim the confirmation.
+ */
+
+const FORM_ENTRY = {
+  id: 'memory:c9',
+  kind: 'memory',
+  title: '人工确认过的标题',
+  body: '候选正文',
+  scope: { kind: 'project', projectId: PROJECT },
+  baseRevision: 0,
+};
+
+test('a form approval carries the reviewer confirmation to the core', async () => {
+  const params = await buildPanelAdminParams('proposal-approve', { id: 'c9', entry: FORM_ENTRY }, CONFIG, adminStub(null));
+  assert.equal(params.classificationAcknowledged, true,
+    '表单里点过确认的采纳必须把人工确认带给核心，否则被拦下的候选永远无法采纳');
+  assert.deepEqual(params.entry, FORM_ENTRY, '条目必须原样透传，不被这一层改写');
+});
+
+test('a derived entry does not pretend a person confirmed it', async () => {
+  const payload = {
+    projectId: PROJECT,
+    discovery: '可自动升格',
+    classification: { kind: 'memory', scope: 'project', autoPromotable: true },
+  };
+  const params = await buildPanelAdminParams('proposal-approve', { id: 'c10' }, CONFIG, adminStub(payload));
+  assert.ok(params.entry, '一键路径仍应构造出条目');
+  assert.equal(params.classificationAcknowledged, undefined,
+    '由适配器派生的条目不是人工确认，不得带上标记');
+});
+
+test('an explicit refusal to confirm is not overwritten', async () => {
+  const params = await buildPanelAdminParams(
+    'proposal-approve',
+    { id: 'c11', entry: FORM_ENTRY, classificationAcknowledged: false },
+    CONFIG,
+    adminStub(null),
+  );
+  assert.equal(params.classificationAcknowledged, false,
+    '调用方明确说未确认时必须保留，只有缺省才由表单补上');
+});

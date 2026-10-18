@@ -39,8 +39,22 @@ test.after(() => {
   }
 });
 
+/**
+ * Store a body **as it would be if it had been written before ingest-time redaction**.
+ *
+ * `store.import` now sanitises credential-shaped values on the way in — that is the point of
+ * the change — so a test that exercises the *export* guard can no longer build its fixture
+ * through the write path. Real libraries still hold such text (the live one had 46 hits when
+ * this was measured), so the guard is not hypothetical: the fixture is injected straight into
+ * the revision row, exactly like a record that was written before the rule existed.
+ */
 function seed(store: Store, id: string, body: string) {
   store.import([{ id, baseRevision: 0, kind: 'memory', title: id, body, scope: { kind: 'global' } }]);
+  const row = store.db.prepare('SELECT content FROM revisions WHERE id=? AND revision=1').get(id) as { content: string } | undefined;
+  assert.ok(row, `夹具条目 ${id} 应当已写入，否则下面的注入是空操作`);
+  const parsed = JSON.parse(row.content) as Record<string, unknown>;
+  parsed.body = body;
+  store.db.prepare('UPDATE revisions SET content=? WHERE id=? AND revision=1').run(JSON.stringify(parsed), id);
 }
 
 function exportInto(source: { store: Store }, targetDir: string) {

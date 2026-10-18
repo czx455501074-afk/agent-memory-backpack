@@ -54,9 +54,42 @@ const resolvedDeploy = deployDir
     return fromProfile ? fromProfile.dependency.slice('link:'.length) : null;
   })();
 
-const deployedAt = resolvedDeploy && existsSync(join(resolvedDeploy, 'index.mjs'))
-  ? statSync(join(resolvedDeploy, 'index.mjs')).mtimeMs
-  : null;
+/**
+ * When was the deployed package last written?
+ *
+ * This used to be the mtime of `index.mjs` alone, and that is only half of what the host
+ * runs. A package carries the adapter entry points at its root *and* a `runtime/` copy of
+ * the core; a change that touches only the core leaves `index.mjs` untouched while
+ * `runtime/store.js` is new. Measured on a real deployment: `index.mjs` 2026-10-17T16:10Z,
+ * `runtime/store.js` 2026-10-18T05:59Z, core started 05:04Z. The old rule compared the
+ * core's start time against 16:10 and reported RUNNING DEPLOYED BUILD — while the core had
+ * in fact been started 55 minutes before the runtime it was supposed to be running
+ * existed. The verdict said "deployed", the machine was serving the previous build, and
+ * that is precisely the confusion this script exists to remove.
+ *
+ * So take the newest of every file the host actually loads: the adapter entries at the
+ * root and the `.js` files of `runtime/`. `node_modules` is skipped on purpose — it is
+ * dependencies, not this package's code, and walking it would add seconds for no signal.
+ */
+function newestDeployedFile(dir) {
+  if (!dir || !existsSync(dir)) return { at: null, file: null, checked: 0 };
+  const candidates = ['index.mjs', 'client.js'].map(name => join(dir, name));
+  const runtime = join(dir, 'runtime');
+  if (existsSync(runtime)) {
+    for (const name of readdirSync(runtime)) if (name.endsWith('.js')) candidates.push(join(runtime, name));
+  }
+  let newest = { at: null, file: null, checked: 0 };
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    newest.checked += 1;
+    const at = statSync(file).mtimeMs;
+    if (newest.at === null || at > newest.at) newest = { at, file, checked: newest.checked };
+  }
+  return newest;
+}
+
+const deployed = newestDeployedFile(resolvedDeploy);
+const deployedAt = deployed.at;
 
 let coreStartedAt = null;
 const lock = join(dataDir, 'core.lock');
@@ -73,6 +106,10 @@ console.log(JSON.stringify({
   profiles: rows,
   deployDir: resolvedDeploy ?? '(unresolved)',
   deployedAt: iso(deployedAt),
+  // Which entry set the timestamp, and how many entries were considered: "the newest
+  // file" is only useful if a reader can see which file that was.
+  deployedFile: deployed.file ?? '(none)',
+  deployedEntriesChecked: deployed.checked,
   coreStartedAt: iso(coreStartedAt),
 }, null, 2));
 

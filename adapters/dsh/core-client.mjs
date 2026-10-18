@@ -39,11 +39,23 @@ export class CoreClientError extends Error {
 /** Map an HTTP status to the kind that describes it. */
 function kindFromStatus(status) {
   // 507 means the core's own outbox is full: capacity, not a plain server fault.
-  return status === 507 ? 'capacity' : status >= 500 ? 'http5xx' : 'http4xx'
+  if (status === 507) return 'capacity'
+  /**
+   * 429 and 408 are "not now", not "no".
+   *
+   * They used to fall into `http4xx`, which `isRetryableClientError` treats as a final
+   * decision — so when the core was rate-limiting or a gateway gave up waiting, the
+   * adapter threw, and the candidate went to neither the outbox nor the spool. Work the
+   * user had already written disappeared, from a condition that resolves by itself.
+   * Measured shape: `spool.mjs` states its whole purpose is preventing exactly that.
+   */
+  if (status === 429) return 'throttled'
+  if (status === 408) return 'timeout'
+  return status >= 500 ? 'http5xx' : 'http4xx'
 }
 
 /** Kinds a later attempt may still survive, and which may therefore be queued. */
-const RETRYABLE_KINDS = new Set(['timeout', 'network', 'transport', 'http5xx', 'capacity'])
+const RETRYABLE_KINDS = new Set(['timeout', 'network', 'transport', 'http5xx', 'capacity', 'throttled'])
 
 /**
  * Whether a failed delivery is worth queueing or replaying.
@@ -60,7 +72,9 @@ export function isRetryableClientError(error) {
   if (typeof error.kind === 'string') return RETRYABLE_KINDS.has(error.kind)
   if (error.name === 'AbortError') return false
   const status = error.status ?? error.statusCode
-  if (typeof status === 'number') return status === 507 || status >= 500
+  // Same three exceptions as `kindFromStatus`, for errors that carry only a status (a
+  // foreign error, or one from an older build).
+  if (typeof status === 'number') return status === 507 || status === 408 || status === 429 || status >= 500
   const message = error instanceof Error ? error.message : String(error)
   return !(/\bHTTP\s*4\d\d\b/.test(message) || message.includes('protocol version mismatch'))
 }
@@ -167,6 +181,9 @@ export async function loadClientConfig(env = process.env) {
   if (raw.autoReflect !== undefined && typeof raw.autoReflect !== 'boolean') {
     throw new Error('autoReflect must be a boolean when configured.')
   }
+  if (raw.autoDistill !== undefined && typeof raw.autoDistill !== 'boolean') {
+    throw new Error('autoDistill must be a boolean when configured.')
+  }
 
   let endpoint
   try {
@@ -184,9 +201,36 @@ export async function loadClientConfig(env = process.env) {
     endpoint: endpoint.origin,
     token: raw.token,
     projectId: raw.projectId.trim(),
-    autoCaptureFailures: raw.autoCaptureFailures !== false,
-    autoCaptureMaterial: raw.autoCaptureMaterial !== false,
+    // Opt-in, and this is the line that decides it. Both capture switches used `!== false`,
+    // so an absent setting produced `true` — while every consumer checks `=== true`. The
+    // two rules disagree about the same field, and the parser wins: an unconfigured install
+    // captured every tool failure and every fetched page. Measured in one log window before
+    // the fix: 252 `experience.captured` events with 167 duplicates (66%), pending
+    // candidates growing ~214/day. A hook triggered by an exit code cannot judge whether the
+    // failure taught anything, so absence has to mean "do not capture".
+    //
+    // `autoReflect` is deliberately NOT in that group. It writes nothing — it asks the agent
+    // for one reflection per turn — so silence is a weaker default there, and a user who
+    // never configures anything still gets the prompt that makes the library useful. The
+    // existing runtime test ("business tools trigger at most one reflection request per
+    // natural turn") is what caught the difference when this line was briefly changed too.
+    autoCaptureFailures: raw.autoCaptureFailures === true,
+    autoCaptureMaterial: raw.autoCaptureMaterial === true,
     autoReflect: raw.autoReflect !== false,
+    /**
+     * Whether the turn boundary asks the core to distil.
+     *
+     * Deliberately not in the opt-in group above: what it writes is `evolve_candidates` — a derived
+     * table that is never injected, never promoted on its own, and rebuildable from the signals it
+     * reads. The switches above gate *knowledge*; this one only makes a candidate visible sooner
+     * than the six-hour window would.
+     *
+     * Default on, because the peer comparison is blunt about it: the projects that move "what is
+     * worth keeping" from the person to the system are the ones whose libraries keep growing.
+     * Setting it false leaves the scheduled pass untouched — nothing is disabled, only the
+     * turn-boundary pass.
+     */
+    autoDistill: raw.autoDistill !== false,
     projectRoot: (typeof raw.projectRoot === 'string' && raw.projectRoot.trim()) ? resolve(raw.projectRoot) : null,
     // Where the shared database lives. The adapter needs it to start a core
     // when none is running; the credential's own directory is authoritative.

@@ -4,11 +4,14 @@ import { createHash } from 'node:crypto';
 import { DomainError, knowledgeSchema } from './schema.js';
 import type { Store } from './store.js';
 import { digestSchema, validateWorkflowDraft, workflowSourceHash } from './workflow-draft.js';
+// The credential judgement is shared with the write path (see redact.ts): one definition, so
+// an export and a write can never disagree about the same bytes.
+import { CREDENTIAL_PATTERN, credentialRule, redactDeep, type RedactionFinding } from './redact.js';
 
 export const BACKUP_FORMAT = 'agent-memory-backpack-backup-v1';
 export const BACKUP_VERSION = 1;
 export const BACKUP_MARKER = 'backup-manifest.json';
-export interface BackupExportResult { directory: string; written: string[]; counts: Record<string, number>; skipped: Array<{ id: string; reason: string }>; }
+export interface BackupExportResult { directory: string; written: string[]; counts: Record<string, number>; skipped: Array<{ id: string; reason: string }>; redactions?: Array<{ where: string; rule: string }>; }
 export interface BackupImportResult { imported: number; skipped: number; conflicts: Array<{ id: string; reason: string }>; wrote: boolean; }
 type Row = Record<string, string | number | null>;
 const tables = ['knowledge', 'revisions', 'workflow_search', 'supersessions', 'adoptions', 'tasks', 'proposals', 'events', 'meta'] as const;
@@ -38,58 +41,31 @@ function guard(directory: string): void {
   }
 }
 /**
- * Placeholder values that documentation uses to *teach* how to supply a credential.
+ * Where a refusal came from, and which rule fired — never the matched text.
  *
- * A library that explains an API necessarily contains strings like `API_KEY=...`
- * or `Bearer <token>`. Refusing to export such a library makes the guard useless in
- * practice, because it blocks exactly the entries that help a later reader - and the
- * bytes it blocks are the instruction, not a secret.
- *
- * The shape of the fix follows how secret scanners handle the same problem: keep the
- * rule, and allowlist the *placeholder form* narrowly. A whole-entry exemption would
- * go blind to a real credential sitting in the same document, so the check below asks
- * "is the matched value itself a placeholder?" rather than "does this entry mention
- * credentials at all?". A live key in the same body is still refused.
+ * The judgement itself lives in `redact.ts`, because the write path needs the same one: this
+ * module only decides what to *do* about a hit (refuse, or rewrite when asked). Keeping two
+ * copies is what would let the two paths disagree about the same bytes.
  */
-const PLACEHOLDER_VALUE = /^(?:<[^>]*>?|\{\{[^}]*\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\.{2,}|…+|[xX*]{2,}|(?:YOUR|MY|THE)[_-].*|REPLACE[_-]?.*|CHANGE[_-]?ME|TODO|FIXME|NONE|NULL|SECRET|PASSWORD|TOKEN|KEY|VALUE|EXAMPLE|SAMPLE|DUMMY|FAKE|TEST[A-Z_]*|[a-z_]+[_-]?key|your[_-]?[a-z]*|placeholder|redacted|omitted)?$/i;
+type GuardFinding = RedactionFinding;
 
-/**
- * Whether a matched credential-shaped value is really just a placeholder.
- *
- * `strict` applies to values that follow a *token prefix* (`sk-`, `ghp_`, `Bearer`):
- * those prefixes only ever appear in front of a credential, so the value must carry an
- * explicit placeholder marker to pass. A long run of letters with no marker is a key
- * as far as this guard is concerned - even when it happens to contain no digits, which
- * is the one signal that otherwise reads as "prose". (A regression test caught exactly
- * this: `api_key=sk-abcdefghijklmnopqrstuvwxyz` was being allowed through.)
- *
- * The default (`strict = false`) applies to values that follow a *setting name*
- * (`api_key=`, `password=`, `client_secret=`), where the value is usually an English
- * word lifted from documentation: "Bearer error", `api_key=os.environ[`,
- * `password = [redacted]`. There "contains no digit" is a sound signal for prose.
- */
-function isPlaceholderValue(value: string | undefined, strict = false): boolean {
-  if (value === undefined) return false;
-  const trimmed = value.trim().replace(/^["']|["'`,;)\]]+$/g, '');
-  // An empty result means the pattern matched a bare key with nothing after it,
-  // which carries no secret to leak.
-  if (trimmed === '') return true;
-  // Whole-value placeholder: `<key>`, `YOUR_KEY`, `REPLACE_ME`, `...`, `sk-xxx@`.
-  if (PLACEHOLDER_VALUE.test(trimmed)) return true;
-  // A value built out of variable or template syntax is a reference, not a secret:
-  // `$RUNPOD_API_KEY`, `${{ secrets.TOKEN }}`, `${KEY}`.
-  if (/[$%{}<>]/.test(trimmed)) return true;
-  // Runs of one repeated character are the standard "type something here" filler
-  // (`xxx`, `abc`, `0000`). A real key does not contain three identical characters
-  // in a row, so this does not weaken the rule in practice.
-  if (/(.)\1{2,}/.test(trimmed)) return true;
-  // No digit means prose - but only where the surrounding syntax is a setting name.
-  // After a token prefix, an all-letter value is still a key.
-  if (!/\d/.test(trimmed)) return !strict;
-  return false;
+/** Refuse a located set of findings: first few by name, the rest by count. */
+function refuseFindings(findings: GuardFinding[]): void {
+  if (!findings.length) return;
+  const shown = findings.slice(0, 8).map(item => `${item.where}〔${item.rule}〕`).join('；');
+  const rest = findings.length > 8 ? `；另有 ${findings.length - 8} 处` : '';
+  refuse(`Credential-shaped content refused：${findings.length} 处（${shown}${rest}）`
+    + '。定位到的位置与规则如上，命中的值一律不回显；'
+    + '要保留这份内容，用 backup --redact-credentials 导出（命中值会被替换，凭证形状的字节不进包），'
+    + '或按定位改写该条内容后重试。');
 }
 
-function guardContent(value: unknown): void {
+function redactRow(row: Row, where: string): { value: Row; hits: GuardFinding[] } {
+  const { value, findings } = redactDeep(row, where);
+  return { value, hits: findings };
+}
+
+function guardContent(value: unknown, where: string, findings: GuardFinding[]): void {
   if (typeof value === 'string') {
     // Naming a file is not holding one. The file-level guard above already refuses
     // to put `core.json`, `*-client.json` or `.credentials*` into the archive, so by
@@ -97,41 +73,24 @@ function guardContent(value: unknown): void {
     // on top of that blocked a real library whose own notes explain where the
     // credential lives - which is precisely the sentence a later reader needs.
     // A credential *value* is still refused by the check below.
-    // Each alternative captures the value that follows the key, so the placeholder
-    // test can look at that value rather than at the whole string.
-    const m = /\b(?:sk-([a-zA-Z0-9_-]{16,})|gh[pousr]_([a-zA-Z0-9]{20,})|Bearer\s+([a-zA-Z0-9._-]+))|-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|client[_-]?secret)\s*["']?\s*[:=]\s*["']?([^\s"',}]+)/i.exec(value);
-    if (m) {
-      const matchedValue = m[1] ?? m[2] ?? m[3] ?? m[4];
-      // Decide by the *value's own shape*, not by which capture group fired: the
-      // alternation tries `api_key=` before `sk-`, so for `api_key=sk-abcdef...` the
-      // value arrives in group 4 while still carrying a token prefix. Looking only at
-      // the group made that case take the tolerant path and let a key through.
-      const value = matchedValue ?? '';
-      // Two ways a value can be "token-shaped": it literally carries the prefix itself
-      // (the `api_key=sk-...` case, where the alternation matched the setting name and
-      // swept the prefix into the value), or it arrived through the `Bearer <value>`
-      // branch, where the prefix deliberately stays outside the capture group - so the
-      // value alone can never reveal it.
-      //
-      // Length gates the strictness, because `Bearer` also introduces plain English in
-      // prose - "Bearer error", "Bearer header", "bearer token expired" - and a short
-      // word like that must never be read as a credential. A credential of any real
-      // format is long; nothing shorter than this threshold can be one.
-      const tokenPrefix = /^(?:sk-|gh[pousr]_)/i.test(value) || m[3] !== undefined;
-      const followsTokenPrefix = tokenPrefix && value.length >= 24;
-      // A real header reads `-----BEGIN RSA PRIVATE KEY-----`; prose that *describes*
-      // the pattern writes it with regex metacharacters (`-----BEGIN .*PRIVATE KEY-----`),
-      // which no actual header contains. The literal form is always refused.
-      const privateKeyHeader = m[0].toUpperCase().includes('PRIVATE KEY');
-      const describedNotMaterial = /[*?(){}[\]]/.test(m[0]);
-      if (privateKeyHeader ? !describedNotMaterial : !isPlaceholderValue(value, followsTokenPrefix))
-        refuse('Credential-shaped content refused');
+    // Every match, not just the first. A body that mentions a placeholder early and a
+    // credential-shaped value later was cleared on the strength of the placeholder, while
+    // the redacting scan below — which walks all matches — rewrote that same body. Two
+    // halves of one guard disagreeing about the same bytes is both a missed detection and
+    // the reason a redacted archive failed to import: the rewrite invalidated a workflow
+    // draft's binding to a revision the strict scan had called clean.
+    for (const m of value.matchAll(new RegExp(CREDENTIAL_PATTERN.source, 'gi'))) {
+      const rule = credentialRule(m as unknown as RegExpExecArray);
+      if (rule) findings.push({ where, rule });
     }
-    if (/^\s*[\[{]/.test(value)) { let parsed: unknown; try { parsed = JSON.parse(value); } catch { return; } guardContent(parsed); }
+    if (/^\s*[\[{]/.test(value)) { let parsed: unknown; try { parsed = JSON.parse(value); } catch { return; } guardContent(parsed, where, findings); }
   } else if (value && typeof value === 'object') {
     for (const [key, item] of Object.entries(value)) {
-      if (/^(?:token|api[_-]?key|access[_-]?token|refresh[_-]?token|password|client[_-]?secret|credentials?)$/i.test(key)) refuse('Credential-shaped field refused');
-      guardContent(item);
+      if (/^(?:token|api[_-]?key|access[_-]?token|refresh[_-]?token|password|client[_-]?secret|credentials?)$/i.test(key)) {
+        findings.push({ where: `${where}.${key}`, rule: '凭据字段名' });
+        continue;
+      }
+      guardContent(item, `${where}.${key}`, findings);
     }
   }
 }
@@ -156,7 +115,16 @@ function load(directory: string): { data: Record<string, Row[]> } {
     for (const table of [...tables, ...optionalTables.filter(table => names.includes(`${table}.json`))]) {
       const value = JSON.parse(texts.get(table)!);
       if (!Array.isArray(value) || value.length !== manifest.counts[table]) refuse(`Backup count mismatch: ${table}`);
-      guardContent(value);
+      // The same exemption the export side already makes, for the same reason: this table
+      // is a derived, normalised projection of text whose authority travels in `revisions`.
+      // Checking it here and not there made an archive that was written successfully fail
+      // to import — a one-sided rule reads as "the package is corrupt" when the bytes are
+      // exactly what the exporter produced.
+      if (table !== 'workflow_search') {
+        const findings: GuardFinding[] = [];
+        guardContent(value, table, findings);
+        refuseFindings(findings);
+      }
       data[table] = value;
     }
     return { data };
@@ -167,7 +135,7 @@ function load(directory: string): { data: Record<string, Row[]> } {
 }
 
 /** Snapshot every authority table, including retired heads and immutable history. */
-export function exportAll(store: Store, options: { directory: string; dryRun?: boolean }): BackupExportResult {
+export function exportAll(store: Store, options: { directory: string; dryRun?: boolean; redactCredentials?: boolean }): BackupExportResult {
   const directory = resolve(options.directory);
   guard(directory);
   if (existsSync(directory)) load(directory);
@@ -183,6 +151,27 @@ export function exportAll(store: Store, options: { directory: string; dryRun?: b
       if (!known.has(name)) skipped.push({ id: name, reason: ['maintenance_jobs', 'revision_notifications', 'outbox'].includes(name) ? 'Device-local executable queues and notifications are not restored; current configuration reconciles fresh jobs' : name.startsWith('workflow_search_') || name === 'sqlite_sequence' ? 'SQLite internal state is regenerated from exported rows' : 'Unknown table is not supported by this backup version' });
     }
   } finally { store.db.exec('ROLLBACK'); }
+  /**
+   * Carry only the index rows the authority tables can still justify.
+   *
+   * The import side refuses a search row whose knowledge entry is retired or is a norm
+   * (`Orphan search row`), and it is right to: the index is derived, so such a row asserts
+   * a projection of something the package either does not carry as active or does not index
+   * at all. The export side shipped all 906 rows of a real library anyway — 81 of them broke
+   * that rule (7 norms, 74 retired entries) — so a package could be written successfully and
+   * then fail to import, with the failure naming a row the user never created and cannot edit.
+   * The rows are dropped here rather than tolerated on import, because the destination can
+   * rebuild them from the authority tables and a one-sided rule is what made the pair
+   * disagree in the first place.
+   */
+  if (data.workflow_search?.length) {
+    const indexable = new Set(store.db.prepare("SELECT id FROM knowledge WHERE status='active' AND kind<>'norm'").all().map(row => String((row as { id: string }).id)));
+    const kept = data.workflow_search.filter(row => indexable.has(String(row.id)));
+    if (kept.length !== data.workflow_search.length) {
+      skipped.push({ id: 'workflow_search', reason: `派生索引行 ${data.workflow_search.length - kept.length} 条没有对应的生效条目（已退役或不参与索引的规范），不随包迁移；目标库可由权威表重建索引` });
+      data.workflow_search = kept;
+    }
+  }
   // The full-text index is derived from the rows above, and building it normalises
   // the text (lower-cased, punctuation stripped). That destroys exactly the shapes the
   // content guard looks for: a body that *describes* `-----BEGIN .*PRIVATE KEY-----`
@@ -191,20 +180,83 @@ export function exportAll(store: Store, options: { directory: string; dryRun?: b
   // in `revisions`, so the index is skipped; refusing an export over a lossy
   // projection of text the user never wrote is a false positive with no security
   // value - and it was the single remaining blocker on a real library.
+  // Every row reports its own location, and every hit is collected before anything is
+  // refused: one failed run then enumerates the whole work list instead of its first item.
+  const findings: GuardFinding[] = [];
+  const redactions: GuardFinding[] = [];
+  // Revisions the redacting pass rewrote, so anything bound to their bytes by hash can be
+  // handled instead of shipping a package that fails its own integrity check on import.
+  const rewrittenRevisions = new Set<string>();
   for (const [table, tableRows] of Object.entries(data)) {
-    if (table === 'workflow_search') continue;
-    guardContent(tableRows);
+    // The derived full-text table is skipped by the strict scan (see the note where it is
+    // exported), but a redacting export still has to walk it: the index is a normalised
+    // copy of the same bodies, so leaving it alone would put back a fragment of exactly the
+    // value that was just removed from the authoritative text.
+    if (table === 'workflow_search' && !options.redactCredentials) continue;
+    const rowsOut: Row[] = [];
+    for (const [index, row] of tableRows.entries()) {
+      const id = row.id ?? row.key ?? row.proposal_id ?? '';
+      const where = id === '' ? `${table}[${index}]` : `${table}:${id}`;
+      if (options.redactCredentials) {
+        const { value, hits } = redactRow(row, where);
+        redactions.push(...hits);
+        if (hits.length && table === 'revisions') rewrittenRevisions.add(`${String(row.id)}@${String(row.revision)}`);
+        rowsOut.push(value as Row);
+      } else {
+        guardContent(row, where, findings);
+        rowsOut.push(row);
+      }
+    }
+    // The written bytes come from `data`, so a redacting export must replace the rows
+    // here rather than only report them.
+    if (options.redactCredentials) data[table] = rowsOut;
   }
+  // A workflow draft is bound to its source revision by a hash of that revision's bytes.
+  // Redacting those bytes makes the binding false, and the import path refuses a package
+  // whose draft no longer matches its own source — correctly, since the draft was derived
+  // from text that is no longer there. Rewriting the hash to fit would invent an approval
+  // that never happened, so the draft is left out and the reason is recorded. It is not
+  // lost: it stays on the machine it was created on, and the archive simply does not carry
+  // a claim it can no longer support.
+  if (options.redactCredentials && rewrittenRevisions.size && data.workflow_drafts?.length) {
+    const kept: Row[] = [];
+    for (const draft of data.workflow_drafts) {
+      let bound: string | null = null;
+      if (draft.result !== null && draft.result !== undefined) {
+        try {
+          const source = (JSON.parse(String(draft.result)) as { source?: { skillId?: unknown; revision?: unknown } }).source;
+          if (source && source.skillId !== undefined && source.revision !== undefined)
+            bound = `${String(source.skillId)}@${String(source.revision)}`;
+        } catch { bound = null; }
+      }
+      if (bound && rewrittenRevisions.has(bound)) {
+        skipped.push({ id: String(draft.id), reason: '草案绑定的来源正文含凭据形状的值，已按 --redact-credentials 改写，绑定不再成立；草案保留在源机器上，不随这个包迁移' });
+        continue;
+      }
+      kept.push(draft);
+    }
+    data.workflow_drafts = kept;
+  }
+  // In the redacting mode nothing is refused: the strict path's objection is answered by
+  // removing the bytes, which is what the objection was about. `findings` stays empty
+  // there, and `redactions` records what was rewritten.
+  if (!options.redactCredentials) refuseFindings(findings);
   const counts = Object.fromEntries(Object.keys(data).map(table => [table, data[table]!.length]));
   const files = Object.fromEntries(Object.keys(data).map(table => [`${table}.json`, json(data[table])]));
-  const manifest = json({ format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: new Date().toISOString(), files: Object.fromEntries(Object.entries(files).map(([name, text]) => [name, hash(text)])), counts, skipped });
+  const manifest = json({
+    format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: new Date().toISOString(),
+    files: Object.fromEntries(Object.entries(files).map(([name, text]) => [name, hash(text)])), counts, skipped,
+    // Redactions travel in the manifest so the package explains itself: a reader can see
+    // that a value was removed, where, and under which rule — without the value.
+    ...(redactions.length ? { redacted: redactions } : {}),
+  });
   const written = [...Object.keys(files), BACKUP_MARKER].map(name => join(directory, name));
   if (!options.dryRun) {
     mkdirSync(directory, { recursive: true });
     for (const [name, text] of Object.entries(files)) writeFileSync(join(directory, name), text, 'utf8');
     writeFileSync(join(directory, BACKUP_MARKER), manifest, 'utf8');
   }
-  return { directory, written, counts, skipped };
+  return { directory, written, counts, skipped, ...(redactions.length ? { redactions } : {}) };
 }
 
 /** Merge without deleting local rows; immutable history must agree byte for byte. */

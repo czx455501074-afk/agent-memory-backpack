@@ -195,6 +195,10 @@ test('fake clock cleanup expires proposal content after 30 days and removes old 
   });
 
   now += 30 * 86400000;
+  // Cleanup is the maintenance tick's job, not a side effect of asking for stats: the fix
+  // that removed `cleanup()` from `stats()` is pinned by
+  // `stats-read-only.test.ts`, and this suite now drives retention explicitly.
+  store.cleanup();
   const stats = store.stats();
   assert.equal(stats.pendingProposals, 0);
   assert.equal(stats.events, 0);

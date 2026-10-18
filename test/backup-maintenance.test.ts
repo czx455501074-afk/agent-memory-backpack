@@ -26,10 +26,14 @@ test('portable backup preserves model review and checkpoint receipts without rev
     assert.equal(marker.files['maintenance_jobs.json'], undefined);
     assert.equal(marker.files['revision_notifications.json'], undefined);
     assert.ok(exported.skipped.some(item => item.id === 'maintenance_jobs' && /Device-local/.test(item.reason)));
-    const before = target.db.prepare("SELECT name FROM sqlite_master WHERE name='model_reviews'").get();
-    assert.equal(before, undefined);
+    // `model_reviews` now exists from the moment the store opens — it is part of the schema,
+    // because `cleanup()` prunes orphaned reviews and cannot run against a table that may not
+    // be there. So the assertion is about *content*, not existence: a dry run must not fill
+    // it, and a real import must produce exactly the source's rows.
+    const reviewCount = () => Number(target.db.prepare('SELECT count(*) AS n FROM model_reviews').get()!.n);
+    assert.equal(reviewCount(), 0, '目标库打开后该表存在但为空');
     importAll(target, { directory, dryRun: true });
-    assert.equal(target.db.prepare("SELECT name FROM sqlite_master WHERE name='model_reviews'").get(), undefined, 'dry run must not create optional tables');
+    assert.equal(reviewCount(), 0, 'dry run must not import rows');
     importAll(target, { directory });
     assert.deepEqual(target.db.prepare('SELECT * FROM model_reviews').all(), source.db.prepare('SELECT * FROM model_reviews').all());
     assert.deepEqual(target.db.prepare('SELECT value FROM meta WHERE key=?').get(checkpointKey), source.db.prepare('SELECT value FROM meta WHERE key=?').get(checkpointKey));

@@ -80,7 +80,9 @@ test('outage preserves candidate locally, 4xx is not queued, disable is respecte
   const dataDir = mkdtempSync(join(tmpdir(), 'amb-capture-'))
   const records = []
   const logger = { info: (...args) => records.push(args), warn: (...args) => records.push(args) }
-  const config = { projectId: 'shared', dataDir, token: 'secret' }
+  // Capture is opt-in now; this suite tests the capture path, so it switches it on by name. The
+  // opt-out assertion below still pins the opposite direction.
+  const config = { projectId: 'shared', dataDir, token: 'secret', autoCaptureFailures: true }
   const options = { ...base, result: { isError: true, error: 'missing binary' } }
   try {
     const client = { post: async () => { throw new Error('unavailable') } }

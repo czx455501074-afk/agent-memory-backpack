@@ -36,6 +36,8 @@ npm run build
 
 # 2. 本地安装（自动初始化数据目录、生成凭据、运行自检）
 npm run install:local
+#    更短的等价入口：node dist/src/cli.js setup —— 它同样建目录与凭据，并额外打印
+#    「装进宿主」所需的精确命令（profile 名与仓库路径都已解析，你不用填）
 
 # 可选：同时安装到 Codex 工作区
 npm run install:local -- --codex-workspace <工作区名称>
@@ -167,6 +169,7 @@ node dist/src/cli.js restore --data-dir $AMB --file backup.ambpack --yes
 ```
 
 - `backup` 生成 `.ambpack` 文件，包含全部知识、经验、历史版本。`--yes` 确认写入，否则只干跑。
+- `--redact-credentials`：库里若有**形状像凭据**的内容（例如某条记录在讲"API key 长什么样"、或记着用来测试本守卫的样本），导出会**拒绝并报出定位与规则名**，从不回显命中的值。加这个开关则改为**替换**那些值再导出，位置写进归档 manifest 的 `redacted`。**默认仍是拒绝**——放宽只发生在这个显式开关之后。
 - `restore` 不带 `--yes` 时只检查归档（导出时间、条目计数、文件列表），不触碰数据库。
 - `restore --yes` 合并归档到当前库，重复条目会跳过，不覆盖本地更新。
 

@@ -48,7 +48,9 @@ test('core receipt proves persistence, duplicate reads do not renew 90 day mater
   t.after(async () => { server.closeAllConnections(); await new Promise(done => server.close(done)); store.close(); rmSync(dir, { recursive: true, force: true }) })
   const records = []
   const logger = { info: (...args) => records.push(args), warn: (...args) => records.push(args) }
-  const config = { projectId: 'shared', token }
+  // Material capture is opt-in now; this suite exercises the capture path, so it opts in. The
+  // assertion below still pins `autoCaptureMaterial: false` to the empty result.
+  const config = { projectId: 'shared', token, autoCaptureMaterial: true }
   const client = { post: async (path, body) => {
     const response = await fetch(`http://127.0.0.1:${server.address().port}${path}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'x-amb-protocol': '1' }, body: JSON.stringify(body) })

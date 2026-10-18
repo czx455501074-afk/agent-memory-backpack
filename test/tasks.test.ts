@@ -132,6 +132,8 @@ test('任务和事件采用不同保留策略：日记长期保留，原始事�
   store.event('dsh', { eventId: 'evt-temp', adapter: 'dsh', projectId: PROJECT, kind: 'turn_stopped', summary: '临时事件' });
 
   now += 31 * 86400000;
+  // Retention runs on the maintenance clock, not on whoever asked for stats.
+  store.cleanup();
   const stats = store.stats();
   assert.equal(stats.events, 0, '原始事件按 30 天清理');
   assert.equal(stats.tasks, 1, '任务日记不被事件清理牵连');

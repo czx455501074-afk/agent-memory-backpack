@@ -32,7 +32,12 @@ test('real Loader reads isolated config, loads packaged AMB, retrieves bodies an
   const server = createCoreServer(store, { protocolVersion: 1, port: 47631,
     clients: [{ id: 'dsh', token, projectId: 'loader-library' }] });
   await new Promise(done => server.listen(0, '127.0.0.1', done));
-  await writeFile(process.env.AMB_DSH_CONFIG, JSON.stringify({ endpoint: `http://127.0.0.1:${server.address().port}`, token, projectId: 'loader-library' }));
+  // This fixture proves the packaged plugin retains a failed-tool receipt, and capture is
+  // opt-in — so the switch has to be named here. Leaving it out would make the suite pass
+  // only while the parser silently defaulted capture to on, which is the defect it now
+  // guards against (see test/adapter-defaults.test.mjs).
+  await writeFile(process.env.AMB_DSH_CONFIG, JSON.stringify({
+    endpoint: `http://127.0.0.1:${server.address().port}`, token, projectId: 'loader-library', autoCaptureFailures: true }));
   const root = new Context();
   const loader = new Loader(root, { baseUrl: pathToFileURL(join(dir, 'cordis.yml')).href });
   t.after(async () => {

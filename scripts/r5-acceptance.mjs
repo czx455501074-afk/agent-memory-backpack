@@ -54,6 +54,12 @@ const short = raw => {
   return parts.length > 1 ? `${parts[0]}:${parts[1].slice(0, 10)}` : id.slice(0, 24);
 };
 
+/** Does the library's own index contain this fragment? The same question the store asks. */
+const presentInIndex = (token) => {
+  try { return Boolean(store.db.prepare('SELECT 1 FROM workflow_search WHERE workflow_search MATCH ? LIMIT 1').get(`"${token}"`)); }
+  catch { return false; }
+};
+
 // 1 + 2: reach and receipt, per query. The selection is taken the way the host
 // takes it: `/v1/prepare` forwards `selectedIds` whenever the selection is not the
 // unconfigured case, so asking the core with no selection would test a path the
@@ -86,7 +92,53 @@ for (const query of asked) {
       selected: prepared.retrieval.selected.map(item => short(item.id)),
     },
     budget: { used: prepared.budget.usedChars, limit: prepared.budget.limitChars, norms: prepared.norms.length },
-    _matchedOk: matched.length > 0,
+    _issues: (() => {
+      /**
+       * What "an honest receipt" actually means, spelled out.
+       *
+       * This used to be a single test — `matchedTokens.length > 0` — while the file's own header
+       * described the property as "a matched term is not simultaneously reported as a gap". Those
+       * are not the same claim, and the difference showed up on the degraded path: the local index
+       * selected an entry, the evidence floor withheld it, nothing was injected, and the script
+       * called the receipt dishonest for reporting no matches. A receipt with nothing injected and
+       * nothing matched is *accurate*; what would be dishonest is calling the query a coverage gap
+       * at the same moment the index found something for it.
+       *
+       * So the checks below are the property, not a proxy for it — and they are strictly more than
+       * the old one:
+       *   1. a matched term may never appear in `gaps` (the original intent, never implemented);
+       *   2. if entries were actually injected, the receipt must name what matched them;
+       *   3. if nothing was injected, the receipt must not silently imply the library is empty —
+       *      either it reports withheld candidates, or it claims gaps (which the store now verifies
+       *      against the index before claiming).
+       */
+      const issues = [];
+      const overlap = matched.filter(token => prepared.retrieval.gaps.includes(token));
+      if (overlap.length) issues.push(`命中的词同时被报成缺口：${overlap.slice(0, 5).join('、')}`);
+      if (prepared.retrieval.shown > 0 && matched.length === 0 && !prepared.retrieval.selectionBasis)
+        issues.push('注入了条目却没有任何命中词，也没有说明选择依据');
+      // The check that actually catches the measured defect: when the index offered candidates and
+      // the evidence floor withheld them, a fragment the library *contains* must not be reported as
+      // a coverage gap. An earlier version of this script checked for the presence of a `withheld`
+      // field instead — and a deliberately reverted fix still passed it, which is how a check that
+      // inspects the wrong thing gets discovered.
+      //
+      // Scoped to the withheld case on purpose: with no candidates in hand, an empty selection
+      // keeps its established meaning ("searched, nothing matched") and every fragment is listed.
+      if (prepared.retrieval.withheld) {
+        const falseGaps = prepared.retrieval.gaps.filter(presentInIndex);
+        if (falseGaps.length) issues.push(`把库内存在的片段报成覆盖缺口：${falseGaps.slice(0, 5).join('、')}`);
+      }
+      // Only when the receipt has *nothing* to show: no injected entries, no hit words, no withheld
+      // candidates — and yet claims the query fragments are coverage gaps. A selection that matched
+      // a norm (which travels by its own path and is not part of `shown`) legitimately has hits and
+      // gaps at once, so requiring hit words to be absent is what keeps this check from firing on
+      // honest receipts.
+      if (prepared.retrieval.shown === 0 && prepared.retrieval.gaps.length > 0 && matched.length === 0
+        && !prepared.retrieval.withheld && !prepared.retrieval.note.includes('没有检索意图'))
+        issues.push('没有注入、也没有任何命中词，却声称存在覆盖缺口');
+      return issues;
+    })(),
   });
 }
 
@@ -104,9 +156,11 @@ const shape = {
 console.log(JSON.stringify({ projectId, results, shape }, null, 2));
 
 const reachOk = results.every(item => item.top.some(hit => hit.kind === 'norm'));
-const receiptOk = results.every(item => item._matchedOk);
+const receiptIssues = results.flatMap(item => item._issues.map(issue => `${item.query}：${issue}`));
+const receiptOk = receiptIssues.length === 0;
 console.log(`\n检索可达规范: ${reachOk ? 'PASS' : 'FAIL（准原文查询没能在索引路径命中规范）'}`);
-console.log(`回执诚实   : ${receiptOk ? 'PASS' : 'FAIL（matchedTokens 为空，缺口头全部命中词）'}`);
+console.log(`回执诚实   : ${receiptOk ? 'PASS（命中词与缺口无交集；注入与未注入两种情况都如实说明）' : 'FAIL'}`);
+for (const issue of receiptIssues) console.log(`      - ${issue}`);
 
 store.close();
 rmSync(scratch, { recursive: true, force: true });

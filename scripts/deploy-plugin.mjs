@@ -46,7 +46,7 @@ if (values.help) {
     '',
     'Usage: node scripts/deploy-plugin.mjs [options]',
     '',
-    '  --artifact DIR   packaged artifact root (default: artifacts/latest.json)',
+    '  --artifact DIR   packaged artifact root (default: artifacts/latest.json, else the newest artifacts/p0-*)',
     '  --target DIR     where to place the plugin package',
     '                   (default: $AMB_PLUGIN_DIR, else <dsh home>/plugins/agent-memory-backpack)',
     '  --profiles LIST  comma-separated profile names (default: every profile that declares it)',
@@ -56,8 +56,35 @@ if (values.help) {
   process.exit(0);
 }
 
-const artifactRoot = resolve(values.artifact
-  ?? JSON.parse(readFileSync(join(root, 'artifacts', 'latest.json'), 'utf8')).directory);
+/**
+ * Which packaged artifact to deploy, without assuming the pointer still points at something.
+ *
+ * `artifacts/latest.json` is the normal answer, but it is a record *into* a directory that is
+ * now rotated (see ARTIFACT_KEEP in package.mjs): a cleanup can remove the copy it names while
+ * the record survives, and the record itself can be gone. Reading it blindly made `deploy:plugin`
+ * die with ENOENT on a machine whose artifacts had just been cleaned — the failure named a JSON
+ * file rather than the situation. Falling back to the newest `p0-*` copy keeps deployment working
+ * after a cleanup; when there is nothing at all, the message names the command that produces one.
+ */
+function latestArtifactRoot() {
+  const record = join(root, 'artifacts', 'latest.json');
+  if (existsSync(record)) {
+    try {
+      const named = JSON.parse(readFileSync(record, 'utf8')).directory;
+      if (typeof named === 'string' && existsSync(join(named, 'dsh-plugin'))) return named;
+    } catch { /* fall through to the newest copy */ }
+  }
+  const artifacts = join(root, 'artifacts');
+  let newest;
+  try { newest = readdirSync(artifacts).filter(name => /^p0-\d+$/.test(name)).sort().pop(); }
+  catch { newest = undefined; }
+  if (newest) return join(artifacts, newest);
+  console.error('No packaged artifact to deploy: artifacts/latest.json is absent or stale, and artifacts/ holds no p0-* copy.');
+  console.error('Run "npm run pack:local" first.');
+  process.exit(1);
+}
+
+const artifactRoot = resolve(values.artifact ?? latestArtifactRoot());
 const source = join(artifactRoot, 'dsh-plugin');
 validateDshClient(source);
 if (!existsSync(join(source, SENTINEL))) {
@@ -310,6 +337,26 @@ function commit() {
       renameSync(operation.staged, operation.target);
     }
   } catch (error) {
+    /**
+     * A running core holds its own directory open, and Windows refuses to rename a
+     * directory in use (`EBUSY`). That is neither a corrupt package nor a permissions
+     * problem, and the bare Node error names neither the cause nor the fix — it surfaced
+     * as "rename core -> core.backup-…" right after a successful pack, which reads like
+     * the deploy itself is broken. Measured on this machine: deploying while the core ran
+     * left the previous build in place, while `verify-host-deployment` still reported
+     * RUNNING DEPLOYED BUILD because the core had been restarted a moment earlier. That
+     * combination is the worst kind — a green verdict over stale code.
+     */
+    if (error && ['EBUSY', 'EPERM', 'EACCES'].includes(error.code)) {
+      const target = String(error.path ?? '目标目录');
+      error.message = `部署目标被占用：${target}\n`
+        + '正在运行的核心会加载它自己的目录，Windows 因此拒绝重命名它。\n'
+        + '正确顺序是「先停核心 → 部署 → 再启动核心」：\n'
+        + '  node <core>/runtime/cli.js service stop\n'
+        + '  node scripts/deploy-plugin.mjs\n'
+        + '  node <core>/runtime/cli.js service start\n'
+        + `原始错误：${error.code}`;
+    }
     const rollbackErrors = [];
     for (const operation of operations.slice().reverse()) {
       try {

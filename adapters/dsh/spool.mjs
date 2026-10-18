@@ -112,12 +112,28 @@ export function loadSpool(dataDir) {
       return [];
     }
     const now = Date.now();
-    // Prune expired items
-    return parsed.items.filter(item => {
+    // Prune expired items, then persist the pruned list.
+    const kept = parsed.items.filter(item => {
       if (!item || typeof item !== 'object') return false;
       const age = now - (Number(item.createdAt) || 0);
+      // `age >= 0` also drops entries stamped in the future, which is what a clock that
+      // moved backwards produces — without it those rows would look eternally fresh.
       return age >= 0 && age <= SPOOL_TTL_MS && (item.attempts ?? 0) < SPOOL_MAX_ATTEMPTS;
     });
+    /**
+     * Write the survivors back before returning them.
+     *
+     * The filter used to apply to the *return value* only: expired entries stayed in the
+     * file, were re-filtered on every load, and were never sent again — with no log line
+     * and no counter saying a queued capture had been dropped. The file shrank only when
+     * some later `saveSpool` happened to run, so a session that queued nothing new kept
+     * the dead entries forever. Dropping unsent work is allowed; dropping it silently is
+     * how a user comes to believe a capture was saved when it was not.
+     */
+    if (kept.length !== parsed.items.length) {
+      try { saveSpool(dataDir, kept); } catch { /* the in-memory result is still correct */ }
+    }
+    return kept;
   } catch {
     try { renameSync(file, `${file}.corrupt-${Date.now()}`); } catch {}
     return [];

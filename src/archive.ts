@@ -189,7 +189,7 @@ export function inspectArchive(file: string): ArchiveInspectResult {
  * database directly would create a second definition of "everything", and the
  * two would eventually disagree.
  */
-export function exportArchive(store: Store, options: { file: string; dryRun?: boolean; overwrite?: boolean }): ArchiveExportResult {
+export function exportArchive(store: Store, options: { file: string; dryRun?: boolean; overwrite?: boolean; redactCredentials?: boolean }): ArchiveExportResult {
   const file = resolve(options.file);
   if (!file.toLowerCase().endsWith(ARCHIVE_EXTENSION))
     throw new DomainError('invalid_archive', `Archive file must end with ${ARCHIVE_EXTENSION}`);
@@ -203,7 +203,7 @@ export function exportArchive(store: Store, options: { file: string; dryRun?: bo
       `Refusing to overwrite an existing file: ${file}. Pass --overwrite to replace it, or choose another name.`, 409);
   const workspace = mkdtempSync(join(tmpdir(), 'amb-pack-'));
   try {
-    const staged = exportAll(store, { directory: join(workspace, 'backup'), dryRun: false });
+    const staged = exportAll(store, { directory: join(workspace, 'backup'), dryRun: false, redactCredentials: options.redactCredentials });
     const names = readdirSync(staged.directory).sort();
     const entries = names.map(name => ({ name, body: readFileSync(join(staged.directory, name)) }));
     const packed = gzipSync(tar(entries), { level: 9 });

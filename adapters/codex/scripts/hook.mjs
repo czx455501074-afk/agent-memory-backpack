@@ -99,6 +99,9 @@ function loadConfig(config, configPath) {
   if (config.autoCaptureFailures !== undefined && typeof config.autoCaptureFailures !== 'boolean') {
     throw new Error('autoCaptureFailures must be a boolean when configured');
   }
+  if (config.autoDistill !== undefined && typeof config.autoDistill !== 'boolean') {
+    throw new Error('autoDistill must be a boolean when configured');
+  }
   if (typeof config.projectId !== "string" || !config.projectId.trim()) {
     throw new Error("Agent Memory Backpack client configuration requires projectId");
   }
@@ -148,6 +151,9 @@ function loadConfig(config, configPath) {
     // decision.
     autoCaptureFailures: config.autoCaptureFailures === true,
     autoCaptureMaterial: config.autoCaptureMaterial === true,
+    // Same default and same reasoning as the DSH side: the turn boundary asks the core to distil,
+    // and what that writes is the derived candidate table — never knowledge, never a proposal.
+    autoDistill: config.autoDistill !== false,
     // The credential's directory is where the shared database lives, which the
     // core needs when it has to be started.
     dataDir: dirname(configPath),
@@ -780,9 +786,13 @@ async function archiveStoppedTurn({ config, logger, sessionId, taskId, turnKey }
   if (typeof taskId !== "string" || !taskId.trim()) return;
   const trimmed = taskId.trim();
   try {
-    const receipt = await post(config, "/v1/tasks/archive", { projectId: config.projectId, taskId: trimmed });
+    const receipt = await post(config, "/v1/tasks/archive", { projectId: config.projectId, taskId: trimmed,
+      // The turn boundary is the one moment this host knows the session stopped; the core distils
+      // on the signal (it cannot be done here — that endpoint is admin-only by design).
+      distill: config.autoDistill !== false });
     logger.info("task.archived", { adapter: "codex", sessionId, taskId: trimmed,
-      knowledgeId: receipt?.knowledgeId, revision: receipt?.revision, unchanged: receipt?.unchanged });
+      knowledgeId: receipt?.knowledgeId, revision: receipt?.revision, unchanged: receipt?.unchanged,
+      distilled: receipt?.distilled });
     saveSessionState(config.dataDir, sessionId, { archivedStopTurnKey: turnKey, archivedTaskId: trimmed });
   } catch (error) {
     logger.warn("task.archive_failed", { adapter: "codex", sessionId, taskId: trimmed,

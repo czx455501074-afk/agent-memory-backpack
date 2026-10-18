@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { z } from 'zod';
 import { Store, classificationApprovalGate } from './store.js';
 import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, outboxEntrySchema, DomainError } from './schema.js';
+import { FORBIDDEN_AUTOMATIC } from './evolve.js';
 import { coreSchema, type CoreConfig } from './config.js';
 import { exportArchive, importArchive, inspectArchive } from './archive.js';
 import { capabilityManifest, operatingModeFromDisk } from './capabilities.js';
@@ -60,7 +61,7 @@ const ADMIN_ONLY = new Set([
   // The rest of the review lifecycle is the human's for the same reason approval is:
   // holding a candidate for evidence, archiving it, or acting on many at once are all
   // review decisions, and an agent that could call them could clear its own queue.
-  '/v1/proposals/request-evidence', '/v1/proposals/archive', '/v1/proposals/reopen', '/v1/proposals/batch',
+  '/v1/proposals/request-evidence', '/v1/proposals/archive', '/v1/proposals/reopen', '/v1/proposals/batch', '/v1/proposals/group',
   '/v1/rescan/interval', '/v1/rescan/mark',
   '/v1/knowledge/supersede', '/v1/knowledge/structure',
   // Migration moves the whole library, so it belongs to the human. An agent that
@@ -85,7 +86,11 @@ const ADMIN_ONLY = new Set([
   // not: an adapter holds the item that failed, so recording it is not a
   // management decision, and the replay only re-sends what the adapter already
   // tried to send.
-  '/v1/outbox/list', '/v1/outbox/purge',
+  '/v1/outbox/list', '/v1/outbox/purge', '/v1/outbox/requeue',
+  // Running evolution writes candidates into a table a person then reviews; reading the
+  // summary is a read, but it belongs beside it so one credential does not see half of it.
+  '/v1/evolution/run', '/v1/evolution/summary',
+  '/v1/evolution/consolidate', '/v1/evolution/promote',
   '/v1/maintenance/status',
   '/v1/maintenance/retry',
   '/v1/workflow-drafts/list', '/v1/workflow-drafts/get', '/v1/workflow-drafts/generate', '/v1/workflow-drafts/approve',
@@ -356,14 +361,100 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(500).optional() }).parse(body);
           return reply(res, 200, store.outboxStatus(p.projectId, p.limit));
         }
+        /**
+         * Reopen deliveries whose abandonment reason was a defect, not the content.
+         *
+         * Admin-only: it changes queue state, and the payloads it moves belong to the
+         * human. `dryRun` defaults to true so the count and the reasons are visible before
+         * anything is re-queued — the same shape as `amb reclassify`, because both are
+         * "rewrite stored verdicts" operations.
+         */
+        case '/v1/outbox/requeue': {
+          const p = z.object({
+            projectId: z.string(),
+            limit: z.number().int().positive().max(5000).optional(),
+            reasonPattern: z.string().min(1).max(200).optional(),
+            dryRun: z.boolean().default(true),
+          }).parse(body);
+          const result = store.requeueAbandoned({ projectId: p.projectId, limit: p.limit, reasonPattern: p.reasonPattern, dryRun: p.dryRun });
+          return reply(res, 200, {
+            ...result,
+            note: result.dryRun
+              ? '这是预演：只统计符合条件的已放弃条目与原因，没有改动任何一行。带 dryRun=false 才会真正重新入队。'
+              : `已把 ${result.requeued} 条重新入队，截止时间延长 30 天、重试次数归零；下一次重放会按现有幂等路径送达或再次拒绝。`,
+          });
+        }
+        /**
+         * Stage one of the evolution pipeline: repeated signals → candidates.
+         *
+         * `dryRun` defaults to true, because the first call against a real library must be
+         * able to show what it would produce before anything is stored. Even a real run
+         * writes only to `evolve_candidates`: knowledge, norms and supersessions stay a
+         * person's decision, and `forbidden` restates that list in the response rather than
+         * leaving it to documentation nobody reads.
+         */
+        case '/v1/evolution/run': {
+          const p = z.object({
+            projectId: z.string(),
+            dryRun: z.boolean().default(true),
+            limit: z.number().int().positive().max(50000).optional(),
+          }).parse(body);
+          const result = store.runEvolution({ projectId: p.projectId, dryRun: p.dryRun, limit: p.limit });
+          return reply(res, 200, {
+            ...result,
+            forbidden: FORBIDDEN_AUTOMATIC,
+            note: result.dryRun
+              ? '这是预演：只统计会产出哪些候选，没有写入任何一行。带 dryRun=false 才会写入 evolve_candidates。'
+              : `已写入 ${result.candidates.length} 条候选；知识库未变（版本仍为 ${result.knowledgeRevision}），升格仍需要人。`,
+          });
+        }
+        /**
+         * Stages two and three.
+         *
+         * `consolidate` relates candidates and reports which went quiet; `promote` turns the
+         * eligible ones into `pending` proposals — a review item, never a knowledge entry.
+         * Both default to a dry run for the same reason stage one does: the first call
+         * against a real library must be able to say what it would do first.
+         */
+        case '/v1/evolution/consolidate': {
+          const p = z.object({ projectId: z.string(), dryRun: z.boolean().default(true) }).parse(body);
+          const result = store.consolidateEvolution({ projectId: p.projectId, dryRun: p.dryRun });
+          return reply(res, 200, {
+            ...result,
+            note: result.dryRun
+              ? '这是预演：只报出会建立哪些关系、哪些候选已安静，未写入任何一行。'
+              : `已建立 ${result.linked} 条关系（重复的不会重复写入）；过期只在结果里报出，不落库——它是时间的函数。`,
+          });
+        }
+        case '/v1/evolution/promote': {
+          const p = z.object({
+            projectId: z.string(),
+            dryRun: z.boolean().default(true),
+            limit: z.number().int().positive().max(50).optional(),
+            minConfidence: z.number().min(0).max(1).optional(),
+          }).parse(body);
+          const result = store.promoteEvolution({ projectId: p.projectId, dryRun: p.dryRun, limit: p.limit, minConfidence: p.minConfidence });
+          return reply(res, 200, {
+            ...result,
+            forbidden: FORBIDDEN_AUTOMATIC,
+            note: result.dryRun
+              ? '这是预演：只说明会提交哪些候选，未创建任何提案。'
+              : `已把 ${result.promoted.length} 条候选提交为待审提案；知识库未变——批准仍要人来做。`,
+          });
+        }
+        case '/v1/evolution/summary': {
+          const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body);
+          return reply(res, 200, { ...store.evolutionSummary(p.projectId, p.limit), forbidden: FORBIDDEN_AUTOMATIC });
+        }
         case '/v1/outbox/purge': {
           const p = z.object({ projectId: z.string(), includePending: z.boolean().default(false) }).parse(body);
           const result = store.purgeOutbox({ projectId: p.projectId, includePending: p.includePending });
           return reply(res, 200, {
             ...result,
             note: p.includePending
-              ? '已连同未送达条目一并清除；discarded 列出被丢弃的内容，这是明确决定而非静默删除。'
-              : '只清除了已送达或已放弃的条目；未送达条目仍在队列中。',
+              ? '已连同未送达条目一并清除，幂等键随之消失；discarded 列出被丢弃的内容，这是明确决定而非静默删除。'
+              : '已送达条目被墓碑化：正文清空、行与幂等键保留，因此迟到的重试仍会被识别为重复而不是新任务。'
+                + '已放弃条目原样保留——重新入队需要它的内容。要连带删除它们请显式传 includePending。',
           });
         }
         /**
@@ -594,9 +685,45 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           });
         }
         case '/v1/proposals/archive': {
-          const p = z.object({ projectId: z.string(), id: z.string() }).parse(body);
-          store.archiveProposal(p.id, { projectId: p.projectId });
-          return reply(res, 200, { state: 'archived', note: '已移出待办队列，记录仍可查阅。' });
+          const p = z.object({
+            projectId: z.string(), id: z.string(),
+            // Recorded with the state change: without these, "who moved this out and why"
+            // is lost, and an undo has no object to restore.
+            actor: z.string().min(1).max(200).optional(),
+            reason: z.string().min(1).max(2000).optional(),
+          }).parse(body);
+          store.archiveProposal(p.id, { projectId: p.projectId, actor: p.actor, reason: p.reason });
+          return reply(res, 200, { state: 'archived', note: '已移出待办队列，记录与决定仍可查阅。' });
+        }
+        /**
+         * Disposing of a whole folded group.
+         *
+         * The queue folds repeats by signature but the members could only be handled one at
+         * a time: 43 signatures covering 98 pending rows meant 98 clicks for one decision.
+         * The ids are recomputed server-side from the signature, so the group the reviewer
+         * saw and the rows this touches cannot diverge — and the three samples the queue
+         * shows inline are a display limit, not the set being acted on.
+         */
+        case '/v1/proposals/group': {
+          const p = z.object({
+            projectId: z.string(),
+            signature: z.string().min(1).max(200),
+            action: z.enum(['archive', 'reject']),
+            reason: z.string().min(1).max(500).optional(),
+            actor: z.string().min(1).max(200).optional(),
+          }).parse(body);
+          const ids = store.proposalIdsBySignature(p.projectId, p.signature);
+          if (!ids.length) {
+            return reply(res, 404, {
+              signature: p.signature, matched: 0,
+              note: '该签名下没有待处理的候选；可能已被处理，或签名已不再匹配。',
+            });
+          }
+          const result = store.reviewBatch(p.projectId, { action: p.action, ids, actor: p.actor, reason: p.reason });
+          return reply(res, 200, {
+            signature: p.signature, action: p.action, matched: ids.length, ...result,
+            note: `按签名 ${p.signature} 处理 ${ids.length} 条；知识库未变，成员记录与原文全部保留，可用 /v1/proposals/reopen 逐条取回。`,
+          });
         }
         case '/v1/proposals/batch': {
           const p = z.object({
@@ -605,6 +732,8 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             ids: z.array(z.string().min(1)).min(1).max(200),
             entries: z.record(z.string(), knowledgeSchema).optional(),
             reason: z.string().min(1).max(500).optional(),
+            /** Recorded on reject and archive; see the single-archive endpoint. */
+            actor: z.string().min(1).max(200).optional(),
             allowGlobalScope: z.boolean().default(false),
             /** See the single-approval endpoint: absent means "no acknowledgement given". */
             classificationAcknowledged: z.boolean().default(false),
@@ -978,10 +1107,52 @@ export function createCoreServer(store: Store, config: CoreConfig) {
          * Idempotent, so a host may call it on every stop.
          */
         case '/v1/tasks/archive': {
-          const p = z.object({ projectId: z.string(), taskId: z.string().min(1).max(120) }).parse(body);
+          const p = z.object({
+            projectId: z.string(), taskId: z.string().min(1).max(120),
+            /**
+             * "The turn just ended" — the one moment the host knows a session stopped.
+             *
+             * The adapter cannot run the distiller itself: `/v1/evolution/run` is admin-only by
+             * design (it is the pipeline that can eventually produce proposals), and widening that
+             * to adapter credentials to save a round trip would trade a real boundary for a
+             * convenience. So the adapter *signals* and the core acts — the same split the archive
+             * itself already uses.
+             */
+            distill: z.boolean().optional(),
+          }).parse(body);
+          const archived = store.archiveTaskScope(p.projectId, p.taskId);
+          /**
+           * Distil at the turn boundary — and only distil.
+           *
+           * `runEvolution` writes `evolve_candidates` and nothing else: no knowledge entry, no
+           * proposal, no norm. The eight-item `FORBIDDEN_AUTOMATIC` list is what pins that, and it
+           * is why this is safe to run unattended. What it changes is when the work happens: the
+           * pipeline already ran on a six-hour window, so a candidate could be produced long after
+           * the session that earned it had ended. Here the candidate exists by the time the human
+           * looks after the turn — which is the whole difference the peer comparison pointed at.
+           *
+           * A failure is reported, not swallowed and not fatal: an archive is bookkeeping, and a
+           * turn that already ended must not fail because a background pass did. `error` travels
+           * back so a silent zero is distinguishable from a pass that never ran.
+           */
+          let distilled: { scanned: number; candidates: number; skipped: number; error?: string } | undefined;
+          if (p.distill) {
+            try {
+              const run = store.runEvolution({ projectId: p.projectId, dryRun: false });
+              distilled = { scanned: run.scanned, candidates: run.candidates.length, skipped: run.skipped.length };
+            } catch (error) {
+              distilled = { scanned: 0, candidates: 0, skipped: 0, error: error instanceof Error ? error.message : String(error) };
+            }
+          }
           return reply(res, 200, {
-            ...store.archiveTaskScope(p.projectId, p.taskId),
-            note: '本会话事实已归档为 task 作用域条目，可在任务活动里查到；它不是完成声明，也不改变任务状态。',
+            ...archived,
+            ...(distilled ? { distilled } : {}),
+            note: '本会话事实已归档为 task 作用域条目，可在任务活动里查到；它不是完成声明，也不改变任务状态。'
+              + (distilled
+                ? (distilled.error
+                  ? ' 本轮结束时的提炼没有跑完（原因见 distilled.error）；六小时窗口那一趟仍会照常进行。'
+                  : ` 本轮结束时按当前信号做了一次提炼：扫描 ${distilled.scanned} 条、产出 ${distilled.candidates} 条候选（只写候选表，绝不自动采纳）。`)
+                : ''),
           });
         }
         /**

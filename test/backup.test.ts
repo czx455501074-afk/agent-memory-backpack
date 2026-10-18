@@ -80,9 +80,27 @@ test('credential-shaped files including nested files are refused', () => {
   assert.throws(() => importAll(destination.store, { directory: source.backup }), /Credential-shaped file refused/);
   assert.throws(() => exportAll(source.store, { directory: source.backup }), /Credential-shaped file refused/);
 });
+/**
+ * Seed a body the way a library written **before ingest-time redaction** holds it.
+ *
+ * The write path now sanitises credential-shaped values on the way in, so `store.import`
+ * cannot produce the state this test is about — and it should not: what is under test is the
+ * export guard's behaviour on text that is already stored. That state is real (the live library
+ * held 46 such hits when this was measured), so the fixture is injected into the revision row
+ * after a normal import has produced a schema-valid record to attach it to.
+ */
+function seedRaw(store: Store, draft: KnowledgeDraft, body: string) {
+  store.import([draft]);
+  const revision = (draft.baseRevision ?? 0) + 1;
+  const row = store.db.prepare('SELECT content FROM revisions WHERE id=? AND revision=?').get(draft.id, revision) as { content: string } | undefined;
+  assert.ok(row, `夹具条目 ${draft.id} 应当已写入，否则下面的注入是空操作`);
+  const parsed = JSON.parse(row.content) as Record<string, unknown>;
+  parsed.body = body;
+  store.db.prepare('UPDATE revisions SET content=? WHERE id=? AND revision=?').run(JSON.stringify(parsed), draft.id, revision);
+}
 test('credential-shaped stored content is refused before export or import', () => {
   const source = open(), directory = join(root(), 'absent');
-  source.store.import([memory('secret', 0, 'api_key=sk-abcdefghijklmnopqrstuvwxyz')]);
+  seedRaw(source.store, memory('secret'), 'api_key=sk-abcdefghijklmnopqrstuvwxyz');
   assert.throws(() => exportAll(source.store, { directory }), /Credential-shaped content/);
   assert.equal(existsSync(directory), false);
   const clean = populated(), destination = open();

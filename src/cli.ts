@@ -1,15 +1,17 @@
 #!/usr/bin/env node
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { parseArgs } from 'node:util';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { Store } from './store.js';
 import { seedSchema, workflowSchema, type Knowledge } from './schema.js';
 import { coreSchema, clientSchema, defaultDataDir } from './config.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { createCoreServer } from './server.js';
+// The optional semantic layer: configuration comes from the environment, and absence means off.
+import { embedTexts, embeddingConfigFrom } from './embeddings.js';
 import { defaultScanRoots, diff, discover, rescanDiff, summarize, summarizeRescan } from './discovery.js';
 // candidateToKnowledge lives with the rescan policy so the CLI and the running
 // core convert discovered text identically; two copies would drift.
@@ -46,6 +48,8 @@ const USAGE = [
   '                                           candidates (dry run by default; --yes writes)',
   '  unstructured                             skills awaiting structure',
   '  backup --file FILE [--yes] [--overwrite]  pack all data into one portable .ambpack file',
+  '         [--redact-credentials]            replace credential-shaped values instead of',
+  '                                          refusing the export (positions land in the manifest)',
   '  restore --file FILE [--yes] [--json]     inspect, then merge an .ambpack archive',
   '  export --dir DIR [--yes] [--kinds a,b]   write plain SKILL.md files',
   '  ui [--open]                              print the core-served management UI address',
@@ -53,6 +57,10 @@ const USAGE = [
   '                                           resident core: single instance, health, login startup',
   '  doctor [--offline] [--json]              self-check; never prints credentials',
   '  logs [--source plugin] [--all-sources] [--level LVL] [--event NAME] [--json]',
+  '  embed [--project ID] [--limit N] [--yes]   vectors for the optional semantic layer',
+  '                                           (needs AMB_EMBEDDING_ENDPOINT + AMB_EMBEDDING_MODEL)',
+  '  setup [--project ID] [--port N] [--project-root PATH]',
+  '                                           first run: data dir + credentials + next command',
   '  init [--project ID] [--port N] [--project-root PATH]',
   '  serve [--roots PATH,...] [--rescan-interval MS]',
   '  seed --input FILE | retire --id ID --revision N | status',
@@ -116,6 +124,7 @@ const parsed = (() => {
       all: { type: 'boolean', default: false }, 'dsh-runtime-version': { type: 'string' },
       dir: { type: 'string' }, kinds: { type: 'string' },
       file: { type: 'string' }, overwrite: { type: 'boolean', default: false },
+      'redact-credentials': { type: 'boolean', default: false },
       open: { type: 'boolean', default: false },
       source: { type: 'string' }, 'all-sources': { type: 'boolean', default: false },
       'admin-dir': { type: 'string' },
@@ -282,6 +291,70 @@ function currentUserSid(): string {
  * failure here is the worst outcome, because the file looks written and is
  * readable; so the caller is given the finding and the CLI exits non-zero on it.
  */
+/**
+ * Write the data directory's configuration and credentials.
+ *
+ * Extracted from the `init` branch so `setup` can run the same code rather than a second copy of
+ * it: a first run that says "now run init, then doctor, then the host command" is three steps
+ * wearing one name, and the peer comparison was blunt about what a first run should cost. Nothing
+ * about *what* gets written changed — only that two commands now share one implementation.
+ */
+function initializeDataDir(dir: string, options: { port: string; project: string; projectRoot?: string; adminDir?: string }): {
+  written: Array<{ id: string; path: string; role: string }>;
+  aclResults: Array<{ id: string; path: string; ok: boolean; detail: string }>;
+  adminDir: string;
+} {
+  const corePath = join(dir, 'core.json');
+  if (existsSync(corePath) || existsSync(join(dir, 'client.json'))) throw new Error('配置已存在；拒绝覆盖凭据');
+  // Three credentials, two roles. The adapters are agents: they read and
+  // propose. The admin credential is the human's, and only it can review
+  // proposals — otherwise an agent could approve its own submission.
+  const config = coreSchema.parse({
+    protocolVersion: 1, port: Number(options.port),
+    clients: [
+      { id: 'codex', projectId: options.project, role: 'adapter', token: randomBytes(32).toString('hex') },
+      { id: 'dsh', projectId: options.project, role: 'adapter', token: randomBytes(32).toString('hex') },
+      { id: 'admin', projectId: options.project, role: 'admin', token: randomBytes(32).toString('hex') },
+    ],
+  });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(corePath, JSON.stringify(config, null, 2), { flag: 'wx', mode: 0o600 });
+  // The admin credential can be placed outside the adapter directory. Keeping it
+  // apart does not stop a same-user process — an agent running as this user can
+  // read anything the user can — but it does keep the privileged credential out
+  // of the directory an adapter is pointed at, which is the difference between
+  // "no reason to look" and "one directory listing away".
+  const adminDir = options.adminDir ?? dir;
+  if (adminDir !== dir) mkdirSync(adminDir, { recursive: true, mode: 0o700 });
+  const written: Array<{ id: string; path: string; role: string }> = [];
+  for (const c of config.clients) {
+    const client = JSON.stringify({
+      endpoint: `http://127.0.0.1:${config.port}`, token: c.token,
+      projectId: c.projectId,
+      ...(options.projectRoot ? { projectRoot: options.projectRoot } : {}),
+      role: c.role,
+    }, null, 2);
+    const target = c.role === 'admin' ? adminDir : dir;
+    const path = join(target, `${c.id}-client.json`);
+    writeFileSync(path, client, { flag: 'wx', mode: 0o600 });
+    written.push({ id: c.id, path, role: c.role });
+    if (c.id === 'codex') writeFileSync(join(dir, 'client.json'), client, { flag: 'wx', mode: 0o600 });
+  }
+  /**
+   * Tighten each credential file, then say what actually happened.
+   *
+   * The mode above is not enforced on Windows, so until this runs the file inherits whatever the
+   * directory grants — and a `--data-dir` on a drive root grants `Authenticated Users` and `Users`.
+   * The result of the attempt is returned rather than assumed: a failure to tighten is a security
+   * property of a token, and reporting success while the token stays world-readable would be worse
+   * than not attempting it.
+   */
+  const aclResults = written
+    .filter(entry => existsSync(entry.path))
+    .map(entry => ({ id: entry.id, path: entry.path, ...restrictCredentialAcl(entry.path) }));
+  return { written, aclResults, adminDir };
+}
+
 function restrictCredentialAcl(target: string): { ok: boolean; detail: string } {
   if (process.platform !== 'win32') {
     // POSIX: the mode passed at creation is what applies, and it was already set
@@ -923,14 +996,18 @@ try {
         // A missing --file is a convenience, not an error: the default name is
         // dated, so re-running cannot silently overwrite yesterday's archive.
         const file = values.file ? resolve(String(values.file)) : resolve(defaultArchiveName());
-        const result = exportArchive(store, { file, dryRun: values.yes !== true, overwrite: values.overwrite === true });
+        const result = exportArchive(store, { file, dryRun: values.yes !== true, overwrite: values.overwrite === true,
+          redactCredentials: values['redact-credentials'] === true });
+        const redacted = result.redactions?.length ?? 0;
         const note = values.yes === true
           ? '归档已写入。它包含全部知识、历史版本、任务与候选队列，不含任何凭据；复制到另一台设备后用 restore 导入。'
+            + (redacted ? ` 其中 ${redacted} 处凭据形状的内容已替换为 [REDACTED-CREDENTIAL]（位置记录在归档的 manifest.redacted 里），其余字节原样保留。` : '')
           : '干跑：未写入文件。确认路径后加 --yes 执行导出。';
         if (values.json === true) {
           console.log(JSON.stringify({
             dryRun: values.yes !== true, file: result.file, bytes: result.bytes,
-            entries: result.entries, counts: result.counts, skipped: result.skipped, note,
+            entries: result.entries, counts: result.counts, skipped: result.skipped,
+            redacted: result.redactions ?? [], note,
           }, null, 2));
         } else {
           console.log(values.yes === true ? '导出知识库' : '导出知识库（干跑，未写文件）');
@@ -986,55 +1063,12 @@ try {
       }
     } finally { store.close(); }
   } else if (command === 'init') {
-    const corePath = join(dir, 'core.json');
-    if (existsSync(corePath) || existsSync(join(dir, 'client.json'))) throw new Error('配置已存在；拒绝覆盖凭据');
-    // Three credentials, two roles. The adapters are agents: they read and
-    // propose. The admin credential is the human's, and only it can review
-    // proposals — otherwise an agent could approve its own submission.
-    const config = coreSchema.parse({
-      protocolVersion: 1, port: Number(values.port),
-      clients: [
-        { id: 'codex', projectId: values.project, role: 'adapter', token: randomBytes(32).toString('hex') },
-        { id: 'dsh', projectId: values.project, role: 'adapter', token: randomBytes(32).toString('hex') },
-        { id: 'admin', projectId: values.project, role: 'admin', token: randomBytes(32).toString('hex') },
-      ],
+    const { written, aclResults, adminDir } = initializeDataDir(dir, {
+      port: String(values.port),
+      project: String(values.project),
+      ...(values['project-root'] ? { projectRoot: resolve(String(values['project-root'])) } : {}),
+      ...(values['admin-dir'] ? { adminDir: resolve(String(values['admin-dir'])) } : {}),
     });
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(corePath, JSON.stringify(config, null, 2), { flag: 'wx', mode: 0o600 });
-    // The admin credential can be placed outside the adapter directory. Keeping it
-    // apart does not stop a same-user process — an agent running as this user can
-    // read anything the user can — but it does keep the privileged credential out
-    // of the directory an adapter is pointed at, which is the difference between
-    // "no reason to look" and "one directory listing away".
-    const adminDir = values['admin-dir'] ? resolve(String(values['admin-dir'])) : dir;
-    if (adminDir !== dir) mkdirSync(adminDir, { recursive: true, mode: 0o700 });
-    const written: Array<{ id: string; path: string; role: string }> = [];
-    for (const c of config.clients) {
-      const client = JSON.stringify({
-        endpoint: `http://127.0.0.1:${config.port}`, token: c.token,
-        projectId: c.projectId,
-        ...(values['project-root'] ? { projectRoot: resolve(String(values['project-root'])) } : {}),
-        role: c.role,
-      }, null, 2);
-      const target = c.role === 'admin' ? adminDir : dir;
-      const path = join(target, `${c.id}-client.json`);
-      writeFileSync(path, client, { flag: 'wx', mode: 0o600 });
-      written.push({ id: c.id, path, role: c.role });
-      if (c.id === 'codex') writeFileSync(join(dir, 'client.json'), client, { flag: 'wx', mode: 0o600 });
-    }
-    /**
-     * Tighten each credential file, then say what actually happened.
-     *
-     * The mode above is not enforced on Windows, so until this runs the file
-     * inherits whatever the directory grants — and a `--data-dir` on a drive root
-     * grants `Authenticated Users` and `Users`. The result of the attempt is
-     * printed rather than assumed, and a failure to tighten is a non-zero exit:
-     * this is a security property of a token, and reporting success while the
-     * token stays world-readable would be worse than not attempting it.
-     */
-    const aclResults = written
-      .filter(entry => existsSync(entry.path))
-      .map(entry => ({ id: entry.id, path: entry.path, ...restrictCredentialAcl(entry.path) }));
     console.log(`P0 configuration created at ${dir}. Credentials were not printed. Keep these files private.`);
     console.log('Adapter credentials (codex, dsh) may read knowledge and submit candidates; only the admin credential may review proposals.');
     // Say plainly what the file mode does and does not buy, rather than implying
@@ -1044,6 +1078,89 @@ try {
     if (aclResults.some(acl => !acl.ok)) process.exitCode = 1;
     console.log('Note: file permissions are set to owner-only, but on Windows that mode is not enforced — the file ACL is what applies, and it has been restricted to this user (plus SYSTEM/Administrators). Any process running as this user can still read these files, so treat the whole directory as holding credentials.'
       + (adminDir === dir ? ' Pass --admin-dir to keep the admin credential in a separate directory from the adapters.' : ` The admin credential is in ${adminDir}.`));
+  } else if (command === 'setup') {
+    /**
+     * One command for the first run, and it ends by naming the *next* command.
+     *
+     * The measured gap was a first run of six steps (clone → npm ci → build → install:local →
+     * host add → restart), while the peer projects ask for one command and then let the agent
+     * assemble the rest. Publishing to npm is out of scope here, so the honest target is: one
+     * command does everything this repository can do by itself, and it prints exactly what
+     * remains — with the paths and profile names already resolved, because a placeholder the
+     * user has to fill in is work handed back to them.
+     */
+    const alreadyInitialised = existsSync(join(dir, 'core.json'));
+    let setupResult: ReturnType<typeof initializeDataDir> | undefined;
+    if (alreadyInitialised) {
+      console.log(`数据目录已初始化：${dir}（跳过 init，不覆盖已有凭据）`);
+    } else {
+      setupResult = initializeDataDir(dir, {
+        port: String(values.port),
+        project: String(values.project),
+        ...(values['project-root'] ? { projectRoot: resolve(String(values['project-root'])) } : {}),
+        ...(values['admin-dir'] ? { adminDir: resolve(String(values['admin-dir'])) } : {}),
+      });
+      console.log(`已创建数据目录与三组凭据：${dir}`);
+      for (const acl of setupResult.aclResults) console.log(`  ACL ${acl.ok ? 'ok' : 'FAILED'} ${acl.id}: ${acl.detail}`);
+      if (setupResult.aclResults.some(acl => !acl.ok)) process.exitCode = 1;
+    }
+    // The host command is printed with the repository path resolved from *this* file's location,
+    // so it is correct on any machine and never a path copied from someone else's box.
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+    const adapterDir = join(repoRoot, 'adapters', 'dsh');
+    const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh');
+    const profilesDir = join(dshHome, 'profiles');
+    const profiles = existsSync(profilesDir)
+      ? readdirSync(profilesDir).filter(name => existsSync(join(profilesDir, name, 'package.json'))).sort()
+      : [];
+    console.log('');
+    console.log('下一步（还差这一步插件才在宿主里生效）：');
+    if (profiles.length) {
+      for (const profile of profiles) console.log(`  dsh plugin --profile ${profile} add "${adapterDir}"`);
+      console.log(`  （本机 profile：${profiles.join('、')}；只装你实际在用的那个）`);
+    } else {
+      console.log(`  dsh plugin --profile <你的 profile> add "${adapterDir}"`);
+      console.log(`  （没有在 ${profilesDir} 下找到 profile，请用你在用的 profile 名）`);
+    }
+    console.log('  然后重启宿主（核心是常驻服务，宿主重启不会重启它；需要时用 amb service restart 等价命令）。');
+    console.log('  自检：amb doctor');
+  } else if (command === 'embed') {
+    /**
+     * Fill in the optional layer's vectors.
+     *
+     * Explicit rather than automatic, and dry-run by default, for the same reason `adopt` and
+     * `rescan` are: this spends somebody's inference budget on every entry in the library, and the
+     * first thing a person needs to see is how many entries that is. Unconfigured is not an error —
+     * it is the default state, and the message says so instead of implying something is broken.
+     */
+    const embeddingConfig = embeddingConfigFrom();
+    if (!embeddingConfig) {
+      console.log('未配置嵌入服务，检索走词法路径（与引入该层之前的行为一致）。');
+      console.log('要启用：设置 AMB_EMBEDDING_ENDPOINT 与 AMB_EMBEDDING_MODEL（需要鉴权时再加 AMB_EMBEDDING_KEY），然后重跑本命令。');
+    } else {
+      const store = new Store(join(dir, 'knowledge.sqlite'));
+      try {
+        const model = String(embeddingConfig.model);
+        const coverage = store.embeddingCoverage(String(values.project), model);
+        const pending = store.pendingEmbeddingEntries(String(values.project), model, Number(values.limit ?? 200));
+        console.log(`嵌入模型 ${model}：可嵌入条目 ${coverage.eligible}，已有向量 ${coverage.embedded}，本次待生成 ${pending.length}`);
+        if (values.yes !== true) {
+          console.log('干跑：未生成任何向量。加 --yes 执行。');
+        } else {
+          let saved = 0;
+          for (let start = 0; start < pending.length; start += 64) {
+            const batch = pending.slice(start, start + 64);
+            const vectors = await embedTexts(batch.map(item => item.text), embeddingConfig);
+            if (!vectors) {
+              console.log(`第 ${Math.floor(start / 64) + 1} 批失败：嵌入服务不可用，已停止（此前已保存 ${saved} 条）。`);
+              break;
+            }
+            saved += store.saveEmbeddings(batch.map((item, index) => ({ id: item.id, revision: item.revision, model, vector: vectors[index]! })));
+          }
+          console.log(`已保存 ${saved} 条向量。检索在覆盖率足够时会自动融合，不足时回落词法。`);
+        }
+      } finally { store.close(); }
+    }
   } else if (['serve', 'seed', 'retire', 'status'].includes(command ?? '')) {
     const config = coreSchema.parse(JSON.parse(readFileSync(join(dir, 'core.json'), 'utf8')));
     const store = new Store(join(dir, 'knowledge.sqlite'));

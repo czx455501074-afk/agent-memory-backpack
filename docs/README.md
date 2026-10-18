@@ -2,8 +2,9 @@
 
 这个目录里有一百多个文件，按时间堆叠。这份索引不是清单，而是**入口**：想知道某件事，从这里进去。
 
-## 先读哪三份
+## 先读哪几份
 
+0. [`../AGENTS.md`](../AGENTS.md) —— **接手这个仓库的第一份**：目录地图、"想改 X 该看哪里 → 怎么验"、不要递归扫的目录、五条踩过的坑。`node verification/project-map.mjs` 会核对它是否已经过期（含"顶层出现未登记目录"这类检查），所以它是可信的。
 1. `release-notes-1.0.0.md` —— 这一版做了什么、已知限制是什么。**给使用者看的第一份。**
 2. `release-checklist.md` —— 发布前必须跑过什么，每条命令对应哪个理由。
 3. `implementation/r5-chief-engineer-plan-2026-10-17.md` —— R5 这一轮的全部判断、取舍与遗留项。**给维护者看的第一份。**
@@ -28,7 +29,7 @@
 
 **宿主与部署**：`r5-deploy-and-restart.md`、`post-restart-handoff-2026-10-17.md`、`dsh-panel-verify-2026-10-17.md`、`codex-side-verify-2026-10-17.md`、`cold-start-verify-2026-10-17.md`。
 
-**比对同行**：`peer-research-round2-2026-10-17.md`（调研）、`r5-peer-benchmark.md`（哪些采纳、哪些拒绝及理由）。
+**比对同行**：`peer-review-2026-10-18.md`（**最新**：8 个项目 × 功能/使用双维度，分场景结论"自用够用 / 陌生用户装不上"与缺口清单）、`peer-comparison-and-improvement-list-2026-10-17.md`（此前三轮对比与 T1–T15 清单）、`peer-research-round2-2026-10-17.md`（调研原文）、`r5-peer-benchmark.md`（哪些采纳、哪些拒绝及理由）。
 
 ## 文件命名约定
 

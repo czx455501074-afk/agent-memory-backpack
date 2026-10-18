@@ -584,9 +584,16 @@ function renderProposals(filterState) {
           '<button class="ghost btn-sm btn-danger action-reject" data-id="' + esc(item.id) + '">拒收</button>' +
           '</div>';
       } else if (item.state === 'archived' || item.state === 'rejected' || item.state === 'expired') {
-        actions = '<div class="card__actions">' +
-          '<button class="ghost btn-sm action-reopen" data-id="' + esc(item.id) + '">重新开启审阅</button>' +
-          '</div>';
+        // Act on the data, not on the state name. expireProposals clears the payload of an
+        // expired candidate on purpose (a pending candidate's text should not outlive review
+        // by long), and a rejected one is cleared after ninety days, so reopenProposal
+        // refuses both with 404 "has no retained content to reopen". Rendering the button for
+        // them gave the user a control that could only ever fail.
+        actions = payload.discovery
+          ? '<div class="card__actions">' +
+            '<button class="ghost btn-sm action-reopen" data-id="' + esc(item.id) + '">重新开启审阅</button>' +
+            '</div>'
+          : '<div class="card__meta">这条候选的正文已按保留期清除（' + esc(item.state) + '），无法重新开启；需要的内容请重新提交。</div>';
       }
 
       var decision = payload.decision || {};
@@ -716,7 +723,7 @@ function showProposalEditor(proposalId) {
         '<div class="form-group"><label>条目 ID' + (detail.payload && detail.payload.workflowId ? '（必须等于目标流程 ID）' : '（默认使用候选 UUID）') + '</label>' +
         '<input type="text" id="pe-id" value="' + esc(detail.payload && detail.payload.workflowId ? detail.payload.workflowId : detail.id) + '"></div>' +
         kindSelect +
-        '<div class="form-group"><label>标题</label>' +
+        '<div class="form-group"><label>标题（已按候选首行预填，可留空或修改）</label>' +
         '<input type="text" id="pe-title" value="' + esc((detail.discovery || '').slice(0, 40) || '经验记录') + '"></div>' +
         '<div class="form-group"><label>正文</label>' +
         '<textarea id="pe-body" rows="6">' + esc(body) + '</textarea></div>';
@@ -1481,7 +1488,7 @@ panel.addEventListener('click', function (event) {
     post('/v1/proposals/batch', { action: 'reject', ids: rejectIds }).then(function (res) {
       if (res.failed && res.failed.length) {
         alert('部分候选拒收未完成（' + res.failed.length + ' 条）：\\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n'));
+          res.failed.map(function (f) { return f.id + ': ' + (f.message || f.reason || '未说明'); }).join('\\n'));
       }
       renderProposals('pending');
     }).catch(reportError);
@@ -1494,7 +1501,7 @@ panel.addEventListener('click', function (event) {
     post('/v1/proposals/batch', { action: 'archive', ids: arcIds }).then(function (res) {
       if (res.failed && res.failed.length) {
         alert('部分候选归档未完成（' + res.failed.length + ' 条）：\\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n'));
+          res.failed.map(function (f) { return f.id + ': ' + (f.message || f.reason || '未说明'); }).join('\\n'));
       }
       renderProposals('pending');
     }).catch(reportError);
@@ -1525,7 +1532,7 @@ panel.addEventListener('click', function (event) {
     post('/v1/proposals/batch', { action: 'request-evidence', ids: batchIds, reason: batchReason }).then(function (res) {
       if (res.failed && res.failed.length) {
         alert('部分候选要求补证未完成（' + res.failed.length + ' 条）：\\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n'));
+          res.failed.map(function (f) { return f.id + ': ' + (f.message || f.reason || '未说明'); }).join('\\n'));
       }
       renderProposals('pending');
     }).catch(reportError);
@@ -1642,7 +1649,7 @@ panel.addEventListener('click', function (event) {
       var msg = '清理完成！已清理 ' + purgedCount + ' 条资料。';
       if (failedCount > 0) {
         msg += '\\n警告：' + failedCount + ' 条资料清理失败：\\n' +
-          res.failed.map(function (f) { return f.id + ': ' + f.reason; }).join('\\n');
+          res.failed.map(function (f) { return f.id + ': ' + (f.message || f.reason || '未说明'); }).join('\\n');
       }
       alert(msg);
       renderMaterial();

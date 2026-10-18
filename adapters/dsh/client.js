@@ -232,8 +232,9 @@ window.__ModuleLoader__.load({
       "manage.proposalsTitle": "候选复核",
       "manage.proposalsNote": "这里的每个操作都会改变有效知识库，并且需要管理员凭据；操作会记入插件日志。",
       "manage.composeKind": "把它存成哪一类",
-      "manage.composeTitle": "标题",
-      "manage.composeNote": "候选本身只有一段待核实的文本，没有知识条目形态。选定类别与标题后，「确认采纳」才会把它写进有效库——这一步的判断只能由人来做。",
+      "manage.composeTitle": "标题（已按候选首行预填，可不改）",
+      "manage.untitled": "未命名条目",
+      "manage.composeNote": "候选只有一段待核实文本，没有知识条目形态。类别与标题都已按系统判定预填，你也可以改；标题留空时取候选首行。「确认采纳」才会把它写进有效库——这一步的判断只能由人来做。",
       "manage.approveConfirmed": "确认采纳",
       "manage.cancel": "取消",
       "manage.submittedAt": "提交于",
@@ -254,6 +255,10 @@ window.__ModuleLoader__.load({
       "manage.scopeKind.global": "全局",
       "manage.reject": "拒绝",
       "manage.archive": "归档",
+      // 折叠组整组处置。文案里直接写"整组"，因为按钮作用于这一组的全部成员，
+      // 而界面上只看得到三条样本——不说清楚就会被当成对那三条的操作。
+      "manage.groupArchive": "整组归档",
+      "manage.groupReject": "整组拒绝",
       "manage.confirm": "此操作会改变有效知识库，确认执行？",
       "manage.loading": "正在读取候选…",
       "manage.empty": "没有待审候选。",
@@ -365,6 +370,41 @@ window.__ModuleLoader__.load({
       var payload = proposal.payload;
       if (payload && typeof payload.discovery === "string") return payload.discovery;
       return "";
+    }
+
+    /**
+     * The title a candidate gets when the form was submitted untouched.
+     *
+     * Mirrors `derivedTitle` in the core's store: first non-empty line, Markdown markers
+     * stripped, 60 characters. The duplication is unavoidable — this is a browser half
+     * that cannot import the core — so both sides are pinned by a test with the same
+     * cases rather than left to drift.
+     */
+    function derivedCandidateTitle(proposal) {
+      var text = proposalText(proposal);
+      // Same rule as the core's `derivedTitle`, including skipping fenced code whole:
+      // the first line inside a ``` block is usually `const x = 1`, which says nothing
+      // about the candidate and would make a meaningless label.
+      var insideFence = false;
+      var line = "";
+      var raw = String(text || "").split("\n");
+      for (var index = 0; index < raw.length; index += 1) {
+        if (raw[index].trim().indexOf("```") === 0) { insideFence = !insideFence; continue; }
+        if (insideFence) continue;
+        var cleaned = raw[index]
+          .replace(/^\s{0,3}#{1,6}\s*/, "")
+          .replace(/^\s*[-*+]\s+/, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (cleaned !== "") { line = cleaned; break; }
+      }
+      if (line === "") {
+        // No candidate text at all: the caller supplies the table's own word for it, so
+        // every visible string still comes from MESSAGES (a literal here is what the
+        // localisation guard in the surface test exists to catch).
+        return "";
+      }
+      return line.length <= 60 ? line : line.slice(0, 60) + "…";
     }
 
     /**
@@ -1571,12 +1611,29 @@ window.__ModuleLoader__.load({
      * accept, reject or archive control: its members are separate records, and the
      * control that matters here is the one that lists them.
      */
-    function aggregateRow(h, group) {
+    function aggregateRow(h, group, options) {
       var meta = [
         t("manage.foldedOccurrences") + " " + String(numberOrNull(group.occurrences) === null ? "?" : group.occurrences),
         t("manage.foldedLastSeen") + "：" + relativeTime(group.lastSeenAt, t),
         t("manage.foldedMembers") + "：" + String(Array.isArray(group.memberIds) ? group.memberIds.length : 0),
       ].filter(function (part) { return part !== ""; }).join("  ·  ");
+      var signature = typeof group.signature === "string" ? group.signature : "";
+      var busy = options && typeof options.busy === "string" ? options.busy : "";
+      // A folded group is one decision. The queue shows three members inline, so acting on
+      // it row by row meant 98 clicks for 43 groups — which is why the queue never emptied.
+      // The core recomputes the member set from the signature, so acting here cannot act on
+      // a sample and silently leave the rest behind.
+      var groupActions = signature && options && typeof options.onAction === "function"
+        ? h("div", { className: "amb-row amb-actions" },
+          h("button", {
+            type: "button", className: "amb-button amb-danger", disabled: busy,
+            onClick: function () { options.onAction("proposal-group", { signature: signature, action: "archive" }); },
+          }, t("manage.groupArchive")),
+          h("button", {
+            type: "button", className: "amb-button", disabled: busy,
+            onClick: function () { options.onAction("proposal-group", { signature: signature, action: "reject" }); },
+          }, t("manage.groupReject")))
+        : null;
       return h("li", { className: "amb-row", key: "aggregate-" + String(group.signature) },
         h("div", { className: "amb-row-head" },
           h("span", { className: "amb-badge", "data-tone": "proposal" }, t("manage.aggregateHead")),
@@ -1584,6 +1641,7 @@ window.__ModuleLoader__.load({
           group.tool ? h("span", { className: "amb-badge" }, String(group.tool)) : null,
         ),
         h("div", { className: "amb-detail-line amb-meta" }, meta),
+        groupActions,
       );
     }
 
@@ -1855,10 +1913,13 @@ window.__ModuleLoader__.load({
         children.push(stateBlock(h, t("manage.empty")));
       } else {
         children.push(h("ul", { className: "amb-list" }, admin.proposals.map(function (proposal) {
-          // A folded group is a lens on rows that are still there, so it gets no
-          // accept/reject control: deciding it would mean deciding several records at
-          // once, and its members are listed above instead.
-          if (proposal.kind === "aggregate") return aggregateRow(h, proposal);
+          // A folded group is a lens on rows that are still there. It does get a control —
+          // acting on each member separately is how 43 groups covering 98 rows meant 98
+          // clicks for one decision, and the queue therefore never emptied. What makes the
+          // button safe is that the core recomputes the members from the signature instead
+          // of accepting this view's three samples, so "what the group showed" and "what the
+          // action touches" cannot diverge.
+          if (proposal.kind === "aggregate") return aggregateRow(h, proposal, options);
           var editing = options.compose && options.compose.id === proposal.id;
           var decide = function (action, extra) {
             return function () {
@@ -1985,7 +2046,12 @@ window.__ModuleLoader__.load({
                   h("button", {
                     type: "button",
                     className: "amb-button",
-                    disabled: busy || options.compose.title === "",
+                    // Not gated on the title: a reviewer confirms the kind and the scope,
+                    // and an empty field now yields a title derived from the candidate's
+                    // own first line. Requiring a typed title was the step that made
+                    // adoption feel like paperwork, and the core repeats the fallback so
+                    // no surface has to carry this rule alone.
+                    disabled: busy,
                     onClick: decide("proposal-approve", { entry: options.onComposeEntry(proposal) }),
                   }, t("manage.approveConfirmed")),
                 ),
@@ -2416,7 +2482,10 @@ window.__ModuleLoader__.load({
               } else if (action === "backup-import") {
                 message = t("manage.importDone");
               }
-              var decided = action === "proposal-approve" || action === "proposal-reject" || action === "proposal-archive";
+              var decided = action === "proposal-approve" || action === "proposal-reject" || action === "proposal-archive"
+                // A group action removes every member, so the list has to be re-read rather
+                // than filtered by one id — there is no single row to drop from `previous`.
+                || action === "proposal-group";
               setAdminState(function (previous) {
                 var next = Object.assign({}, previous, { busy: "", message: message, failure: null });
                 // A decided candidate leaves the pending queue in the core, so it leaves
@@ -2481,15 +2550,17 @@ window.__ModuleLoader__.load({
               setCompose(null);
               return;
             }
-            // Seed the title from the candidate's first line so the reviewer edits
-            // rather than starts from nothing - but never silently accept it, the
-            // field is theirs to change and the confirm button stays disabled until
-            // it holds something.
-            var text = proposal.payload && typeof proposal.payload.discovery === "string"
-              ? proposal.payload.discovery : "";
-            var firstLine = text.split("\n").map(function (line) { return line.trim(); })
-              .filter(function (line) { return line !== ""; })[0] || "";
-            setCompose({ id: proposal.id, kind: "memory", title: firstLine.slice(0, 60) });
+            // Seed both fields the reviewer should not have to invent: the title from the
+            // candidate's own first line, and the kind from the classification the core
+            // already made. They stay editable — the point is to start from the plugin's
+            // reading, not to start from nothing. The confirm button no longer punishes an
+            // empty title, so this seed is convenience rather than a precondition.
+            var shape = proposedShape(proposal);
+            setCompose({
+              id: proposal.id,
+              kind: shape && shape.kind ? shape.kind : "memory",
+              title: derivedCandidateTitle(proposal) || t("manage.untitled"),
+            });
           },
           onComposeUpdate: function (field, value) {
             setCompose(function (previous) {
@@ -2513,7 +2584,11 @@ window.__ModuleLoader__.load({
               id: compose.kind + ":" + String(proposal.id),
               baseRevision: 0,
               kind: compose.kind,
-              title: compose.title,
+              // A blank field means "let the candidate name itself", not "submit an
+              // empty title": the core applies the same rule, so the entry is named the
+              // same way whichever surface sent it.
+              title: String(compose.title || "").trim()
+                || derivedCandidateTitle(proposal) || t("manage.untitled"),
               body: text,
               scope: scope,
               // Chosen by a person through the correction path, so the stored entry

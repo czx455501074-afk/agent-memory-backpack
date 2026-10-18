@@ -425,7 +425,10 @@ test('global Codex hook captures structured failure, with stable retry key and n
     if (request.url === '/v1/proposals') return json(response, 200, { id: 'captured', state: 'pending', duplicate: false });
     return json(response, 200, { id: 'event', stored: true, duplicate: false });
   });
-  const config = await createConfig(service.endpoint, { projectRoot: null });
+  // Explicit opt-in: this suite proves the capture path works, and the default became "submit
+  // nothing" because a hook triggered by an exit code cannot judge whether the failure taught
+  // anything. Testing the mechanism requires turning the mechanism on by name.
+  const config = await createConfig(service.endpoint, { projectRoot: null, autoCaptureFailures: true });
   const input = { hook_event_name: 'PostToolUse', cwd: tmpdir(), session_id: 'outside-project',
     tool_name: 'Bash', tool_response: { exit_code: 2, output: 'PRIVATE OUTPUT' } };
   for (let i = 0; i < 2; i++) {
@@ -497,7 +500,9 @@ test("Stop files the task diary once per turn through the idempotent archive end
 
   assert.deepEqual(parseStdout(await runHook(stop, config)), { continue: true });
   assert.equal(archives().length, 1, "会话结束必须发起一次归档");
-  assert.deepEqual(archives()[0].body, { projectId: "project-fixture", taskId: "task-fixture" });
+  // Same signal as the DSH side, and for the same reason: the core distils on it, because this
+  // hook has no business calling the admin-only evolution endpoint.
+  assert.deepEqual(archives()[0].body, { projectId: "project-fixture", taskId: "task-fixture", distill: true });
   assert.equal(archives()[0].headers["x-amb-protocol"], "1", "归档调用必须带 x-amb-protocol: 1");
 
   // Idempotent at this end: a Stop retried for the same turn asks nothing again.

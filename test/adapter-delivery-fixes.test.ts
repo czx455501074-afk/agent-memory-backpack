@@ -354,6 +354,7 @@ test('F07: Codex hook 发送 Stop 事件携带 taskId', async () => {
     assert.equal(archives.length, 1, '会话结束必须发起一次归档');
     assert.equal(archives[0].body.projectId, 'proj-1');
     assert.equal(archives[0].body.taskId, 'task-abc');
+    assert.equal(archives[0].body.distill, true, '归档同时携带"回合结束"的提炼信号（核心据此提炼，适配器无权自己跑）');
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });
