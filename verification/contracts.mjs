@@ -390,6 +390,15 @@ const CONTRACTS = [
     ],
   },
   {
+    id: 'injection-uses-the-real-query',
+    why: 'prepare 为了列出全部候选给 knowledge() 传空 query（那是故意的），而片段与"读第几块"必须按真实查询取。把 excerpt 改成"相关段落"之后，prepare 路径上一点没变——因为它传的是空字符串，于是 excerpt 永远是正文开头、hitChunks 永远是 null；而当时的测试测的是 knowledge() 直调，所以全绿。**测了函数不等于测了那条真正在跑的路。**',
+    file: 'src/store.ts',
+    must: ['excerptQuery', '400, 0.5, query)', 'hitChunks'],
+    other: [
+      ['test/injection-uses-the-real-query.test.ts', ['片段必须按查询取，不能等于正文开头', '浏览目录时不该指路']],
+    ],
+  },
+  {
     id: 'deploy-busy-guidance',
     why: '核心在跑时 Windows 拒绝重命名 core 目录；裸 EBUSY 让“部署失败”看起来像包损坏。',
     file: 'scripts/deploy-plugin.mjs',

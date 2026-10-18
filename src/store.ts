@@ -14,6 +14,8 @@ import { decodeVector, encodeVector } from './embeddings.js';
 import { buildTermBridge } from './term-bridge.js';
 // 注入用的相关段落：正文开头往往不是答案所在（见 retrieval-excerpt.ts）。
 import { relevantPassages } from './retrieval-excerpt.js';
+// 分块视图：让注入能说清"相关段落在第几块"（见 retrieval-chunk.ts）。
+import { chunkBody } from './retrieval-chunk.js';
 import { consolidateCandidates, distillFailures, EVOLVE_DEFAULTS, promotionText, type EvolveCandidate, type EvolveLink, type EvolveThresholds, type FailureSignal } from './evolve.js';
 
 type Row = Record<string, unknown>;
@@ -1434,7 +1436,18 @@ export class Store {
    * characters against a 2k-4k token budget, so retrieval returns entry points
    * and expansion is explicit.
    */
-  knowledge(projectId: string, query: string, limit = 5, excerptChars = 400, relevanceFloor = 0.5) {
+  knowledge(projectId: string, query: string, limit = 5, excerptChars = 400, relevanceFloor = 0.5,
+    /**
+     * 片段与"读第几块"按哪个查询取。
+     *
+     * 与 `query` 分开是**必要的**：`prepare` 为了列出全部候选必须传空 query（有 query 时
+     * `knowledge()` 会先过滤，而它要自己用 `rankAutomatic` 排序），但片段必须按**真实查询**取。
+     *
+     * 这个区分是踩出来的：把 excerpt 改成"与查询相关的段落"之后，`prepare` 路径上一点没变 ——
+     * 因为它传的是空字符串，于是 excerpt 永远退回正文开头、hitChunks 永远是 null。而当时的测试
+     * 测的是 `knowledge()` 直调，所以没抓到。**测了函数不等于测了那条真正在跑的路。**
+     */
+    excerptQuery?: string) {
     const entries = this.liveEntries();
     const all = new Map(entries.map(x => [x.id, x]));
     const tokens = queryTokens(query);
@@ -1457,6 +1470,11 @@ export class Store {
       provenance: string;
       /** Why this entry was retrieved: which query fragments matched, and how much. */
       why: { matched: string[]; coverage: number } | null;
+      /**
+       * 相关段落落在第几块（1 起）与总块数。`null` 表示**不必指路**：查询为空、正文一块装得下、
+       * 或没有命中段落。注入行据此说"读第 3、7 块"而不是"读全部 16 块"。
+       */
+      hitChunks: { chunks: number[]; total: number } | null;
     }> = [];
     for (const id of ids) {
       const entry = all.get(id);
@@ -1487,12 +1505,34 @@ export class Store {
       excerpt: (() => {
         // 相关段落优先，但**总长仍受 `excerptChars` 约束**：那个参数是调用方对"注入多少字"的
         // 决定，不能被这里擅自放大（`skill-context` 的测试正是钉这一点的）。
-        const passages = relevantPassages(body, query, Math.max(120, excerptChars * 2));
+        const passages = relevantPassages(body, excerptQuery ?? query, Math.max(120, excerptChars * 2));
         if (passages.length) {
           const joined = passages.map(item => item.text.trim()).join(' … ');
           return joined.length > excerptChars ? `${joined.slice(0, excerptChars)}…` : joined;
         }
         return body.length > excerptChars ? `${body.slice(0, excerptChars)}…` : body;
+      })(),
+      /**
+       * 相关段落落在**第几块**（1 起）。这是"读哪里"的可执行版本。
+       *
+       * 只说"正文有 16 块"仍然把寻找的活留给了 agent，而它面对 16 个选项最常见的选择是先不读。
+       * 说"相关段落在第 3、7 块"才是能直接照做的指令。这条对应一个**真实事故**：检索两次都
+       * 命中、`why.matched` 与 `coverage` 都正常，却两次都只凭 excerpt 判断而没读全文——因为
+       * 当时的 excerpt 只截条目开头，根本不含关键词所在的位置。
+       *
+       * 一块装得下（≤ 默认块大小）时不指路：那时"读它"就等于"读全文"。
+       */
+      hitChunks: (() => {
+        const passageQuery = excerptQuery ?? query;
+        if (!passageQuery.trim() || body.length <= 4000) return null;
+        const passages = relevantPassages(body, passageQuery, Math.max(120, excerptChars * 2));
+        if (!passages.length) return null;
+        const view = chunkBody(body, {});
+        const lines = passages.map(item => body.slice(0, item.offset).split('\n').length);
+        const hits = [...new Set(lines.map(line => view.outline.findIndex((item, index) =>
+          line >= item.startLine && (index + 1 >= view.outline.length || line < view.outline[index + 1]!.startLine))))]
+          .filter(index => index >= 0).sort((a, b) => a - b);
+        return hits.length ? { chunks: hits.map(index => index + 1), total: view.totalChunks } : null;
       })(),
         chars: body.length,
         leafCount: content.kind === 'skill' ? content.leaves.length : 0,
@@ -1942,7 +1982,11 @@ export class Store {
     // Automatic injection uses the entry's advertised purpose, not matches buried
     // in dozens of reference documents or shared procedure boilerplate. Explicit
     // universal search and knowledge() still index the full source and leaves.
-    const knowledge = hasQuery ? rankAutomatic(this.knowledge(projectId, '', Number.MAX_SAFE_INTEGER, 400), 5) : [];
+    //
+    // 空 query 是**故意的**：它让 knowledge() 列出全部候选，排序交给下面的 rankAutomatic。
+    // 但片段必须按真实查询取（第六个参数），否则注入的永远是正文开头 —— 这个漏洞让"excerpt
+    // 改成相关段落"的修复在真实路径上静默失效了一整轮。
+    const knowledge = hasQuery ? rankAutomatic(this.knowledge(projectId, '', Number.MAX_SAFE_INTEGER, 400, 0.5, query), 5) : [];
     /**
      * The record of what this retrieval did, and what it could not find.
      *
@@ -2140,15 +2184,21 @@ export class Store {
       ...knowledge.map(k => `${k.kind === 'skill' ? '已采纳技能' : '背景记忆'} ${k.id}@${k.revision} ${k.title}`
         + (k.leafCount ? `（含 ${k.leafCount} 个参考文档）` : '')
         /**
-         * 把"上面这段不是全文"说清楚，并给出读全的办法。
+         * 把"上面这段不是全文"说清楚，并给出**读哪里**。
          *
          * 实测：正文平均 7459 字符、最长 53117。过去这行只写"（正文 N 字符，需要时调用
-         * amb_read_knowledge 读取）"——它把"要不要读"留给了 agent 的判断，而 agent 面对一个
-         * 大数字最常见的选择是先不读。现在把**块数与读法**直接写出来，让"还有多少没看"
-         * 成为可见状态；块数用字符估算（按标题切块不固定长度，所以写"约"）。
+         * amb_read_knowledge 读取）"——它把"要不要读"留给了 agent 的判断，而 agent 面对一个大
+         * 数字最常见的选择是先不读。后来改成"约几块"，仍然只是把寻找的活推给它。
+         *
+         * 现在：**有命中块就直接点名**（"相关段落在第 3、7 块，共 16 块"），没有才退回块数。
+         * 这一条对应一个真实事故：检索两次都命中、why.matched 与 coverage 都正常，却两次都只凭
+         * excerpt 判断而没读全文——因为当时的 excerpt 只截条目开头，不含关键词所在的位置。
          */
-        + `（正文 ${k.chars} 字符，约 ${Math.max(1, Math.ceil(k.chars / 4000))} 块；上面只是与查询相关的片段，不是全文——`
-        + `需要完整约束时用 amb_read_knowledge 传 query 取相关段落，或按 chunkIndex 逐块读，回执会告诉你还有几块未读）`
+        + (k.hitChunks
+          ? `（正文 ${k.chars} 字符，共 ${k.hitChunks.total} 块；**相关段落在第 ${k.hitChunks.chunks.join('、')} 块**——`
+            + `上面只是它的片段。用 amb_read_knowledge 传 chunkIndex 读那几块即可，不必读全文）`
+          : `（正文 ${k.chars} 字符，约 ${Math.max(1, Math.ceil(k.chars / 4000))} 块；上面只是与查询相关的片段，不是全文——`
+            + `需要完整约束时用 amb_read_knowledge 传 query 取相关段落，或按 chunkIndex 逐块读，回执会告诉你还有几块未读）`)
         + (k.kind === 'skill' && k.needsStructure ? '［尚未结构化：原文保存，未经核实为完整方法］' : '')
         + `\n摘要: ${k.excerpt}`),
     ];
