@@ -2066,7 +2066,7 @@ export class Store {
          * 大数字最常见的选择是先不读。现在把**块数与读法**直接写出来，让"还有多少没看"
          * 成为可见状态；块数用字符估算（按标题切块不固定长度，所以写"约"）。
          */
-        + `（正文 ${k.chars} 字符，约 ${Math.max(1, Math.ceil(k.chars / 2400))} 块；上面只是与查询相关的片段，不是全文——`
+        + `（正文 ${k.chars} 字符，约 ${Math.max(1, Math.ceil(k.chars / 4000))} 块；上面只是与查询相关的片段，不是全文——`
         + `需要完整约束时用 amb_read_knowledge 传 query 取相关段落，或按 chunkIndex 逐块读，回执会告诉你还有几块未读）`
         + (k.kind === 'skill' && k.needsStructure ? '［尚未结构化：原文保存，未经核实为完整方法］' : '')
         + `\n摘要: ${k.excerpt}`),

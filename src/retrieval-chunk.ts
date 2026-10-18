@@ -34,8 +34,14 @@ export interface ChunkView {
   advisory: string;
 }
 
-/** 默认块大小：约 2400 字符。实测条目中位数 7459 字符，这个粒度约 3-4 块，跳读够用。 */
-const DEFAULT_CHUNK_CHARS = 2400;
+/**
+ * 默认块大小：约 4000 字符（≈1.5k token）。
+ *
+ * 为什么从 2400 调大：实测一份 41947 字符的技能在 2400 下切成 **24 块**，在 4000 下约 11 块。
+ * 两者都远小于"按标题硬切"的 52 块，但 11 块的目录更像一份可用的目录——跳读的前提是
+ * 读者能在一次扫视里看完选项。块再大就会挤占上下文，那是另一个方向的代价。
+ */
+const DEFAULT_CHUNK_CHARS = 4000;
 
 interface Segment {
   heading: string;
@@ -45,49 +51,85 @@ interface Segment {
 }
 
 /**
- * 按 Markdown 标题切段；段太长时再按字符窗口切。
+ * 按 Markdown 标题切段，再**合并到目标大小**；仍超长的段按字符窗口切。
+ *
+ * 合并不是优化，是必要性：实测一份 41947 字符的技能按标题切成 **52 块**、平均 800 字符——
+ * 那等于把"跳读"变成"逐页翻"，而 agent 面对 52 块只会挑第一块看。结构决定边界（不把一条
+ * 规则切成两半），但块要够大才值得跳。
  *
  * 标题层级不细分（## 与 ### 同等对待）：目的只是"可跳读的块"，不是重建文档树。
  */
 function segment(body: string, maxChars: number): Segment[] {
   const lines = String(body ?? '').split('\n');
-  const segments: Segment[] = [];
+  const raw: Segment[] = [];
   let current: { heading: string; startLine: number; lines: string[] } | null = null;
   const flush = (endLine: number) => {
     if (!current) return;
-    const text = current.lines.join('\n');
-    // 一个标题段落太长时，按字符窗口再切，保留 120 字符重叠以免把一句话拦腰截断。
-    if (text.length <= maxChars) {
-      segments.push({ heading: current.heading, startLine: current.startLine, endLine, text });
-    } else {
-      const overlap = 120;
-      for (let offset = 0, index = 0; offset < text.length; index++) {
-        const slice = text.slice(offset, offset + maxChars);
-        const startLine = current.startLine + text.slice(0, offset).split('\n').length - 1;
-        const endLineHere = startLine + slice.split('\n').length - 1;
-        segments.push({
-          heading: index === 0 ? current.heading : `${current.heading}（续 ${index}）`,
-          startLine, endLine: endLineHere, text: slice,
-        });
-        offset += maxChars - overlap;
-      }
-    }
+    raw.push({ heading: current.heading, startLine: current.startLine, endLine, text: current.lines.join('\n') });
     current = null;
   };
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!;
-    const isHeading = /^\s{0,3}#{1,6}\s+\S/.test(line);
-    if (isHeading) {
+    if (/^\s{0,3}#{1,6}\s+\S/.test(line)) {
       flush(index); // 上一段在本行之前结束
       current = { heading: line.replace(/^\s{0,3}#{1,6}\s+/, '').trim(), startLine: index + 1, lines: [line] };
       continue;
     }
-    if (!current) current = { heading: '(开头)', startLine: index + 1, lines: [] };
+    if (!current) current = { heading: '', startLine: index + 1, lines: [] };
     current.lines.push(line);
   }
   flush(lines.length);
-  if (!segments.length) segments.push({ heading: '(空)', startLine: 1, endLine: Math.max(1, lines.length), text: '' });
-  return segments;
+
+  // 合并相邻段，直到接近目标大小才断。
+  const merged: Segment[] = [];
+  let accumulator: Segment | null = null;
+  for (const part of raw) {
+    if (!accumulator) { accumulator = { ...part }; continue; }
+    if (accumulator.text.length + part.text.length + 1 <= maxChars) {
+      accumulator.text = `${accumulator.text}\n${part.text}`;
+      accumulator.endLine = part.endLine;
+      // 开头那段本来没有标题（文档以正文起头），借后一段的标题作为它的名字，
+      // 否则目录里会出现 "(开头)" 这种对跳读毫无帮助的条目。
+      if (!accumulator.heading) {
+        accumulator.heading = part.heading;
+      } else if (part.heading) {
+        /**
+         * 合并进来的小节名也要出现在块名里，否则**目录就开始骗人**：读者看到块名是"第一节"，
+         * 以为这块只讲准备，而里面其实还有"第二节"的执行约束。
+         * 块名不能长到失去可读性，所以最多留三个，其余用节数交代。
+         */
+        const names = accumulator.heading.split(' … ');
+        if (!names.includes(part.heading)) {
+          const all = [...names, part.heading];
+          accumulator.heading = all.length <= 3 ? all.join(' … ') : `${all.slice(0, 2).join(' … ')} … 等 ${all.length} 节`;
+        }
+      }
+    } else {
+      merged.push(accumulator);
+      accumulator = { ...part };
+    }
+  }
+  if (accumulator) merged.push(accumulator);
+
+  // 仍然超长的块（单个标题下就是几万字）按字符窗口再切，保留 120 字符重叠，
+  // 免得把一句话拦腰截断后两边都读不懂。
+  const out: Segment[] = [];
+  for (const block of merged) {
+    if (block.text.length <= maxChars) { out.push(block); continue; }
+    const overlap = 120;
+    for (let offset = 0, index = 0; offset < block.text.length; index++) {
+      const slice = block.text.slice(offset, offset + maxChars);
+      const startLine = block.startLine + block.text.slice(0, offset).split('\n').length - 1;
+      out.push({
+        heading: index === 0 ? block.heading : `${block.heading}（续 ${index}）`,
+        startLine,
+        endLine: startLine + slice.split('\n').length - 1,
+        text: slice,
+      });
+      offset += maxChars - overlap;
+    }
+  }
+  return out.length ? out : [{ heading: '', startLine: 1, endLine: Math.max(1, lines.length), text: '' }];
 }
 
 /**
