@@ -179,6 +179,39 @@ node dist/src/cli.js restore --data-dir $AMB --file backup.ambpack --yes
 
 > 早期版本另有一个 Electron 桌面控制台，**已下线**，`npm run console` 这条命令不再存在。源码留在 `console.archived-electron/`，去向见 [`docs/implementation/electron-deprecation.md`](docs/implementation/electron-deprecation.md)。
 
+## 从 GitHub 直接安装
+
+**适配器可以从 GitHub 直接装**，不必先 clone——但要用 **pnpm 12 或以上**：`dsh` 内嵌的 pnpm 11 会**丢弃 `path:` 参数**，把仓库根当成插件装上，然后警告它没有 `dsh.bundle`。
+
+```powershell
+cd "$HOME/.dsh/profiles/<你的 profile>"
+pnpm add "github:czx455501074-afk/agent-memory-backpack#<sha>&path:adapters/dsh"
+```
+
+装完把包名登记进 `dsh.profile.bundles`（`dsh plugin add` 会自动写；手工装要自己写）：
+
+```json
+{ "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-agent-memory-backpack"] } } }
+```
+
+**核心需要构建产物**，所以它不走 git 直装（仓库不含 `dist/`）：
+
+```powershell
+git clone https://github.com/czx455501074-afk/agent-memory-backpack.git
+cd agent-memory-backpack
+npm ci && npm run build
+```
+
+**让装来的适配器找到这个核心**：把 `AMB_CORE_ENTRY` 指向它的 `cli.js`。
+
+```powershell
+$env:AMB_CORE_ENTRY = "$PWD/dist/src/cli.js"
+```
+
+适配器找不到核心时会报 `core-entry-missing`——只报告、不崩——`AMB_CORE_ENTRY` 就是给"适配器与核心不在一起"的安装准备的出口。核心 CLI 自己的 `service` 子命令读的是同一个变量，所以只需命名一次。
+
+> 为什么根 `package.json` 里没有 `prepare`：加过一版，`npm` 会执行它（只给警告），但 **pnpm 12 默认阻止 git 依赖的构建脚本**，于是适配器的直装会整体失败。适配器是纯 `.mjs`、本来不需要构建，所以构建被留在核心这一侧。
+
 ## 采纳你已有的知识
 
 插件可以扫描你机器上**已经存在**的规范、偏好与技能，把它们收进共享库，让两个桌面都读到同一份。
