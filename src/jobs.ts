@@ -1,7 +1,12 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 
-export type JobKind = 'model_review' | 'export' | 'notify' | 'structure_skill_digest' | 'structure_skill' | 'evolve';
+/**
+ * 作业类型。**新增一种就必须加进这个联合类型**：`enqueue` 一个未登记的类型不会被拒绝，
+ * 而是静默丢失 —— 这次加 `term_bridge` 时是 TypeScript 先挡住的
+ * （`Argument of type '"term_bridge"' is not assignable to parameter of type 'JobKind'`）。
+ */
+export type JobKind = 'model_review' | 'export' | 'notify' | 'structure_skill_digest' | 'structure_skill' | 'evolve' | 'term_bridge';
 export interface Job { id: string; kind: JobKind; key: string; payload: Record<string, unknown>; status: string; attempts: number; nextAt: number; error: string | null }
 
 /** Uses the authority connection: enqueue inside the caller's transaction for atomic commits. */

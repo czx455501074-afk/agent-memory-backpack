@@ -5,6 +5,8 @@ import { createHash } from 'node:crypto';
 import type { Store } from './store.js';
 import { DurableJobs } from './jobs.js';
 import { analyzeWithModel, modelReviewConfigSchema } from './model-review.js';
+// 模型归纳版术语桥：自动进化顺带补规则覆盖不到的那些说法（见 term-bridge-model.ts）。
+import { proposeBridge } from './term-bridge-model.js';
 import { exportSkills } from './export-skills.js';
 import { initializeWorkflowDrafts, processWorkflowDraft, processWorkflowDigest, enqueueWorkflowDraft } from './workflow-organization.js';
 import { collect, proposalSourceFrom, refineThresholds, type RefineRun } from './refine.js';
@@ -156,12 +158,49 @@ export function createMaintenanceWorker(store: Store, dataDir: string, projectId
             .run(Number(job.payload.revision), JSON.stringify(job.payload), Date.now());
           return { revision: job.payload.revision, availableForPolling: true };
         },
+        /**
+         * 自动进化顺带补**模型桥**。
+         *
+         * 规则桥在建索引时就算好了（见 store.ts 的 withBridge），这一步只补规则覆盖不到的那些
+         * 说法：项目内部黑话、旧称、某个人的习惯叫法 —— 那些要读过条目、又见过用户怎么说话的
+         * 一方才补得出来。
+         *
+         * 三条与别处一致的纪律：**未配置就跳过、不假装跑过**；**失败不写坏数据**（模型返回
+         * 不合形状时 proposeBridge 自己降级）；**桥存独立表、不写回条目**（不造新修订）。
+         *
+         * 由 `evolve` 作业在跑完后触发，所以它跟着自动进化的节奏走，不需要人记得手动跑。
+         */
+        async term_bridge(job) {
+          const configFile = join(dataDir, 'model-review.json');
+          let config;
+          if (existsSync(configFile)) {
+            try { config = modelReviewConfigSchema.parse(JSON.parse(readFileSync(configFile, 'utf8'))); }
+            catch { /* 下面按未配置处理，不落任何凭据或解析细节 */ }
+          }
+          if (!config) return { skipped: true, reason: 'not_configured' };
+          const pending = store.pendingBridgeEntries(Number(job.payload.limit ?? 10));
+          let saved = 0; let failed = 0;
+          for (const entry of pending) {
+            const proposal = await proposeBridge({ title: entry.title, body: entry.body, kind: entry.kind, config });
+            if (proposal.source !== 'model') { failed++; continue; }
+            saved += store.saveBridge([{
+              id: entry.id, revision: entry.revision, model: proposal.model ?? '',
+              aliases: proposal.aliases, keywords: proposal.keywords, summary: proposal.summary,
+            }]);
+          }
+          // 只在真写了东西时重建：没有新桥时重建索引是纯浪费（万级条目下约 2.4 秒）。
+          if (saved) store.rebuildSearchIndex();
+          return { saved, failed, pending: pending.length, model: config.model };
+        },
         evolve(job) {
           // Stage one and two only. Promotion is not called here on purpose: it files
           // proposals, which is a decision, and this worker runs unattended.
           const projectId = String(job.payload.projectId);
           const distilled = store.runEvolution({ projectId, dryRun: false });
           const consolidated = store.consolidateEvolution({ projectId, dryRun: false });
+          // 归纳之后顺带补模型桥：新条目一落地就带规则桥，模型桥在这里跟上。
+          // 未配置模型时那个作业会自己跳过，所以这里不必先判断配置。
+          jobs.enqueue('term_bridge', `term_bridge:${projectId}:${store.revision}`, { limit: 10 });
           return {
             scanned: distilled.scanned,
             candidates: distilled.candidates.length,

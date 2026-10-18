@@ -83,6 +83,26 @@ test('产出被清洗：去重，且拒绝单字泛词', async () => {
   assert.equal(proposal.keywords.filter(word => word === '入库').length, 1, '关键词同样去重');
 });
 
+test('待补模型桥的条目能被列出来（自动进化顺带补桥的入口）', () => {
+  /**
+   * 这条是 `evolve` → `term_bridge` 作业那条链路的入口判据：归纳产出的条目落地后必须能被这个
+   * 列表找到；补过之后不能再重复列出（否则每个维护周期都会为同一条重复调模型）。
+   */
+  const store = open();
+  store.import([{
+    id: 'memory:auto', baseRevision: 0, kind: 'memory', title: '自动进化产出的条目',
+    scope: { kind: 'global' }, body: '正文。',
+  }]);
+  const pending = store.pendingBridgeEntries(10);
+  const found = pending.find(entry => entry.id === 'memory:auto');
+  assert.ok(found, `新条目应出现在待补列表里：${pending.map(entry => entry.id).join('、')}`);
+  assert.equal(found!.revision, 1, '待补列表要带上当前修订号，否则补的桥会挂到错版本上');
+
+  store.saveBridge([{ id: 'memory:auto', revision: 1, model: 'stub', aliases: ['别名甲'], keywords: [], summary: '' }]);
+  assert.ok(!store.pendingBridgeEntries(10).some(entry => entry.id === 'memory:auto'),
+    '已补过的条目不该再被列出');
+});
+
 test('模型桥落库后进索引，且不需要改条目（不造新修订）', async () => {
   const store = open();
   store.import([{

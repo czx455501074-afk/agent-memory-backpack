@@ -399,6 +399,17 @@ const CONTRACTS = [
     ],
   },
   {
+    id: 'evolve-tops-up-the-model-bridge',
+    why: '自动进化产出的条目自动带**规则桥**（所有写入路径都过 withBridge），但规则覆盖不到项目内部黑话、旧称、某个人的习惯叫法——那要模型。所以 evolve 跑完后排队一个 term_bridge 作业去补：未配置模型时它自己跳过（不假装跑过），补到的桥存独立表、不写回条目（不造新修订），只在真写了东西时才重建索引。',
+    file: 'src/maintenance.ts',
+    must: ["async term_bridge(job)", "jobs.enqueue('term_bridge'", 'pendingBridgeEntries', 'not_configured'],
+    other: [
+      ['src/jobs.ts', ["'term_bridge'"]],
+      ['src/term-bridge-model.ts', ['proposeBridge']],
+      ['test/term-bridge-model.test.ts', ['待补模型桥的条目能被列出来']],
+    ],
+  },
+  {
     id: 'deploy-busy-guidance',
     why: '核心在跑时 Windows 拒绝重命名 core 目录；裸 EBUSY 让“部署失败”看起来像包损坏。',
     file: 'scripts/deploy-plugin.mjs',
