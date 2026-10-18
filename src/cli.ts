@@ -12,6 +12,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createCoreServer } from './server.js';
 // The optional semantic layer: configuration comes from the environment, and absence means off.
 import { embedTexts, embeddingConfigFrom } from './embeddings.js';
+// 模型归纳版术语桥（可选增强；规则版不需要它）。
+import { proposeBridge } from './term-bridge-model.js';
 import { defaultScanRoots, diff, discover, rescanDiff, summarize, summarizeRescan } from './discovery.js';
 // candidateToKnowledge lives with the rescan policy so the CLI and the running
 // core convert discovered text identically; two copies would drift.
@@ -59,6 +61,8 @@ const USAGE = [
   '  logs [--source plugin] [--all-sources] [--level LVL] [--event NAME] [--json]',
   '  embed [--project ID] [--limit N] [--yes]   vectors for the optional semantic layer',
   '                                           (needs AMB_EMBEDDING_ENDPOINT + AMB_EMBEDDING_MODEL)',
+  '  bridge [--limit N] [--yes]              model-written term bridge for entries that lack one',
+  '                                           (needs model-review.json; rules work without it)',
   '  reindex                                  rebuild the full-text index (refreshes the term bridge)',
   '  setup [--project ID] [--port N] [--project-root PATH]',
   '                                           first run: data dir + credentials + next command',
@@ -624,6 +628,44 @@ try {
         note: '术语桥已按当前规则重算（别名与关键词进入全文索引）；条目本身没有被修改，也没有产生新修订。'
           + '用 amb_search_universal 或管理界面试一条同义说法，即可核对是否命中。',
       }, null, 2));
+    } finally { store.close(); }
+  } else if (command === 'bridge') {
+    /**
+     * 用模型为条目归纳术语桥（可选增强；规则桥不需要它）。
+     *
+     * 规则版覆盖不了个性化的说法：项目内部黑话、旧称、某个人的习惯叫法。那些要读过条目、
+     * 又见过用户怎么说话的一方才补得出来。
+     *
+     * 未配置模型时**明确说"没配"**，而不是静默跳过 —— 与向量层同一纪律。
+     * 产出落在独立表里、不写回条目（桥只是检索辅助，不值得造新修订），跑完自动重建索引。
+     */
+    const store = new Store(join(dir, 'knowledge.sqlite'));
+    try {
+      const configFile = join(dir, 'model-review.json');
+      let config: unknown;
+      try { config = JSON.parse(readFileSync(configFile, 'utf8')); } catch { config = undefined; }
+      if (!config) {
+        console.log('未配置模型，跳过这一步（规则版术语桥已随索引自动生效，不需要它）。');
+        console.log(`要启用：把模型配置写到 ${configFile}（字段 endpoint / model，可选 apiKey），再重跑本命令。`);
+      } else {
+        const pending = store.pendingBridgeEntries(Number(values.limit ?? 50));
+        console.log(`已有模型桥 ${store.bridgeCount()} 条；本次待归纳 ${pending.length} 条。`);
+        if (values.yes !== true) {
+          console.log('干跑：未调用模型、未写入。加 --yes 执行。');
+        } else {
+          let saved = 0; let failed = 0;
+          for (const entry of pending) {
+            const proposal = await proposeBridge({ title: entry.title, body: entry.body, kind: entry.kind, config: config as never });
+            if (proposal.source !== 'model') { failed++; continue; }
+            saved += store.saveBridge([{
+              id: entry.id, revision: entry.revision, model: proposal.model ?? '',
+              aliases: proposal.aliases, keywords: proposal.keywords, summary: proposal.summary,
+            }]);
+          }
+          console.log(`已保存 ${saved} 条模型桥${failed ? `，${failed} 条未成功（模型不可用或返回不合形状）` : ''}。`);
+          if (saved) console.log(`已重建索引 ${store.rebuildSearchIndex()} 条，模型桥已合并进检索。`);
+        }
+      }
     } finally { store.close(); }
   } else if (command === 'supersede') {
     // Working-time correction: after verifying in practice, replace or complement

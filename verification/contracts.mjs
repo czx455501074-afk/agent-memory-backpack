@@ -370,6 +370,17 @@ const CONTRACTS = [
     ],
   },
   {
+    id: 'model-term-bridge-is-optional-and-fault-tolerant',
+    why: '规则桥覆盖不了个性化说法（项目内部黑话、旧称、某个人的习惯叫法），模型归纳版补这一层。三条纪律：未配置就明说、不可用/不合形状降级到规则桥、产出逐条清洗——**一个坏项不得作废整批**（schema 设长度下限会一票否决，测试连抓两次：.min(2) 挡单字、.min(1) 挡空白串，两次都成了 invalid_response）。产出存独立表不写回条目，所以不造新修订。',
+    file: 'src/term-bridge-model.ts',
+    must: ['proposeBridge', 'not_configured', 'bridgeSchema', 'invalid_response'],
+    other: [
+      ['src/store.ts', ['entry_bridges', 'saveBridge', 'pendingBridgeEntries', 'bridgeCount']],
+      ['src/cli.ts', ["command === 'bridge'"]],
+      ['test/term-bridge-model.test.ts', ['未配置模型时不崩', '不造新修订', '单字泛词应被拒绝']],
+    ],
+  },
+  {
     id: 'deploy-busy-guidance',
     why: '核心在跑时 Windows 拒绝重命名 core 目录；裸 EBUSY 让“部署失败”看起来像包损坏。',
     file: 'scripts/deploy-plugin.mjs',

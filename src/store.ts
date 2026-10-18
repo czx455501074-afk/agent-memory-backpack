@@ -275,12 +275,19 @@ function searchable(value: string): string {
  * 条目**自带** `aliases`/`keywords`（模型归纳写的，或人填的）时原样采用——那是比规则更强的
  * 证据，不该被规则覆盖；只有当两者都缺时才用规则补。
  */
-function withBridge(contentJson: string): string {
+function withBridge(contentJson: string, modelBridges?: Map<string, { aliases: string[]; keywords: string[] }>): string {
   try {
     const content = JSON.parse(contentJson) as Record<string, unknown>;
+    const id = String(content.id ?? '');
     const aliases = Array.isArray(content.aliases) ? content.aliases : [];
     const keywords = Array.isArray(content.keywords) ? content.keywords : [];
+    // 条目**自带**的桥优先：那是模型归纳或人填的，比任何一侧的自动生成都更接近"用户怎么说"。
     if (aliases.length && keywords.length) return contentJson;
+    // 其次是**模型归纳的桥**（它读过条目、也见过用户怎么说话），最后才是规则桥。
+    const fromModel = modelBridges?.get(id);
+    if (fromModel && (fromModel.aliases.length || fromModel.keywords.length)) {
+      return `${contentJson} ${[...fromModel.aliases, ...fromModel.keywords].join(' ')}`;
+    }
     const asText = (value: unknown): string[] => Array.isArray(value)
       ? value.flat().filter((item): item is string => typeof item === 'string')
       : [];
@@ -299,6 +306,29 @@ function withBridge(contentJson: string): string {
     // 解析不了就按原样索引：宁可没有桥，也不能因为一条坏 JSON 让整次重建失败。
     return contentJson;
   }
+}
+
+/**
+ * 模型归纳的术语桥：读全表一次，供索引重建时合并。
+ *
+ * 只取**当前版本**的桥：条目改版后旧桥描述的可能是另一段文字，那会让检索命中一条讲别的事的
+ * 条目 —— 比没有桥更糟。
+ */
+function bridgeMap(db: DatabaseSync): Map<string, { aliases: string[]; keywords: string[] }> {
+  const map = new Map<string, { aliases: string[]; keywords: string[] }>();
+  try {
+    const rows = db.prepare(`SELECT b.id AS id, b.aliases AS aliases, b.keywords AS keywords FROM entry_bridges b
+      JOIN knowledge k ON k.id = b.id AND k.head = b.revision`).all() as Array<{ id: string; aliases: string; keywords: string }>;
+    for (const row of rows) {
+      try {
+        map.set(String(row.id), {
+          aliases: JSON.parse(String(row.aliases)) as string[],
+          keywords: JSON.parse(String(row.keywords)) as string[],
+        });
+      } catch { /* 坏行跳过，不让它拖垮整次重建 */ }
+    }
+  } catch { /* 表还没建（老库）就当没有模型桥 */ }
+  return map;
 }
 
 /**
@@ -889,7 +919,7 @@ export class Store {
       const id = String((row as { id: string }).id);
       if (indexed.has(id)) continue;
       this.db.prepare('INSERT INTO workflow_search VALUES(?,?)')
-        .run(id, searchable(withBridge(String((row as { content: string }).content))));
+        .run(id, searchable(withBridge(String((row as { content: string }).content), bridgeMap(this.db))));
     }
   }
   /**
@@ -909,15 +939,66 @@ export class Store {
       JOIN revisions r ON r.id = k.id AND r.revision = k.head
       WHERE k.status = 'active'`).all() as Array<{ id: string; content: string }>;
     const insert = this.db.prepare('INSERT INTO workflow_search VALUES(?,?)');
+    // 模型桥读一次、合并进每一条：它优先于规则桥（见 withBridge 的优先级说明）。
+    const bridges = bridgeMap(this.db);
     this.transaction(() => {
       this.db.prepare('DELETE FROM workflow_search').run();
-      for (const row of heads) insert.run(String(row.id), searchable(withBridge(String(row.content))));
+      for (const row of heads) insert.run(String(row.id), searchable(withBridge(String(row.content), bridges)));
     });
     return heads.length;
   }
   /** 索引当前覆盖多少条：用于核对重建前后的差异。 */
   searchIndexSize(): number {
     return Number((this.db.prepare('SELECT count(*) n FROM workflow_search').get() as { n: number }).n);
+  }
+  /**
+   * 存一条模型归纳的术语桥（按 id + revision）。
+   *
+   * 存在独立表里，**不写回条目**：桥只是检索辅助，不值得造新修订，也不该让条目历史里混进一串
+   * 由模型猜出来的别名。重跑同一条目同一版本是覆盖 —— 于是"再跑一次"永远是安全的。
+   */
+  saveBridge(rows: Array<{ id: string; revision: number; model: string; aliases: string[]; keywords: string[]; summary: string }>): number {
+    if (!rows.length) return 0;
+    const statement = this.db.prepare(`INSERT INTO entry_bridges(id, revision, model, aliases, keywords, summary, created_at)
+      VALUES(?,?,?,?,?,?,?) ON CONFLICT(id, revision) DO UPDATE SET model=excluded.model, aliases=excluded.aliases,
+      keywords=excluded.keywords, summary=excluded.summary, created_at=excluded.created_at`);
+    const now = this.now();
+    this.transaction(() => {
+      for (const row of rows) statement.run(row.id, row.revision, row.model, JSON.stringify(row.aliases), JSON.stringify(row.keywords), row.summary, now);
+    });
+    return rows.length;
+  }
+  /**
+   * 还没有模型桥的条目（或版本已变、旧桥失效的条目）。
+   *
+   * 与 `pendingEmbeddingEntries` 同一形状：只挑 active 且当前版本缺桥的。版本变化会让旧桥自动
+   * 不再被 `bridgeMap` 采用（它按 revision 关联），所以这里也就自然把它算作"待补"。
+   */
+  pendingBridgeEntries(limit = 100): Array<{ id: string; revision: number; kind: string; title: string; body: string }> {
+    const rows = this.db.prepare(`SELECT k.id AS id, k.head AS head, r.content AS content FROM knowledge k
+      JOIN revisions r ON r.id = k.id AND r.revision = k.head
+      WHERE k.status = 'active'
+        AND NOT EXISTS (SELECT 1 FROM entry_bridges b WHERE b.id = k.id AND b.revision = k.head)
+      ORDER BY k.head DESC LIMIT ?`).all(Math.max(1, Math.min(2000, limit))) as Array<{ id: string; head: number; content: string }>;
+    const out: Array<{ id: string; revision: number; kind: string; title: string; body: string }> = [];
+    for (const row of rows) {
+      try {
+        const content = JSON.parse(String(row.content)) as Record<string, unknown>;
+        out.push({
+          id: String(row.id), revision: Number(row.head), kind: String(content.kind ?? ''),
+          title: String(content.title ?? ''),
+          body: String(content.body ?? content.did ?? content.overview ?? ''),
+        });
+      } catch { /* 坏行跳过 */ }
+    }
+    return out;
+  }
+  /** 有多少条目已经有模型桥（用于核对"跑完前后"）。 */
+  bridgeCount(): number {
+    try {
+      return Number((this.db.prepare(`SELECT count(*) n FROM entry_bridges b
+        JOIN knowledge k ON k.id = b.id AND k.head = b.revision`).get() as { n: number }).n);
+    } catch { return 0; }
   }
   close() { this.db.close(); }
   /**
@@ -3270,6 +3351,13 @@ export class Store {
       CREATE TABLE IF NOT EXISTS embeddings(
         id TEXT NOT NULL, revision INTEGER NOT NULL, model TEXT NOT NULL, dims INTEGER NOT NULL,
         vector BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(id, revision));
+      -- 模型归纳的术语桥。独立表而不是条目字段：桥只是**检索辅助**，不值得为它造一条新修订，
+      -- 也不该让"条目历史"里混进一串由模型猜出来的别名。放在这里，"重建索引"就仍然是刷新桥的
+      -- 唯一动作 —— 规则版与模型版共用同一条出口（见 withBridge）。
+      CREATE TABLE IF NOT EXISTS entry_bridges(
+        id TEXT NOT NULL, revision INTEGER NOT NULL, model TEXT NOT NULL,
+        aliases TEXT NOT NULL, keywords TEXT NOT NULL, summary TEXT NOT NULL,
+        created_at INTEGER NOT NULL, PRIMARY KEY(id, revision));
     `);
   }
   /**
