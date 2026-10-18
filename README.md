@@ -181,6 +181,25 @@ dsh plugin --profile <profile> add "$PWD\adapters\dsh"
 
 > **不要手工往 `cordis.patch.yml` 里 insert 本插件。** 它自带 bundle 补丁（`adapters/dsh/package.json` 的 `dsh.bundle.patch`），安装命令会自动注册；重复 insert 同一个 id 会让加载器因 duplicate loader entry id 拒绝启动。
 
+### 更新到最新版本
+
+上面三条路径装的都是**某一刻的快照**——产物不会自己跟进仓库。仓库前进之后要更新，重跑同一套流程即可（每次都从最新提交构建）：
+
+```powershell
+git clone --depth 1 https://github.com/czx455501074-afk/agent-memory-backpack.git "$env:TEMP\amb-latest"
+cd "$env:TEMP\amb-latest"
+npm ci --ignore-scripts
+npm run build
+npm run pack:local
+
+# DSH 侧：部署到稳定目录并重新接线（核心在跑时先停核心，否则目录被占用）
+node scripts/deploy-plugin.mjs --artifact (Get-Content artifacts/latest.json | ConvertFrom-Json).directory
+
+# Codex 侧：把产物的 .agents 与 codex-plugin 覆盖到 marketplace 根目录，再重启 Codex
+```
+
+**怎么确认装的是哪一版**：比对部署副本与新产物的文件哈希，或查一个只在某次提交之后才存在的标记字符串。举例：`AMB_CORE_ENTRY` 是 `80f1082` 引入的——若部署副本的 `hook.mjs` / `index.mjs` 里搜不到它，那就是旧版。
+
 ### 桌面里还要做两步
 
 1. **加载插件**：桌面设置 → 插件管理 → 本地安装 → 选择数据目录或打包产物里的 `dsh-plugin`。
