@@ -927,7 +927,22 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           // find nothing here. The reason is rewritten rather than dropped: a caller
           // must still be able to tell "the model abstained" from "the model judged
           // this irrelevant" - those are different facts and lead to different fixes.
-          const modelAbstained=(selection.mode==='model'||selection.mode==='index')&&selection.selectedIds.length===0;
+          /**
+           * 弃权与不可用**长得一样，结论相反**。
+           *
+           * 两者都可能是 `mode: 'index'` + 空 `selectedIds`，所以不能只看形状：
+           *   - **弃权**（模型说"没什么适用"）：那是关于**相关性**的回答，可以用本地排名兜底；
+           *   - **不可用**（provider 挂了/超时/排队）：那是关于**可用性**的回答，兜底就等于把
+           *     "没查"当成"没找到"——正是这个项目反复禁止的那类混淆。
+           *
+           * 判据因此落在 reason 上：降级路径里只有 `model_abstained` 算弃权；而 `mode: 'model'`
+           * 意味着模型真的作答了（选了空），也算弃权。既有测试
+           * `unavailable model does not guess automatic recall` 守的正是这条边界——第一版按
+           * "mode + 空集"判断，它立刻红了。
+           */
+          const modelAbstained=(selection.mode==='model'||selection.mode==='index')
+            &&selection.selectedIds.length===0
+            &&((selection.reason??'').includes('model_abstained')||selection.mode==='model');
           const effective=modelAbstained?{...selection,mode:'lexical_fallback' as const,reason:`model_abstained:${selection.reason??'no_selection'}`}:selection;
           const bySelection=effective.selectedIds.flatMap(id=>catalog.filter(entry=>entry.id===id)).slice(0,p.limit??(p.autoRecall?3:100));
           /**
@@ -949,7 +964,27 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           // that as undecided would answer with a local guess exactly where
           // `retrieval-service` documents availability and relevance as different
           // claims.
-          const decided=selection.mode==='model'||selection.mode==='index';
+          /**
+           * 模型"明确弃权"**不是**一个决定。
+           *
+           * 上面那段注释本来就是这么写的（"the model said 'nothing applies' … is answered from
+           * the full-text ranking"），但代码把 `mode === 'model'` 一律当 decided，于是弃权返回
+           * 空集。实测抓到的形状：查询「规矩」在索引里命中 **29** 条、字面检索 5 条，而不带
+           * `literal` 时是 **0** 条 —— agent 由此得出的结论会是"库里没有"，而库里有。
+           * 同一个查询换个说法（"我以前写下的那些规矩"）反而能命中，正是因为多出来的词让模型
+           * 给出了选择：**结果取决于模型当天怎么想，而不取决于库里有什么。**
+           */
+          /**
+           * 显式检索与自动召回是**两个约定**，这条线由既有测试划着，我一开始把它当成一条：
+           *   - `autoRecall: true` 走**自动召回**语义 —— 模型不可用时不猜（与 `/v1/prepare` 同一
+           *     约定），因为"没查"不能被当成"没找到"；
+           *   - **显式检索**（不带 autoRecall）是用户在明确找东西 —— 本地索引的严格门槛
+           *     （`automaticRelevance` 的绝对下限）是为自动注入设的，不该拦显式查询。实测形状：
+           *     同一个词在索引里命中 29 条、字面检索 5 条，而这个端点返回 0 条，用户据此断定
+           *     库里没有。
+           */
+          const decided=(selection.mode==='model'&&!modelAbstained)
+            ||(p.autoRecall===true&&selection.mode==='index');
           const results=p.kind==='norm'?store.searchUniversal(p.projectId,p.query,p.kind,p.limit)
             :decided?bySelection:store.searchUniversal(p.projectId,p.query,p.kind,p.limit??(p.autoRecall?3:100));
           return reply(res,200,{results,selection:effective,knowledgeRevision:store.revision});

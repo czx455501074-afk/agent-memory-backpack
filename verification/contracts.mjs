@@ -360,6 +360,16 @@ const CONTRACTS = [
     ],
   },
   {
+    id: 'explicit-search-falls-back-to-the-index',
+    why: '显式检索把降级路径（mode:index —— 本机未配模型时就是它）也当成"模型做了决定"，于是为自动注入设的严格证据门槛拦掉了用户明确要找的东西：实测「规矩」在索引里命中 29 条、literal 5 条，而这个端点 0 条。三条路径的约定必须分开：显式检索兜底、autoRecall 保守、literal 直连索引。',
+    file: 'src/server.ts',
+    must: ["const decided=(selection.mode==='model'&&!modelAbstained)", 'p.autoRecall===true'],
+    other: [
+      ['test/search-path-conventions.test.ts', ['显式检索不得返回空', 'autoRecall 在模型不可用时必须保守']],
+      ['test/retrieval-service.test.ts', ['unavailable model does not guess automatic recall']],
+    ],
+  },
+  {
     id: 'deploy-busy-guidance',
     why: '核心在跑时 Windows 拒绝重命名 core 目录；裸 EBUSY 让“部署失败”看起来像包损坏。',
     file: 'scripts/deploy-plugin.mjs',

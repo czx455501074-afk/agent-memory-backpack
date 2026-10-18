@@ -116,17 +116,22 @@ function segment(body: string, maxChars: number): Segment[] {
   const out: Segment[] = [];
   for (const block of merged) {
     if (block.text.length <= maxChars) { out.push(block); continue; }
-    const overlap = 120;
-    for (let offset = 0, index = 0; offset < block.text.length; index++) {
+    /**
+     * 重叠必须**严格小于**块上限，否则步长 `maxChars - overlap` 会变成零或负数 —— 那是死循环。
+     * 硬编码 120 在默认 4000 下没问题，但 `maxChars: 10` 会让它变成 -110。
+     */
+    const overlap = Math.min(120, Math.max(0, Math.floor(maxChars / 4)));
+    const step = Math.max(1, maxChars - overlap);
+    for (let offset = 0, part = 0; offset < block.text.length; part++) {
       const slice = block.text.slice(offset, offset + maxChars);
       const startLine = block.startLine + block.text.slice(0, offset).split('\n').length - 1;
       out.push({
-        heading: index === 0 ? block.heading : `${block.heading}（续 ${index}）`,
+        heading: part === 0 ? block.heading : `${block.heading}（续 ${part}）`,
         startLine,
         endLine: startLine + slice.split('\n').length - 1,
         text: slice,
       });
-      offset += maxChars - overlap;
+      offset += step;
     }
   }
   return out.length ? out : [{ heading: '', startLine: 1, endLine: Math.max(1, lines.length), text: '' }];
