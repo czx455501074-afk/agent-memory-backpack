@@ -92,8 +92,24 @@ export function createMcp(client: CoreClient, logger?: Logger) {
     inputSchema: { workflowId: identifier, stageId: identifier }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/expand', args));
   server.registerTool('amb_read_knowledge', {
-    description: 'Expand one adopted skill or memory by the id shown in the prepare summary. Set includeLeaves to also read the reference documents a skill carries.',
-    inputSchema: { knowledgeId: referenceId, includeLeaves: z.boolean().default(false) }, annotations: { readOnlyHint: true, openWorldHint: false },
+    /**
+     * 长条目默认分块返回，回执自带"还有几块未读"。
+     *
+     * 实测背景：库里正文平均 7459 字符、最长 53117 字符；过去这个工具一次给全文，于是
+     * agent 面对五万字只读开头，而关键约束常在中后段（Lost in the Middle 实测中段召回跌到
+     * 30% 以下）。现在默认给一块，并把总块数、目录与未读数量写进回执 —— 让"没读完"变成
+     * 可见状态，而不是靠叮嘱。
+     */
+    description: 'Read one entry by the id shown in the prepare summary. Long entries come back in CHUNKS by default: the reply carries chunk.totalChunks, chunk.outline (every chunk heading) and an advisory naming how many chunks remain. Continue with chunkIndex, or pass query to get only the passages relevant to a question. includeLeaves also reads the reference documents a skill carries. full=true returns everything and is rarely what you want.',
+    inputSchema: {
+      knowledgeId: referenceId,
+      includeLeaves: z.boolean().default(false),
+      query: z.string().max(4000).optional(),
+      chunkIndex: z.number().int().nonnegative().optional(),
+      startLine: z.number().int().positive().optional(),
+      endLine: z.number().int().positive().optional(),
+      full: z.boolean().optional(),
+    }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/read', args));
   server.registerTool('amb_supersede_experience', {
     // Admin-only on the core: this rewrites the effective library rather than adding

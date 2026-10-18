@@ -14,6 +14,8 @@ import { reviewPrefill, reviewPrefills, type ReviewPrefill } from './model-revie
 import { enqueueWorkflowDraft, listWorkflowDrafts, readWorkflowDraft, approveWorkflowDraft, reviseWorkflowDraft } from './workflow-organization.js';
 import { createRetrievalService, selectionSource } from './retrieval-service.js';
 import { relevantPassages } from './retrieval-excerpt.js';
+// 分块读取：长条目不再一次给全文（见 retrieval-chunk.ts 的实测背景）。
+import { chunkBody } from './retrieval-chunk.js';
 
 /**
  * Static responses the core serves for its own management interface.
@@ -797,9 +799,49 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           return reply(res, 200, { history: store.supersessions(undefined, p.projectId).slice(0, p.limit ?? 50) });
         }
         case '/v1/knowledge/read': {
-          const p = z.object({ projectId: z.string(), knowledgeId: z.string(), includeLeaves: z.boolean().optional(), query:z.string().max(4000).optional() }).parse(body);
+          const p = z.object({
+            projectId: z.string(), knowledgeId: z.string(), includeLeaves: z.boolean().optional(),
+            query: z.string().max(4000).optional(),
+            /**
+             * 分块定位。**默认不再一次给全文**：实测最长条目 53117 字符，一次塞进去既挤占
+             * 上下文、又让 agent 只读开头（Lost in the Middle 的中段召回跌到 30% 以下）。
+             * 三种定位：`startLine`/`endLine`（精确行）→ `chunkIndex`（按块）→ 默认第 0 块。
+             */
+            chunkIndex: z.number().int().nonnegative().optional(),
+            startLine: z.number().int().positive().optional(),
+            endLine: z.number().int().positive().optional(),
+            /** 显式要全文时才给（保留旧行为，供导出、审计这类确实需要全文的调用方）。 */
+            full: z.boolean().optional(),
+          }).parse(body);
           const knowledge=store.readKnowledge(p.projectId,p.knowledgeId,p.includeLeaves??false);
-          return reply(res,200,{...knowledge,...(p.query?{passages:relevantPassages(knowledge.body,p.query)}:{})});
+          const chars = String(knowledge.body ?? '').length;
+          const passages = p.query ? relevantPassages(knowledge.body, p.query) : undefined;
+          /**
+           * 查询与分块不并用：`query` 本身就是在缩小范围，再叠一层分块只会让读者分不清
+           * "这是全部命中段落"还是"这只是第几块"。两者取其一，并在回执里说清是哪一种。
+           */
+          const chunk = (!p.full && !passages?.length)
+            ? chunkBody(knowledge.body, { chunkIndex: p.chunkIndex, startLine: p.startLine, endLine: p.endLine })
+            : undefined;
+          return reply(res, 200, {
+            ...knowledge,
+            chars,
+            ...(chunk ? {
+              body: chunk.text,
+              chunk: {
+                chunkIndex: chunk.chunkIndex, totalChunks: chunk.totalChunks, hasMore: chunk.hasMore,
+                nextChunkIndex: chunk.nextChunkIndex, startLine: chunk.startLine, endLine: chunk.endLine,
+                totalLines: chunk.totalLines, outline: chunk.outline, advisory: chunk.advisory,
+              },
+            } : {}),
+            ...(passages ? {
+              passages,
+              note: passages.length
+                ? `这是按查询取回的相关段落（共 ${passages.length} 段），不是全文；要更多段落就换关键词再取，或按 chunkIndex 逐块读。`
+                : '没有段落命中该查询；换关键词，或用 chunkIndex 逐块读。',
+            } : {}),
+            ...(!chunk && !passages ? { note: '本次按 full=true 返回全文，长度 ' + chars + ' 字符。' } : {}),
+          });
         }
         // The caller's own projectId is echoed back so a UI can label what it is
         // showing. It is not a disclosure: the request already had to name it, and

@@ -1992,12 +1992,19 @@ export async function apply(ctx) {
 
   registerTool(jsonTool({
     name: 'amb_read_knowledge',
-    description: 'Expand one adopted skill or memory by the id shown in the prepare summary, optionally with its reference documents.',
+    // 与 src/mcp.ts 的同名工具保持一致：长条目默认分块，回执带总块数、目录与未读数量。
+    // 两处必须一起改 —— 只改一处，问题会换条链路复发。
+    description: 'Read one entry by the id shown in the prepare summary. Long entries come back in CHUNKS by default: the reply carries chunk.totalChunks, chunk.outline (every chunk heading) and an advisory naming how many chunks remain. Continue with chunkIndex, or pass query to get only the passages relevant to a question. includeLeaves also reads the reference documents a skill carries. full=true returns everything and is rarely what you want.',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
         knowledgeId: { type: 'string', minLength: 1 },
         includeLeaves: { type: 'boolean' },
+        query: { type: 'string', maxLength: 4000 },
+        chunkIndex: { type: 'integer', minimum: 0 },
+        startLine: { type: 'integer', minimum: 1 },
+        endLine: { type: 'integer', minimum: 1 },
+        full: { type: 'boolean' },
       }, required: ['knowledgeId'],
     },
     async execute(args, exec) {
@@ -2005,6 +2012,11 @@ export async function apply(ctx) {
         projectId: config.projectId,
         knowledgeId: requireString(args?.knowledgeId, 'knowledgeId'),
         includeLeaves: args?.includeLeaves === true,
+        ...(typeof args?.query === 'string' && args.query.trim() ? { query: args.query } : {}),
+        ...(Number.isInteger(args?.chunkIndex) ? { chunkIndex: args.chunkIndex } : {}),
+        ...(Number.isInteger(args?.startLine) ? { startLine: args.startLine } : {}),
+        ...(Number.isInteger(args?.endLine) ? { endLine: args.endLine } : {}),
+        ...(args?.full === true ? { full: true } : {}),
       }, { signal: exec.signal })
     },
   }))

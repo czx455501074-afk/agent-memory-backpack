@@ -347,6 +347,19 @@ const CONTRACTS = [
     other: [['test/skill-context.test.ts', ['宿主已加载的正文不得重复注入']]],
   },
   {
+    id: 'long-entries-are-read-in-chunks',
+    why: '正文平均 7459 字符、最长 53117，而 read 一次给全文、prepare 只给前 400 字符——前者让 agent 面对五万字只读开头（Lost in the Middle 中段召回跌到 30% 以下），后者让它以为"就这些"。现在默认分块，回执带总块数、目录与未读数量，注入行写明"上面只是片段、约几块、怎么读全"。',
+    file: 'src/retrieval-chunk.ts',
+    must: ['chunkBody', 'totalChunks', 'advisory', 'outline'],
+    other: [
+      ['src/server.ts', ['chunkIndex: z.number().int().nonnegative().optional()', 'chunk: {']],
+      ['src/mcp.ts', ['come back in CHUNKS by default']],
+      ['adapters/dsh/index.mjs', ['come back in CHUNKS by default']],
+      ['src/store.ts', ['上面只是与查询相关的片段，不是全文']],
+      ['test/retrieval-chunk.test.ts', ['未读必须明说', '默认不得返回全文']],
+    ],
+  },
+  {
     id: 'deploy-busy-guidance',
     why: '核心在跑时 Windows 拒绝重命名 core 目录；裸 EBUSY 让“部署失败”看起来像包损坏。',
     file: 'scripts/deploy-plugin.mjs',

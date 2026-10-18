@@ -12,6 +12,8 @@ import { redactDeep, redactInString, type RedactionFinding } from './redact.js';
 import { decodeVector, encodeVector } from './embeddings.js';
 // 术语桥：让「用户怎么说」与「库里怎么写」对上（见 term-bridge.ts）。
 import { buildTermBridge } from './term-bridge.js';
+// 注入用的相关段落：正文开头往往不是答案所在（见 retrieval-excerpt.ts）。
+import { relevantPassages } from './retrieval-excerpt.js';
 import { consolidateCandidates, distillFailures, EVOLVE_DEFAULTS, promotionText, type EvolveCandidate, type EvolveLink, type EvolveThresholds, type FailureSignal } from './evolve.js';
 
 type Row = Record<string, unknown>;
@@ -1392,7 +1394,25 @@ export class Store {
       const body = content.kind === 'journal' ? content.did : content.body;
       result.push({
         id: entry.id, revision: entry.revision, kind: content.kind, title: content.title,
-        excerpt: body.length > excerptChars ? `${body.slice(0, excerptChars)}…` : body,
+      /**
+       * 注入的片段改为**与查询相关的段落**，而不是"正文开头 400 字符"。
+       *
+       * 实测的病：正文平均 7459 字符、最长 53117，而注入的永远是开头。用户问的东西若在中后段，
+       * agent 看到的片段与他的问题毫无关系，于是它既不会用这条、也不知道里面还有内容——
+       * Lost in the Middle 的实测结论正是中段信息召回会跌到 30% 以下。
+       *
+       * 没有命中段落时退回开头，并把这件事如实反映在 `why` 与 `chars` 里：**不假装这段就是答案**。
+       */
+      excerpt: (() => {
+        // 相关段落优先，但**总长仍受 `excerptChars` 约束**：那个参数是调用方对"注入多少字"的
+        // 决定，不能被这里擅自放大（`skill-context` 的测试正是钉这一点的）。
+        const passages = relevantPassages(body, query, Math.max(120, excerptChars * 2));
+        if (passages.length) {
+          const joined = passages.map(item => item.text.trim()).join(' … ');
+          return joined.length > excerptChars ? `${joined.slice(0, excerptChars)}…` : joined;
+        }
+        return body.length > excerptChars ? `${body.slice(0, excerptChars)}…` : body;
+      })(),
         chars: body.length,
         leafCount: content.kind === 'skill' ? content.leaves.length : 0,
         needsStructure: content.kind === 'skill' ? content.needsStructure : false,
@@ -2038,7 +2058,16 @@ export class Store {
       // silently consume the task's context budget.
       ...knowledge.map(k => `${k.kind === 'skill' ? '已采纳技能' : '背景记忆'} ${k.id}@${k.revision} ${k.title}`
         + (k.leafCount ? `（含 ${k.leafCount} 个参考文档）` : '')
-        + `（正文 ${k.chars} 字符，需要时调用 amb_read_knowledge 读取）`
+        /**
+         * 把"上面这段不是全文"说清楚，并给出读全的办法。
+         *
+         * 实测：正文平均 7459 字符、最长 53117。过去这行只写"（正文 N 字符，需要时调用
+         * amb_read_knowledge 读取）"——它把"要不要读"留给了 agent 的判断，而 agent 面对一个
+         * 大数字最常见的选择是先不读。现在把**块数与读法**直接写出来，让"还有多少没看"
+         * 成为可见状态；块数用字符估算（按标题切块不固定长度，所以写"约"）。
+         */
+        + `（正文 ${k.chars} 字符，约 ${Math.max(1, Math.ceil(k.chars / 2400))} 块；上面只是与查询相关的片段，不是全文——`
+        + `需要完整约束时用 amb_read_knowledge 传 query 取相关段落，或按 chunkIndex 逐块读，回执会告诉你还有几块未读）`
         + (k.kind === 'skill' && k.needsStructure ? '［尚未结构化：原文保存，未经核实为完整方法］' : '')
         + `\n摘要: ${k.excerpt}`),
     ];
