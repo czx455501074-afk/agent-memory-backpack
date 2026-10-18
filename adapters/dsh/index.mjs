@@ -21,10 +21,18 @@ const ADAPTER_DIR = dirname(fileURLToPath(import.meta.url))
  * Packaged: `dsh-plugin/runtime/cli.js` beside this file. A development checkout
  * has no such copy, so `dist/src/cli.js` two levels up is tried as well. Only
  * the first that exists is used; a missing entry is reported, never raised.
+ *
+ * `AMB_CORE_ENTRY` covers the third shape, which neither of the first two fits:
+ * `dsh plugin --profile <p> add "github:<owner>/<repo>#<sha>&path:adapters/dsh"` installs the
+ * adapter *alone* into the profile's `node_modules` — no packaged runtime beside it, no checkout
+ * two levels up — so the plugin used to report `core-entry-missing` and never start a core. The
+ * variable names a core built elsewhere: `npm i -g github:<owner>/<repo>` runs the root `prepare`
+ * script, so that install does have `dist/src/cli.js`.
  */
 const CORE_ENTRY_CANDIDATES = [
   join(ADAPTER_DIR, 'runtime', 'cli.js'),
   join(ADAPTER_DIR, '..', '..', 'dist', 'src', 'cli.js'),
+  ...(process.env.AMB_CORE_ENTRY?.trim() ? [resolve(process.env.AMB_CORE_ENTRY.trim())] : []),
 ]
 
 export const name = 'agent-memory-backpack'

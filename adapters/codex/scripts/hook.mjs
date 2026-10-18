@@ -173,8 +173,19 @@ function loadConfig(config, configPath) {
  * as a clear refusal.
  */
 async function startCoreIfNeeded(config, logger) {
-  const coreEntry = [join(dirname(fileURLToPath(import.meta.url)), "..", "runtime", "cli.js")]
-    .find((path) => existsSync(path));
+  /**
+   * The core entry, in the two shapes this hook can be installed as.
+   *
+   * Packaged: `runtime/cli.js` beside the hook. Installed on its own — which is what a
+   * `dsh plugin add github:...#path:adapters/dsh`-style install of this repository produces — there is
+   * no packaged runtime, so `AMB_CORE_ENTRY` names a core built elsewhere. That is the same variable
+   * and the same `resolve()` the CLI's own `service` subcommand already reads (`src/cli.ts`), so an
+   * operator who wraps this project names the entry once and both ends agree.
+   */
+  const coreEntry = [
+    join(dirname(fileURLToPath(import.meta.url)), "..", "runtime", "cli.js"),
+    ...(process.env.AMB_CORE_ENTRY?.trim() ? [resolve(process.env.AMB_CORE_ENTRY.trim())] : []),
+  ].find((path) => existsSync(path));
   try {
     const outcome = await ensureCoreRunning({
       endpoint: config.endpoint.origin,
