@@ -29,12 +29,19 @@ const USAGE = [
   '  --no-sync               跳过「同步本地已有知识」这一步（默认会同步）',
   '  --sync-roots PATH,...   只扫描这些位置（默认扫描 DSH/Codex 的规范与技能目录）',
   '  --codex-workspace PATH  用官方 codex CLI 把本插件装进该工作区（可选）',
-  '  --start                 前台启动核心（cli serve），Ctrl+C 停止；默认不启动',
+  '  --start                 装完后把核心作为常驻进程启动（cli service start）；默认不启动',
+  '  --no-desktop            跳过「桌面控制台（托盘）」这一步（默认会装）',
+  '  --no-startup            跳过「开机自动启动」这一步（默认会注册核心与桌面端）',
   '  --offline               自检跳过网络探测（等价于 cli doctor --offline）',
   '  --dry-run               只打印将要执行的命令，不创建目录、不构建、不安装',
   '  -h, --help              显示本帮助',
   '',
-  '本脚本不做的事（重要，别把它当成「一键装好」）：',
+  '本脚本一条命令装到位的部分：',
+  '  - 核心与凭据、DSH 适配器、Codex 适配器',
+  '  - 桌面控制台（Tauri 托盘程序：启动即隐藏、托盘菜单可显示/隐藏、检查核心、切自启、退出）',
+  '  - 开机自动启动（核心服务 + 桌面端托盘，各写一条 HKCU 的 Run 项）',
+  '',
+  '本脚本不做的事（重要）：',
   '  - 不安装、不信任任何桌面的 hooks。两端桌面的「加载插件 + 信任 hooks」尚未',
   '    验证通过，脚本只打印可执行的人工步骤。',
   '  - 不写任何凭据值到输出或日志，只打印凭据文件的路径。',
@@ -151,7 +158,7 @@ function findCodexCli() {
   return undefined;
 }
 
-const totalSteps = 7;
+const totalSteps = 9;
 say('Agent Memory Backpack 本地安装');
 say(`仓库根目录：${root}`);
 if (dryRun) say('模式：--dry-run（只打印命令，不写入任何东西）');
@@ -306,7 +313,7 @@ if (values['no-sync']) {
   }
 }
 
-// ------------------------------------------------- [5/7] Codex 插件（可选）
+// ------------------------------------------------- [5/9] Codex 插件（可选）
 step(5, totalSteps, 'Codex 插件安装到工作区（可选）');
 if (!values['codex-workspace']) {
   say('未传 --codex-workspace，跳过。需要时用法：');
@@ -387,18 +394,104 @@ if (!values['codex-workspace']) {
   }
 }
 
-// ------------------------------------------------------- [6/7] 服务（可选）
-step(6, totalSteps, '启动核心（可选）');
-if (!values.start) {
-  say('未传 --start，跳过。需要时：');
-  say(`  node dist/src/cli.js serve --data-dir "${dataDir}"`);
-  say('  这是前台进程，用 Ctrl+C 停止；P0 没有登录自启。');
+// ------------------------------------------------ [6/9] 桌面控制台（托盘）
+//
+// 装的是 Tauri 桌面端：启动即隐藏、只留托盘图标，托盘菜单里有显示/隐藏主窗口、
+// 检查核心连接、开机自启（勾选）、彻底退出。用的就是打包时产出的那个 NSIS 安装包，
+// 不重新构建——构建需要 Rust 工具链，那是它自己的一次性前提。
+step(6, totalSteps, '桌面控制台（托盘）');
+const bundleDir = join(root, 'desktop-tauri', 'src-tauri', 'target', 'release', 'bundle');
+function findDesktopInstaller() {
+  if (!existsSync(bundleDir)) return undefined;
+  const found = [];
+  for (const [sub, ext] of [['nsis', '.exe'], ['msi', '.msi']]) {
+    const dir = join(bundleDir, sub);
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) if (name.toLowerCase().endsWith(ext)) found.push(join(dir, name));
+  }
+  // NSIS 优先：它支持静默安装（/S）；MSI 要经 msiexec，也更容易被策略拦住。
+  return found.find(path => path.toLowerCase().endsWith('.exe')) ?? found[0];
+}
+const desktopInstaller = findDesktopInstaller();
+const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local');
+const desktopExe = join(localAppData, 'Agent Memory Backpack', 'amb-desktop.exe');
+if (values['no-desktop']) {
+  say('传了 --no-desktop，跳过。之后可手动安装：');
+  say(`  "${desktopInstaller ?? '<desktop-tauri 的 bundle 产物>'}"`);
+} else if (!desktopInstaller) {
+  // 不是失败：桌面端要 Rust 工具链单独构建一次。说清怎么补，不假装装好了。
+  say('没有找到桌面端的安装包，跳过（不算失败）。它需要 Rust 工具链构建一次：');
+  say('  cd desktop-tauri');
+  say('  npm install');
+  say('  npm run build        # tauri build，产出 src-tauri/target/release/bundle/');
+  say('  构建完再重跑本脚本即可。');
 } else if (dryRun) {
-  say(`干跑：将执行 ${process.execPath} ${cliPath} serve --data-dir "${dataDir}"`);
+  say(`干跑：将执行 "${desktopInstaller}" /S（NSIS 静默安装到 %LOCALAPPDATA%\\Agent Memory Backpack）`);
+} else {
+  say(`安装包：${desktopInstaller}`);
+  say('执行静默安装（/S）…');
+  const installed = run(desktopInstaller, ['/S'], root);
+  if (installed.status !== 0) {
+    say(`安装程序退出码 ${installed.status}。若它要求管理员权限或弹了界面，手动双击同一个文件即可。`);
+  } else if (!existsSync(desktopExe)) {
+    say(`安装程序返回 0，但预期位置没有 ${desktopExe}；请确认它是否装到了别处。`);
+  } else {
+    say('桌面控制台已安装。它启动即隐藏到托盘，不占任务栏：');
+    say('  托盘菜单：显示 / 隐藏主窗口、检查核心连接、开机自启（勾选）、彻底退出。');
+  }
 }
 
-// --------------------------------------------------------- [7/7] 自检
-step(7, totalSteps, '自检（cli doctor）');
+// ------------------------------------------------ [7/9] 开机自动启动
+//
+// 两件独立的事，都要做：
+//   - 核心：service enable-startup 写 HKCU 的 Run 项，登录后把核心服务拉起来；
+//   - 桌面端：写同名的 Run 项，登录后托盘就位。键名与桌面端自己的 APP_NAME 一致
+//     （"Agent Memory Backpack"），所以托盘菜单会把已注册读成"已勾选"，两边不打架。
+step(7, totalSteps, '开机自动启动');
+const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const RUN_VALUE = 'Agent Memory Backpack';
+if (values['no-startup']) {
+  say('传了 --no-startup，跳过。之后可手动注册：');
+  say(`  node dist/src/cli.js service enable-startup --data-dir "${dataDir}"`);
+} else if (process.platform !== 'win32') {
+  say('开机自启目前只为 Windows 实现，跳过。');
+} else if (dryRun) {
+  say(`干跑：将执行 ${process.execPath} ${cliPath} service enable-startup --data-dir "${dataDir}"`);
+  say(`干跑：将执行 reg add "${RUN_KEY}" /v "${RUN_VALUE}" /t REG_SZ /d "${desktopExe}" /f`);
+} else {
+  const coreStartup = run(process.execPath, [cliPath, 'service', 'enable-startup', '--data-dir', dataDir], root);
+  say(coreStartup.status === 0
+    ? '核心：已注册登录启动（HKCU 的 Run 项，不需要管理员权限）。'
+    : `核心：注册失败，退出码 ${coreStartup.status}。`);
+  // 桌面端的自启只在它确实装好了时才写，否则就是给一个不存在的路径注册。
+  if (existsSync(desktopExe)) {
+    const desktopStartup = run('reg', ['add', RUN_KEY, '/v', RUN_VALUE, '/t', 'REG_SZ', '/d', `"${desktopExe}"`, '/f'], root);
+    say(desktopStartup.status === 0
+      ? `桌面端：已注册登录启动（${RUN_VALUE} → ${desktopExe}），托盘菜单里的勾选项会显示为已启用。`
+      : `桌面端：注册失败，退出码 ${desktopStartup.status}；也可以在托盘菜单里勾选「开机自启」。`);
+  } else {
+    say('桌面端未安装，跳过它的自启注册（装好后从托盘菜单勾选即可）。');
+  }
+  say('取消方式：核心用 cli service disable-startup；桌面端用托盘菜单里的勾选项。');
+}
+
+// ------------------------------------------------------- [8/9] 服务（可选）
+step(8, totalSteps, '启动核心（可选）');
+if (!values.start) {
+  say('未传 --start，跳过。需要时（常驻、脱离本终端）：');
+  say(`  node dist/src/cli.js service start --data-dir "${dataDir}"`);
+  say('  已注册开机自启时，下次登录会自动起来。');
+} else if (dryRun) {
+  say(`干跑：将执行 ${process.execPath} ${cliPath} service start --data-dir "${dataDir}"`);
+} else {
+  const started = run(process.execPath, [cliPath, 'service', 'start', '--data-dir', dataDir], root);
+  say(started.status === 0
+    ? '核心已作为常驻进程启动（脱离本终端，关掉窗口也不会停）。'
+    : `核心启动返回退出码 ${started.status}，用 cli service status 核对。`);
+}
+
+// --------------------------------------------------------- [9/9] 自检
+step(9, totalSteps, '自检（cli doctor）');
 if (values.start) {
   say('提示：--start 会在自检之后占用前台，所以自检先跑。核心起来后可在另一个终端重跑 doctor 核对「核心可达」。');
 }

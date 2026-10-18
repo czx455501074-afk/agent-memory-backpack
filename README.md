@@ -179,6 +179,22 @@ node dist/src/cli.js restore --data-dir $AMB --file backup.ambpack --yes
 
 > 早期版本另有一个 Electron 桌面控制台，**已下线**，`npm run console` 这条命令不再存在。源码留在 `console.archived-electron/`，去向见 [`docs/implementation/electron-deprecation.md`](docs/implementation/electron-deprecation.md)。
 
+## 一条命令装齐
+
+```powershell
+node scripts/amb-install.mjs --start
+```
+
+九步：环境检查 → 构建 → 数据目录与凭据 → 同步本机已有知识 → Codex 插件（可选）→ **桌面控制台（托盘）** → **开机自动启动** → 启动核心 → 自检。
+
+装完的状态：核心作为常驻服务运行；DSH 与 Codex 的适配器就位；桌面控制台常驻托盘（**启动即隐藏**，不占任务栏；托盘菜单可显示/隐藏主窗口、检查核心连接、切换开机自启、彻底退出）；核心与桌面端各写一条 `HKCU` 的 Run 项，登录后自动就位。
+
+常用开关：`--dry-run`（只打印将执行的命令，不写任何东西）、`--no-desktop`、`--no-startup`、`--no-sync`、`--codex-workspace PATH`、`--build`（强制重建）。
+
+桌面控制台用的是 `desktop-tauri` 的构建产物（NSIS 安装包）。没构建过时会跳过并打印构建命令——它需要 Rust 工具链，属于一次性前提，脚本不替你装。
+
+本脚本**不做**的事：不安装、不信任任何桌面的 hooks。两端桌面的「加载插件 + 信任 hooks」必须在各自的桌面 UI 里完成。
+
 ## 从 GitHub 直接安装
 
 **适配器可以从 GitHub 直接装**，不必先 clone——但要用 **pnpm 12 或以上**：`dsh` 内嵌的 pnpm 11 会**丢弃 `path:` 参数**，把仓库根当成插件装上，然后警告它没有 `dsh.bundle`。
