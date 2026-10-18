@@ -33,6 +33,23 @@ async function cleanup(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
+test('打包产物里不携带种子或夹具文件', async () => {
+  /**
+   * The artifact used to carry a copy of the P0 test seed at its root, because the desktop
+   * acceptance fixture was fed from the packaged copy. That is test knowledge sitting in a release
+   * surface: nothing loads it automatically, but a file whose own text says "these are not the
+   * user's real rules" has no business being distributed, and a release that ships it is not the
+   * clean drop this project promises.
+   *
+   * Asserted against the packaging script rather than a packed artifact, because a check that needs
+   * a two-minute pack to run is a check that stops being run. The fixture now comes from the
+   * repository — `prepare-desktop-p0.mjs` and `package-smoke.test.mjs` both read it there.
+   */
+  const packSource = await readFile(join(repoRoot, 'scripts', 'package.mjs'), 'utf8');
+  assert.ok(!/cpSync\([^)]*fixtures/.test(packSource), '打包脚本不得把 fixtures/ 拷进产物');
+  assert.ok(!/inventory\['p0-seed\.json'\]/.test(packSource), '产物清单不得包含种子文件');
+});
+
 test('一次全新安装不写入任何知识，用户从空开始积累', async () => {
   // The decisive property behind "install it and start storing your own data":
   // `init` may create credentials, but it must not seed a single entry.

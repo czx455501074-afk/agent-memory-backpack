@@ -100,7 +100,11 @@ test('packaged core CLI and MCP run from a Chinese whitespace fixture directory'
   const pluginDir = join(fixtureRoot, 'codex 插件');
   cpSync(join(artifactDir, 'core'), coreDir, { recursive: true });
   cpSync(join(artifactDir, 'codex-plugin'), pluginDir, { recursive: true });
-  cpSync(join(artifactDir, 'p0-seed.json'), join(fixtureRoot, 'p0-seed.json'));
+  // The seed comes from the repository, not from the artifact: the artifact no longer carries a
+  // copy of it (a test fixture has no business in a release surface). What this test is for — the
+  // packaged CLI running under a path with spaces and CJK — does not depend on where its input
+  // file came from.
+  cpSync(resolve('fixtures', 'p0-seed.json'), join(fixtureRoot, 'p0-seed.json'));
 
   const dataDir = join(fixtureRoot, '配置 数据');
   const port = await freeLoopbackPort();

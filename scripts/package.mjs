@@ -95,7 +95,13 @@ cpSync(join(out, 'core', 'node_modules'), join(out, 'dsh-plugin', 'node_modules'
 // panel. Its source is kept, not shipped, at `console.archived-electron/`; see
 // docs/implementation/electron-deprecation.md. Re-adding a `console` tree here
 // would reinstate a third surface that no longer has an owner.
-cpSync(join(root, 'fixtures/p0-seed.json'), join(out, 'p0-seed.json'));
+// The P0 test seed is deliberately **not** copied into the artifact.
+//
+// It used to be, so the desktop acceptance fixture could be fed from the packaged copy — which put
+// a file whose own text says "these are not the user's real rules" into a release surface. Nothing
+// loaded it automatically, but a release that carries test knowledge is not the clean drop this
+// project promises: `amb seed` exists for the operator, and the fixture reads it from the
+// repository (see prepare-desktop-p0.mjs and package-smoke.test.mjs).
 const marketplace = { name: 'amb-local', interface: { displayName: 'Agent Memory Backpack P0 Local' }, plugins: [
   { name: 'agent-memory-backpack', source: { source: 'local', path: './codex-plugin' }, policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' }, category: 'Productivity' },
 ] };
@@ -116,7 +122,7 @@ const addTree = (base, folder) => {
   }
 };
 for (const folder of ['core', 'codex-plugin', 'dsh-plugin']) addTree(out, folder);
-for (const path of ['.agents/plugins/marketplace.json', 'p0-seed.json']) inventory[path] = hashFile(join(out, path));
+for (const path of ['.agents/plugins/marketplace.json']) inventory[path] = hashFile(join(out, path));
 const sourceInventory = {};
 const addSourceTree = folder => {
   const full = join(root, folder);

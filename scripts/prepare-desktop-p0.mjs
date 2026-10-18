@@ -50,7 +50,7 @@ writeFileSync(join(workspace, '.gitignore'), 'packages/\n', { flag: 'wx' });
 run('git', ['init', '--quiet', workspace]);
 const cli = join(workspace, 'packages/core/runtime/cli.js');
 run(process.execPath, [cli, 'init', '--data-dir', dataDir, '--project', 'project-demo', '--project-root', workspace]);
-run(process.execPath, [cli, 'seed', '--data-dir', dataDir, '--input', join(workspace, 'packages/p0-seed.json')]);
+run(process.execPath, [cli, 'seed', '--data-dir', dataDir, '--input', join(root, 'fixtures/p0-seed.json')]);
 const quotePS = value => "'" + value.replaceAll("'", "''") + "'";
 writeFileSync(join(workspace, 'start-core.ps1'),
   `$ErrorActionPreference = 'Stop'\n& ${quotePS(process.execPath)} ${quotePS(cli)} serve --data-dir ${quotePS(dataDir)}\n`, { flag: 'wx' });
