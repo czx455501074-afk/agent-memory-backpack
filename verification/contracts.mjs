@@ -328,6 +328,25 @@ const CONTRACTS = [
     ],
   },
   {
+    id: 'term-bridge',
+    why: '库里 173/173 条条目没有任何桥字段，用户用同义说法（「我以前写下的那些规矩」）检索 matched=0、agent 就"听不懂"——而库里那 4 条 norm 的标题写的是「规范」。术语桥让「用户怎么说」与「库里怎么写」对上：概念组把同一种东西的多种说法连起来，别名与关键词进全文索引（检索侧零改动）。',
+    file: 'src/term-bridge.ts',
+    must: ['CONCEPT_GROUPS', 'buildTermBridge', "'规矩'"],
+    other: [
+      ['src/store.ts', ['withBridge', 'rebuildSearchIndex', 'searchIndexSize']],
+      ['src/schema.ts', ['aliases: z.array(shortText)', 'keywords: z.array(shortText)']],
+      ['src/cli.ts', ["command === 'reindex'"]],
+      ['test/term-bridge.test.ts', ['重建后「规矩」应命中', '不被规则覆盖', '新条目写入时就该带桥']],
+    ],
+  },
+  {
+    id: 'host-norms-are-named-not-resent',
+    why: '库里 4 条规范全是 hostProvided（宿主已注入，插件刻意不重复发送正文），而回执过去只列 id —— agent 既没在上下文里看到内容、也不知道该去读，表现得像"库里没有"。现在给标题与取回方式，但**不给正文**：重复注入会被 skill-context 的测试挡住，那条约束更重要。',
+    file: 'src/store.ts',
+    must: ['插件不重复注入正文', "amb_search_universal(kind='norm')"],
+    other: [['test/skill-context.test.ts', ['宿主已加载的正文不得重复注入']]],
+  },
+  {
     id: 'deploy-busy-guidance',
     why: '核心在跑时 Windows 拒绝重命名 core 目录；裸 EBUSY 让“部署失败”看起来像包损坏。',
     file: 'scripts/deploy-plugin.mjs',

@@ -29,6 +29,9 @@ export function candidateToKnowledge(candidate: AdoptedCandidate): Knowledge {
   const base = {
     id: candidate.id, title: candidate.title, scope: { kind: 'global' as const }, baseRevision: 0,
     labels: [] as string[], provenance: 'user' as const, evidence: 'observed' as const, platforms: [] as Array<'dsh' | 'codex'>,
+    // 术语桥留空：采纳是"原文照搬"，规则生成的桥由索引侧统一补（见 store.ts 的 withBridge）。
+    // 写空数组而不是让它缺省，是因为 `default([])` 只影响 parse —— 类型上这些字段仍然要求存在。
+    aliases: [] as string[], keywords: [] as string[],
   };
   if (candidate.kind === 'skill') {
     return {

@@ -59,6 +59,7 @@ const USAGE = [
   '  logs [--source plugin] [--all-sources] [--level LVL] [--event NAME] [--json]',
   '  embed [--project ID] [--limit N] [--yes]   vectors for the optional semantic layer',
   '                                           (needs AMB_EMBEDDING_ENDPOINT + AMB_EMBEDDING_MODEL)',
+  '  reindex                                  rebuild the full-text index (refreshes the term bridge)',
   '  setup [--project ID] [--port N] [--project-root PATH]',
   '                                           first run: data dir + credentials + next command',
   '  init [--project ID] [--port N] [--project-root PATH]',
@@ -600,6 +601,29 @@ try {
             + (report.vanished.length ? ' Vanished sources were reported but not retired.' : ''),
         }, null, 2));
       }
+    } finally { store.close(); }
+  } else if (command === 'reindex') {
+    /**
+     * 重建全文索引 —— 也就是**刷新术语桥**。
+     *
+     * 术语桥在索引时算、不写回条目（见 store.ts 的 withBridge），所以"重建索引"就等于
+     * "刷新桥"，没有第二个状态需要同步，也不会产生新修订。
+     *
+     * 为什么需要显式跑一次：库打开时会自动回填**缺索引**的条目，但**已经有索引的条目不会
+     * 被重算**。实测背景是库里 173 条条目全部没有桥字段、而它们都已经有索引行 —— 也就是
+     * 加了桥之后，存量条目必须重建一次才会受益。
+     */
+    const store = new Store(join(dir, 'knowledge.sqlite'));
+    try {
+      const before = store.searchIndexSize();
+      const rebuilt = store.rebuildSearchIndex();
+      console.log(JSON.stringify({
+        indexRowsBefore: before,
+        rebuilt,
+        indexRowsAfter: store.searchIndexSize(),
+        note: '术语桥已按当前规则重算（别名与关键词进入全文索引）；条目本身没有被修改，也没有产生新修订。'
+          + '用 amb_search_universal 或管理界面试一条同义说法，即可核对是否命中。',
+      }, null, 2));
     } finally { store.close(); }
   } else if (command === 'supersede') {
     // Working-time correction: after verifying in practice, replace or complement

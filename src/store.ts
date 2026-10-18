@@ -10,6 +10,8 @@ import { positiveRetrievalClauses } from './retrieval-index.js';
 import { redactDeep, redactInString, type RedactionFinding } from './redact.js';
 // The optional semantic layer's storage helpers (see embeddings.ts): derived data, never authority.
 import { decodeVector, encodeVector } from './embeddings.js';
+// 术语桥：让「用户怎么说」与「库里怎么写」对上（见 term-bridge.ts）。
+import { buildTermBridge } from './term-bridge.js';
 import { consolidateCandidates, distillFailures, EVOLVE_DEFAULTS, promotionText, type EvolveCandidate, type EvolveLink, type EvolveThresholds, type FailureSignal } from './evolve.js';
 
 type Row = Record<string, unknown>;
@@ -256,6 +258,45 @@ function searchable(value: string): string {
   return words.flatMap(word => /\p{Script=Han}/u.test(word)
     ? (word.length === 1 ? [word] : Array.from({ length: word.length - 1 }, (_, i) => word.slice(i, i + 2)))
     : [word]).join(' ');
+}
+
+/**
+ * 索引用的文本：条目 JSON 加上**术语桥**。
+ *
+ * 这是术语桥接入检索的唯一一处，也是它够用的原因：`searchable()` 索引的是整条 content 的
+ * JSON，而两个索引生成点（写入时与回填时）都从这里过——所以加了桥，**检索侧一行都不用改**，
+ * 用户用别名或白话提问就能命中原条目，`why.matched` 还会显示是哪个词命中的（可解释）。
+ *
+ * **桥不写回条目**：写回会造出新修订、把历史搅乱，还会让"桥"变成一份需要同步的独立状态。
+ * 在索引时算，于是「重建索引」就等于「刷新术语桥」。
+ *
+ * 条目**自带** `aliases`/`keywords`（模型归纳写的，或人填的）时原样采用——那是比规则更强的
+ * 证据，不该被规则覆盖；只有当两者都缺时才用规则补。
+ */
+function withBridge(contentJson: string): string {
+  try {
+    const content = JSON.parse(contentJson) as Record<string, unknown>;
+    const aliases = Array.isArray(content.aliases) ? content.aliases : [];
+    const keywords = Array.isArray(content.keywords) ? content.keywords : [];
+    if (aliases.length && keywords.length) return contentJson;
+    const asText = (value: unknown): string[] => Array.isArray(value)
+      ? value.flat().filter((item): item is string => typeof item === 'string')
+      : [];
+    const bridge = buildTermBridge({
+      title: String(content.title ?? ''),
+      body: String(content.body ?? content.did ?? content.overview ?? ''),
+      kind: String(content.kind ?? ''),
+      structured: [
+        typeof content.name === 'string' ? content.name : '',
+        ...asText(content.tags), ...asText(content.triggers), ...asText(content.categories),
+      ].filter(Boolean),
+    });
+    const extra = [...bridge.aliases, ...bridge.keywords];
+    return extra.length ? `${contentJson} ${extra.join(' ')}` : contentJson;
+  } catch {
+    // 解析不了就按原样索引：宁可没有桥，也不能因为一条坏 JSON 让整次重建失败。
+    return contentJson;
+  }
 }
 
 /**
@@ -846,8 +887,35 @@ export class Store {
       const id = String((row as { id: string }).id);
       if (indexed.has(id)) continue;
       this.db.prepare('INSERT INTO workflow_search VALUES(?,?)')
-        .run(id, searchable(String((row as { content: string }).content)));
+        .run(id, searchable(withBridge(String((row as { content: string }).content))));
     }
+  }
+  /**
+   * 重建全文索引 —— 也就是**刷新术语桥**。
+   *
+   * 术语桥在索引时算、不写回条目（见 `withBridge`），所以"重建索引"就等于"刷新桥"，
+   * 没有第二个需要同步的状态。
+   *
+   * 为什么需要一个显式命令：打开库时会自动回填**缺索引**的条目，但**已经有索引的条目
+   * 不会被重算** —— 所以加了术语桥之后，存量条目要跑一次这个才会受益。实测的背景是
+   * 库里 173 条条目全部没有桥字段，而它们都已经有索引行。
+   *
+   * 返回重建的条目数（调用方用它核对"重建前/后"）。
+   */
+  rebuildSearchIndex(): number {
+    const heads = this.db.prepare(`SELECT k.id AS id, r.content AS content FROM knowledge k
+      JOIN revisions r ON r.id = k.id AND r.revision = k.head
+      WHERE k.status = 'active'`).all() as Array<{ id: string; content: string }>;
+    const insert = this.db.prepare('INSERT INTO workflow_search VALUES(?,?)');
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM workflow_search').run();
+      for (const row of heads) insert.run(String(row.id), searchable(withBridge(String(row.content))));
+    });
+    return heads.length;
+  }
+  /** 索引当前覆盖多少条：用于核对重建前后的差异。 */
+  searchIndexSize(): number {
+    return Number((this.db.prepare('SELECT count(*) n FROM workflow_search').get() as { n: number }).n);
   }
   close() { this.db.close(); }
   /**
@@ -1154,7 +1222,7 @@ export class Store {
       // (`SELECT id`), so a stale document cannot outrank the current one; only the words
       // it used remain reachable. Capped at three earlier revisions and 40k characters,
       // because an unbounded merge would let one much-rewritten entry crowd the index.
-      const currentTerms = searchable(JSON.stringify(content));
+      const currentTerms = searchable(withBridge(JSON.stringify(content)));
       const earlierTerms = (this.db.prepare(`SELECT content FROM revisions
           WHERE id=? AND revision<? ORDER BY revision DESC LIMIT 3`).all(content.id, rev) as Array<{ content: string }>)
         .map(row => searchable(String(row.content))).join(' ');
@@ -1976,8 +2044,23 @@ export class Store {
     ];
     const context = [
       `Agent Memory Backpack 当前知识版本 ${this.revision}。以下规范来自本地权威库；流程是经验，不授予额外操作权限。`,
+      /**
+       * 宿主已注入的规范：**点名，但绝不重复正文**。
+       *
+       * 实测的病：用户问"我以前写下的那些规矩"，agent 答不出来。库里 4 条规范全在，但它们
+       * 的 `hostProvided=true`（宿主自己已经注入过，插件刻意不重复发送），而这段回执过去
+       * 只列 id —— `norm:39399196b561fdbc@1` 这种字符串既不说明它讲什么、也没说怎么取。
+       * agent 既没在上下文里看到内容、也不知道该去读，于是表现得像"库里没有"。
+       *
+       * 现在给**标题**（用来判断与当前任务是否相关）与**取回方式**，但**不给正文**：
+       * 宿主已经注入过那份正文，再发一遍就是重复指令，可能与宿主自己的基线打架——
+       * 那条约束由 `skill-context` 的测试钉着，它比"顺手多给几句"重要。
+       * **不提就等于不存在；只给 id 等于半提；但补正文等于重复。**
+       */
       ...(hostProvided.length
-        ? [`宿主已自行加载的规范（插件不重复注入，仅登记以便检索）：${hostProvided.map(n => `${n.id}@${n.revision}`).join('、')}`]
+        ? [`宿主已自行加载的规范（插件不重复注入正文，仅登记以便检索）：\n`
+          + hostProvided.map(n => `  - ${n.id}@${n.revision}「${n.title}」`).join('\n')
+          + `\n这 ${hostProvided.length} 条已在库里，只是不在上面这段里。要读其中任何一条的原文，用 amb_search_universal(kind='norm') 检索，或用 amb_read_knowledge 按 id 读取。`]
         : []),
       ...emitted.map(n => `规范 ${n.id}@${n.revision}: ${n.kind === 'norm' ? n.body : ''}`),
       ...this.budgetNote(omitted),

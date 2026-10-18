@@ -55,6 +55,23 @@ const common = {
   evidence: evidenceLevelSchema.default('unverifiable'),
   /** Which hosts this applies to; empty means both. */
   platforms: z.array(z.enum(['dsh', 'codex'])).max(2).default([]),
+  /**
+   * 术语桥：让「用户怎么说」与「库里怎么写」对上。
+   *
+   * 实测的病：库里 173 条条目，173 条没有任何桥字段。用户说"我装插件之前存进去的那些
+   * 技能和规范"，而那条的标题是别的词，于是检索 `matched=0`、agent 就"听不懂"——
+   * 这不是模型笨，是**库里没有可对上的术语**。同义说法与白话说法全部落空。
+   *
+   * 两个字段都在 `common` 里，所以每种 kind 都带着它们；而 `searchable()` 索引的是整条
+   * content 的 JSON，因此**它们自动进入全文索引**——检索侧一行都不用改，用户搜别名就能
+   * 命中原条目，并且 `why.matched` 会显示是哪个词命中的（可解释）。
+   *
+   * `aliases` 是「同一种东西的别的叫法」（含用户的白话与中英对照），`keywords` 是
+   * 「这条讲什么」的高权重术语。两者都只是**检索用**的辅助，不参与权限、门禁与判定——
+   * 与 `labels` 同一条纪律：它们只用来找东西。
+   */
+  aliases: z.array(shortText).max(40).default([]),
+  keywords: z.array(shortText).max(60).default([]),
 };
 /**
  * Provenance for a workflow that was structured from an adopted skill document.
