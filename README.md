@@ -10,9 +10,13 @@
 ![Tests](https://img.shields.io/badge/tests-816%20passing-brightgreen.svg)
 ![Storage](https://img.shields.io/badge/storage-SQLite%20(local)-informational.svg)
 
-规范与经验今天散落在每个 agent 自己的文件里：你在 DSH 里立了一条规则，Codex 不知道；你在 Codex 里踩过一次坑，下次在 DSH 里照样踩。**Agent Memory Backpack（AMB）** 把这件事收到一个本地库里——两端都从它读、都往它写，而写入要经过审核，改动留下修订史，一条规则可以直接拦住某个工具调用。
+**这是什么**：一个本地知识库插件——核心是只监听 `127.0.0.1` 的 HTTP 服务加一个 SQLite 文件，DSH 与 Codex 各有一个适配器，另有 MCP 入口与托盘桌面控制台。没有云端、没有外部推理、没有账号。
 
-核心是一个只监听 `127.0.0.1` 的本地服务加一个 SQLite 文件。没有云端、没有外部推理、没有账号。
+**给谁用**：同时使用 DSH 和/或 Codex、希望两个 agent 遵守同一套规范并复用同一批经验的人。
+
+**不是全自动的地方**：两端桌面的「加载插件 + 信任 hooks」必须在各自的桌面 UI 里**亲手确认**一次，CLI 无法代劳——这是安全设计，不是缺陷。安装脚本把其余步骤做完，并把这一步明确打印出来。
+
+规范与经验今天散落在每个 agent 自己的文件里：你在 DSH 里立了一条规则，Codex 不知道；你在 Codex 里踩过一次坑，下次在 DSH 里照样踩。**Agent Memory Backpack（AMB）** 把这件事收到一个本地库里——两端都从它读、都往它写，而写入要经过审核，改动留下修订史，一条规则可以直接拦住某个工具调用。
 
 ---
 

@@ -318,6 +318,16 @@ const CONTRACTS = [
     ],
   },
   {
+    id: 'refusal-names-the-field',
+    why: '采纳被拒时只回一句"Request fields are invalid"，而页面能构造 6 种 kind、其中两种（material 需要 url/summary/指纹，journal 需要 did）的字段表单根本没收集——于是"缺 url"变成不可诊断的 400。zod 早已算出路径与原因，是 HTTP 边界把它丢掉了。',
+    file: 'src/server.ts',
+    must: ['const branches', 'closest', 'fields: listed'],
+    other: [
+      ['src/ui.ts', ['pe-material-fields', 'pe-journal-fields', '采纳为「材料」需要填来源 URL']],
+      ['test/approval-invalid-request.test.ts', ['字段列表里应指出 url', '字段列表里应指出 did']],
+    ],
+  },
+  {
     id: 'deploy-busy-guidance',
     why: '核心在跑时 Windows 拒绝重命名 core 目录；裸 EBUSY 让“部署失败”看起来像包损坏。',
     file: 'scripts/deploy-plugin.mjs',

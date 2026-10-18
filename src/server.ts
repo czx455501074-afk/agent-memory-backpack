@@ -1235,7 +1235,55 @@ export function createCoreServer(store: Store, config: CoreConfig) {
       }
     } catch (error) {
       if (error instanceof DomainError) return reply(res, error.status, { code: error.code, message: error.message });
-      if (error instanceof z.ZodError) return reply(res, 400, { code: 'invalid_request', message: 'Request fields are invalid' });
+      if (error instanceof z.ZodError) {
+        /**
+         * Say *which* field is wrong, not just that something is.
+         *
+         * The single sentence this used to return — "Request fields are invalid" — is true and
+         * useless. The panel's approval form can build an entry for six different kinds, and the
+         * kinds needing fields the form never collected (a `material` needs `url` and `summary`, a
+         * `journal` needs `did`) failed with no way for the reader to learn why.
+         *
+         * `knowledgeSchema` is a union, and a union reports the union: the first version of this
+         * fix only ever said `entry`, which is barely better than the sentence it replaced. Zod
+         * keeps each branch's own issues under `errors`, so the branch that is *closest to valid*
+         * is the one worth quoting — branches rejected solely because the `kind` differs are not
+         * where the caller was heading.
+         *
+         * Paths and messages only — never the submitted values, which may be anything.
+         */
+        const fields: Array<{ path: string; message: string }> = [];
+        for (const issue of error.issues) {
+          const prefix = issue.path.join('.');
+          /**
+           * `errors` holds one issue list per union branch, and the list *is* the array — an earlier
+           * read of it assumed `{ issues: [...] }` wrappers and threw on the first request. Accept
+           * both shapes: the wrapper form costs nothing to support and a zod bump is not a reason to
+           * turn a validation refusal into a 500.
+           */
+          const raw = (issue as { errors?: unknown }).errors;
+          const branches: Array<Array<{ path: Array<string | number>; message: string }>> = Array.isArray(raw)
+            ? raw.map(entry => (Array.isArray(entry) ? entry : ((entry as { issues?: unknown }).issues ?? [])) as Array<{ path: Array<string | number>; message: string }>)
+            : [];
+          if (branches.length) {
+            const relevant = branches.filter(branch =>
+              !branch.every(inner => inner.path.join('.') === 'kind' || /expected "/.test(inner.message)));
+            const closest = (relevant.length ? relevant : branches)
+              .reduce((best, branch) => (branch.length < best.length ? branch : best));
+            for (const inner of closest.slice(0, 8)) {
+              fields.push({ path: [prefix, inner.path.join('.')].filter(Boolean).join('.'), message: inner.message });
+            }
+            continue;
+          }
+          fields.push({ path: prefix, message: issue.message });
+        }
+        const listed = fields.slice(0, 12);
+        return reply(res, 400, {
+          code: 'invalid_request',
+          message: '请求字段不合法：' + listed.map(field => (field.path ? field.path + ' ' : '') + field.message).join('；'),
+          fields: listed,
+        });
+      }
       return reply(res, 500, { code: 'internal_error', message: 'Core operation failed' });
     }
   });

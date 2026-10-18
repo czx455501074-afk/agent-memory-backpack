@@ -726,7 +726,18 @@ function showProposalEditor(proposalId) {
         '<div class="form-group"><label>标题（已按候选首行预填，可留空或修改）</label>' +
         '<input type="text" id="pe-title" value="' + esc((detail.discovery || '').slice(0, 40) || '经验记录') + '"></div>' +
         '<div class="form-group"><label>正文</label>' +
-        '<textarea id="pe-body" rows="6">' + esc(body) + '</textarea></div>';
+        '<textarea id="pe-body" rows="6">' + esc(body) + '</textarea></div>' +
+        // Kinds whose schema needs fields the shared form does not carry. They used to be
+        // selectable with no way to supply what they require, so approving as one of them
+        // could only ever return a 400. Shown only for the kind that needs them.
+        '<div class="form-group" id="pe-material-fields" style="display:none;">' +
+        '<label>来源 URL（采纳为「材料」时必填）</label>' +
+        '<input type="text" id="pe-url" placeholder="https://…">' +
+        '<label style="margin-top:8px;">摘要（采纳为「材料」时必填）</label>' +
+        '<input type="text" id="pe-summary"></div>' +
+        '<div class="form-group" id="pe-journal-fields" style="display:none;">' +
+        '<label>本任务做了什么（采纳为「日记」时必填）</label>' +
+        '<input type="text" id="pe-did"></div>';
     }
 
     box.innerHTML = '<div class="editor-card">' +
@@ -750,6 +761,26 @@ function showProposalEditor(proposalId) {
         : '<span class="muted" style="font-size:12px;">批准后目标流程产生新 revision；DSH 下一轮检索即可读到。</span>') +
       '</div>' +
       '</div>';
+    /**
+     * Show only the field group the chosen kind needs.
+     *
+     * Leaving both groups visible invites people to fill fields that will be discarded, and hiding
+     * the wrong one is how a material approval used to become an unexplained 400. Bound here
+     * because the select belongs to the markup just rendered.
+     */
+    (function bindKindFields() {
+      var select = document.getElementById('pe-kind');
+      var materialFields = document.getElementById('pe-material-fields');
+      var journalFields = document.getElementById('pe-journal-fields');
+      if (!select) return;
+      function apply() {
+        var chosen = select.value;
+        if (materialFields) materialFields.style.display = chosen === 'material' ? '' : 'none';
+        if (journalFields) journalFields.style.display = chosen === 'journal' ? '' : 'none';
+      }
+      select.addEventListener('change', apply);
+      apply();
+    })();
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }).catch(function (error) {
     if (box) box.innerHTML = notice((error && (error.friendlyMessage || error.message)) || '读取候选失败');
@@ -788,24 +819,49 @@ function buildApprovalEntry(detail) {
   var kind = ['memory', 'norm', 'preference', 'skill', 'material', 'journal'].indexOf(chosenKind) >= 0 ? chosenKind : 'memory';
   if (!id) throw new Error('条目 ID 必填');
   if (target.available && id !== target.workflowId) throw new Error('该候选关联流程 ' + target.workflowId + '，条目 ID 必须与之一致');
-  return {
-    entry: {
-      id: id,
-      kind: kind,
-      title: title || '经验记录',
-      body: body,
-      scope: scope,
-      baseRevision: 0,
-      labels: ['approved'],
-      // Pre-filling a category does not transfer authorship: the reviewer
-      // confirmed this text, so the entry records the review as the human's.
-      // A suggestion is never allowed to upgrade this field on its own.
-      provenance: 'user',
-      evidence: 'verifiable',
-      platforms: [],
-    },
-    allowGlobalScope: scopeKind === 'global',
+  var entry = {
+    id: id,
+    kind: kind,
+    title: title || '经验记录',
+    body: body,
+    scope: scope,
+    baseRevision: 0,
+    labels: ['approved'],
+    // Pre-filling a category does not transfer authorship: the reviewer
+    // confirmed this text, so the entry records the review as the human's.
+    // A suggestion is never allowed to upgrade this field on its own.
+    provenance: 'user',
+    evidence: 'verifiable',
+    platforms: [],
   };
+  /**
+   * Two kinds carry required fields the shared form does not: a material needs a source URL, a
+   * fingerprint and a summary; a journal needs what the task did. The form collects them (see
+   * pe-material-fields / pe-journal-fields), and this refuses locally — naming the field — instead
+   * of letting the core answer with a 400 the reader cannot act on.
+   */
+  if (kind === 'material') {
+    var url = ((document.getElementById('pe-url') || {}).value || '').trim();
+    var summary = ((document.getElementById('pe-summary') || {}).value || '').trim();
+    if (!url) throw new Error('采纳为「材料」需要填来源 URL（材料条目要求 url、summary 与指纹）');
+    if (!summary) throw new Error('采纳为「材料」需要填摘要');
+    entry.url = url;
+    entry.summary = summary;
+    // A stable local fingerprint. The material schema requires one and its purpose is to notice the
+    // same source arriving twice; djb2 over url+body serves that and needs no crypto.
+    // The separator is a plain '|' rather than an escape: this code lives inside a template
+    // literal, so a backslash escape would be consumed before the page ever parses it.
+    var seed = url + '|' + body;
+    var hash = 5381;
+    for (var i = 0; i < seed.length; i++) hash = ((hash << 5) + hash + seed.charCodeAt(i)) | 0;
+    entry.fingerprint = 'ui-' + (hash >>> 0).toString(16);
+  }
+  if (kind === 'journal') {
+    var did = ((document.getElementById('pe-did') || {}).value || '').trim();
+    if (!did) throw new Error('采纳为「日记」需要填「本任务做了什么」（日记条目要求 did）');
+    entry.did = did;
+  }
+  return { entry: entry, allowGlobalScope: scopeKind === 'global' };
 }
 
 /**
