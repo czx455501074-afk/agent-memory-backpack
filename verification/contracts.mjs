@@ -381,6 +381,15 @@ const CONTRACTS = [
     ],
   },
   {
+    id: 'scale-and-concurrency-measured',
+    why: '此前所有验证都跑在 177 条的小库上。术语桥把每条的别名与关键词灌进全文索引，条目数一涨，索引体积与重建成本都跟着涨——"177 条下很快"从来不等于"一万条下也能用"。',
+    file: 'verification/scale-and-concurrency.mjs',
+    must: ['rebuildSearchIndex', 'AMB_SCALE_TAG', 'pathToFileURL'],
+    other: [
+      ['docs/implementation/term-bridge-and-chunked-reading-2026-10-19.md', ['重建索引期间并发 20 次检索', '两个进程同时写']],
+    ],
+  },
+  {
     id: 'deploy-busy-guidance',
     why: '核心在跑时 Windows 拒绝重命名 core 目录；裸 EBUSY 让“部署失败”看起来像包损坏。',
     file: 'scripts/deploy-plugin.mjs',
