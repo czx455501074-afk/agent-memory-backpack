@@ -240,7 +240,15 @@ export function checkShellWriteBypass(toolName, command, deniedTools) {
   const redirectPattern = /(?:^|[^<>&|])\s*(?:>>|>)\s*(?!\/dev\/null\b|&\d)(?:[^\s>&|]+)/i;
 
   // Pattern 2: Common file writing / directory creation commands
-  const writeCmdPattern = /\b(?:tee|touch|mkdir|Set-Content|Out-File|New-Item)\b/i;
+  //
+  // The list had five entries and two holes that matter in practice: `Add-Content` (the
+  // append form of the cmdlet that *was* listed) and `Copy-Item`/`Move-Item`/`Remove-Item`
+  // (which write a destination or destroy one). Measured before adding them:
+  // `Add-Content fixture.txt x` and `Copy-Item fixture.txt out.txt` both returned
+  // `denied: false` while `Set-Content` returned true - the same operation under a
+  // different verb. This stays a heuristic; it cannot see through `python -c` or a
+  // script file, and the reason string says so.
+  const writeCmdPattern = /\b(?:tee|touch|mkdir|rmdir|Set-Content|Add-Content|Clear-Content|Out-File|New-Item|Copy-Item|Move-Item|Rename-Item|Remove-Item|Export-Csv|Export-Clixml|Set-ItemProperty|New-ItemProperty|cp|mv|rm|install|ln|sed\s+-i|perl\s+-i)\b/i;
 
   // Pattern 3: dd with output file
   const ddPattern = /\bdd\s+.*?\bof=/i;

@@ -13,6 +13,8 @@ import { maintenanceStatus, initializeMaintenance } from './maintenance.js';
 import { reviewPrefill, reviewPrefills, type ReviewPrefill } from './model-review.js';
 import { enqueueWorkflowDraft, listWorkflowDrafts, readWorkflowDraft, approveWorkflowDraft, reviseWorkflowDraft } from './workflow-organization.js';
 import { createRetrievalService, selectionSource } from './retrieval-service.js';
+// Off unless both the endpoint and the model are configured; absence is the switch.
+import { embeddingConfigFrom } from './embeddings.js';
 import { relevantPassages } from './retrieval-excerpt.js';
 // 分块读取：长条目不再一次给全文（见 retrieval-chunk.ts 的实测背景）。
 import { chunkBody } from './retrieval-chunk.js';
@@ -152,7 +154,16 @@ function reviewSuggestion(store: Store, projectId: string, proposalId: string): 
 
 export function createCoreServer(store: Store, config: CoreConfig) {
   initializeMaintenance(store);
-  const selectKnowledge=createRetrievalService(store,dirname(store.path));
+  /**
+   * The optional vector half is wired here, not only in tests.
+   *
+   * It used to be constructed without `embeddings`, so `fuseWithVectors` was reachable
+   * from the unit tests and never from the running core: the layer could be configured
+   * and still change nothing. `embeddingConfigFrom()` returns null unless both the
+   * endpoint and the model are set, so an unconfigured install keeps the lexical answer
+   * byte for byte.
+   */
+  const selectKnowledge=createRetrievalService(store,dirname(store.path),{embeddings:embeddingConfigFrom()});
   const validated = coreSchema.parse(config);
   if (new Set(validated.clients.map(c => c.token)).size !== validated.clients.length)
     throw new Error('Adapter credentials must be distinct');
@@ -233,7 +244,16 @@ export function createCoreServer(store: Store, config: CoreConfig) {
       // reached by an adapter at all rather than being guarded case by case.
       if (ADMIN_ONLY.has(req.url ?? '') && role !== 'admin')
         throw new DomainError('forbidden', ADMIN_ONLY_HINT, 403);
-      store.cleanup();
+      /**
+       * No cleanup on the request path.
+       *
+       * It ran here to keep expiries and abandoned outbox rows current, at the cost of
+       * turning every read into a write transaction: with a core busy importing, a
+       * second process opening the same database failed with `database is locked`
+       * (measured, 3 of 6 opens). Nothing on this path needs it - `liveEntries()`
+       * filters lapsed material, `outboxStatus()` calls `abandonDueOutbox()` itself,
+       * and the maintenance worker plus the CLI timer run the full pass every minute.
+       */
       switch (req.url) {
         case '/v1/workflow-drafts/list': return reply(res,200,{drafts:listWorkflowDrafts(store,envelope.projectId),
           skills:store.scopedEntries(envelope.projectId).filter(e=>e.content.kind==='skill').map(e=>({id:e.id,title:e.content.title,revision:e.revision}))});
@@ -815,7 +835,12 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           }).parse(body);
           const knowledge=store.readKnowledge(p.projectId,p.knowledgeId,p.includeLeaves??false);
           const chars = String(knowledge.body ?? '').length;
-          const passages = p.query ? relevantPassages(knowledge.body, p.query) : undefined;
+          /**
+           * `full` wins over `query`: an explicit request for the whole entry is not
+           * narrowed by a question about it. Without this ordering the passage branch
+           * emptied the body that `full=true` had asked for.
+           */
+          const passages = p.query && !p.full ? relevantPassages(knowledge.body, p.query) : undefined;
           /**
            * 查询与分块不并用：`query` 本身就是在缩小范围，再叠一层分块只会让读者分不清
            * "这是全部命中段落"还是"这只是第几块"。两者取其一，并在回执里说清是哪一种。
@@ -825,6 +850,17 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             : undefined;
           return reply(res, 200, {
             ...knowledge,
+            /**
+             * A query narrows the answer; the full body must not ride along with it.
+             *
+             * `...knowledge` carries the whole prose, and the passage branch used to leave
+             * it untouched: a request that asked for the parts relevant to a question
+             * returned 20,017 characters of body beside a 497-character passage. That is
+             * exactly the cost this endpoint's chunking exists to avoid, and it hit the
+             * most common call shape. The length stays available in `chars`, and `full`
+             * still returns everything when the caller really wants it.
+             */
+            ...(passages?.length ? { body: '' } : {}),
             chars,
             ...(chunk ? {
               body: chunk.text,
@@ -837,7 +873,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             ...(passages ? {
               passages,
               note: passages.length
-                ? `这是按查询取回的相关段落（共 ${passages.length} 段），不是全文；要更多段落就换关键词再取，或按 chunkIndex 逐块读。`
+                ? `这是按查询取回的相关段落（共 ${passages.length} 段），不是全文；全文 ${chars} 字符未返回，要全文用 full=true，要更多段落就换关键词再取。`
                 : '没有段落命中该查询；换关键词，或用 chunkIndex 逐块读。',
             } : {}),
             ...(!chunk && !passages ? { note: '本次按 full=true 返回全文，长度 ' + chars + ' 字符。' } : {}),
@@ -890,7 +926,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             baseRevision: z.number().int().nonnegative(),
             reason: z.string().min(1).max(500),
           }).parse(body);
-          store.retire(p.id, p.baseRevision);
+          store.retire(p.id, p.baseRevision, { projectId: p.projectId, allowGlobal: principal.role === 'admin' });
           return reply(res, 200, { retired: p.id, reason: p.reason });
         }
         case '/v1/knowledge/history': { const p = z.object({ projectId: z.string(), knowledgeId: z.string() }).parse(body); return reply(res, 200, store.history(p.knowledgeId, p.projectId)); }
@@ -1153,7 +1189,25 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             ? { format: 'json', task: result.json }
             : { format: 'markdown', markdown: result.markdown });
         }
-        case '/v1/tasks/record': { const p = z.object({ projectId: z.string(), task: taskSchema }).parse(body); return reply(res, 200, store.recordTask(p.projectId, p.task)); }
+        case '/v1/tasks/record': {
+          const p = z.object({ projectId: z.string(), task: taskSchema }).parse(body);
+          /**
+           * The completion rule is the one the checkpoint path already enforces.
+           *
+           * This endpoint writes a task row directly, and it used to skip both checks:
+           * an adapter could POST `completed` with no `verified` text and claim
+           * `evidence: 'observed'`, and the diary generated from that row then recorded
+           * `outcome: success` - measured end to end. `observed` is the plugin's own
+           * record, which an adapter cannot make, and completion needs evidence that is
+           * not merely the caller's prose.
+           */
+          if (principal.role !== 'admin' && p.task.evidence === 'observed')
+            throw new DomainError('invalid_evidence', 'Adapters may record verifiable evidence, not claim plugin observations');
+          if (p.task.status === 'completed'
+            && (!p.task.verified.trim() || !['observed', 'verifiable'].includes(p.task.evidence)))
+            throw new DomainError('verification_required', 'Completed tasks require verified text and verifiable evidence');
+          return reply(res, 200, store.recordTask(p.projectId, p.task));
+        }
         case '/v1/tasks/list': { const p = z.object({ projectId: z.string(), status: taskStatus.optional() }).parse(body); return reply(res, 200, { tasks: store.tasks(p.projectId, p.status) }); }
         case '/v1/tasks/handoff': { const p = z.object({ projectId: z.string(), taskId: z.string() }).parse(body); return reply(res, 200, store.handoff(p.taskId, p.projectId)); }
         /**

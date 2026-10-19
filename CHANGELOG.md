@@ -6,6 +6,14 @@
 
 ### 修复
 
+- **打开库不再是写操作，第二个进程不会再崩**：构造函数里的 `cleanup()`、`PRAGMA journal_mode=WAL`、建表与种子插入全是写，SQLite 即使判断 `IF NOT EXISTS` 为真也要先拿 schema 锁；服务端每请求还跑一次 `cleanup()`。实测：一个进程每 100ms 批量写 400 条，另一个进程 6 次打开失败 3 次，`ERR_SQLITE_ERROR errcode 5 database is locked` 抛在构造函数里，调用方没有人 catch，CLI 与第二个宿主实例直接退出；仓库自带的规模脚本多进程段同样复现（tag b exit 1）。现在连接级 PRAGMA 先行、日志模式切换单独容错（失败时 `synchronous` 回落 FULL，因为 NORMAL 只在 WAL 下安全）、其余初始化语句在锁被拒且工作已完成时跳过，请求路径不再清理。修复后同一探针 6 次全部成功。新增 `test/concurrent-open.test.ts`（2 条：锁下打开不抛错、锁空闲时清理仍执行）。
+- **作用域在写路径上补齐**：`/v1/knowledge/retire` 只校验信封、不校验目标，已读 404 的条目仍可被他项目凭据退役，连 `global` 禁令一起拆掉（退役后 `gate` 由 deny 翻成 allow）；流程依赖只拦「项目依赖他项目」，`global` 父流程可以依赖 `task` 子流程并让 `expand` 把子流程正文交给每个项目。现在退役按作用域判定（`global` 仅管理员可退役）并保留 404 语义，依赖改为「父作用域必须覆盖子作用域」，`expand` 对历史数据再做一次可见性判定。新增 `test/scope-boundaries.test.ts`（6 条）。
+- **完成必须带证据，记录接口不再例外**：`/v1/tasks/record` 曾可写入 `completed` + 空 `verified` + `evidence: observed`，随后归档的日记记成 `success`。现在与检查点同一套判定：适配器不得声称插件观察，完成需要验证文本与可核验证据。新增 `test/task-completion.test.ts`（5 条）。
+- **上下文与吞吐四处收紧**：带 `query` 读取曾同时返回全文（实测 body 20017 字符、命中段落 497），现在只回段落并给出全文长度，`full=true` 仍优先；只按标点切分的子句让「检查数据库备份但不要修改文件」整句被否定吞掉，现在按转折词分句；升级幂等键固定而载荷含可变计数，候选刷新后二次晋升抛冲突，现在识别为「已提交」；术语桥批次键含知识版本而写桥不推进版本，一个版本最多补 10 条，现在按已补数量推进并链式续跑。
+- **向量层接进核心，并补上项目过滤**：此前只在单测里可达（核心创建检索服务时没传 `embeddings`），且两个向量查询收了 `projectId` 却不用，别的项目的向量会占满 top3。现在按配置启用、按项目可见范围取向量，`selectedIds` 不再越界。另：shell 写入启发式补上 `Add-Content`、`Copy-Item`、`Remove-Item`、`sed -i` 等同一操作的不同拼写，两份适配器保持逐字节一致。新增 `test/context-cost.test.ts`、`test/evolution-and-vector.test.ts`、`test/shell-write-heuristics.test.ts`（共 12 条）。
+
+### 修复
+
 - **提炼器看不见已离开队列的重复**：`refine.ts` 的来源只读 `pending`/`needs_evidence`，于是被拒收或已过期的失败**恰在证据最强的时候**从提炼里消失——它还在反复发生。`evolve.ts` 当初正是因为这一点放宽了来源，而这个来源保留着旧过滤，两个「找重复」的工具对同一个问题看得不一样。现在读全部状态：`collect` 从不按 state 分支，所以放宽只改变它能看到哪些行，不改变它得出什么结论。新增 `test/refine-source.test.ts`（2 条：被拒收的同类失败仍计入重复、只有一条时门槛照旧挡下）。
 
 ### 修复

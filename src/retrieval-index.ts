@@ -34,7 +34,17 @@ export function positiveRetrievalClauses(query:string):string[] {
   if(/^(?:好的?|收到|谢谢|继续|明白|了解|嗯|ok(?:ay)?|thanks?|done|继续吧)[。.!！\s]*$/i.test(trimmed))return [];
   if(/^(?:我)?(?:已|已经)(?:重启|重新启动|安装|更新|升级|保存|完成|恢复)(?:了)?[^，。!?！？]{0,40}[。!！\s]*$/i.test(trimmed))return [];
   if(idle.test(trimmed))return [];
-  return query.split(/[，,。；;\n]|\b(?:but|and|also)\b|而是|同时|以及|并且/i)
+  /**
+   * Clause boundaries include contrastive conjunctions, not only punctuation.
+   *
+   * A negated tail used to swallow the whole sentence: "检查数据库备份但不要修改文件"
+   * carries no punctuation before 但, so it arrived as one clause, matched `negation`,
+   * and the entire query was discarded - `clauses: []`, no retrieval at all. Adding a
+   * comma made the same request work, which is the tell that the boundary was the bug
+   * and not the negation rule. Contrast splits a request into what is asked for and what
+   * is excluded; only the excluded half should be dropped.
+   */
+  return query.split(/[，,。；;\n]|但(?:是)?|不过|而是|然而|可是|\b(?:but|and|also)\b|同时|以及|并且/i)
     .filter(part=>part.trim()&&!negation.test(part)&&!negativeVerb.test(part));
 }
 function tokens(text: string): string[] {

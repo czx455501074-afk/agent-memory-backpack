@@ -256,6 +256,22 @@ const applicable = (scope: Scope, projectId: string, taskId?: string): boolean =
   if (scope.kind === 'task') return taskId !== undefined && scope.taskId === taskId;
   return true;
 };
+/**
+ * Whether a parent at `parent` may depend on a child at `child`.
+ *
+ * Containment, not equality: a parent may only reach entries that are visible wherever
+ * the parent itself is. `global` therefore reaches only `global`; a project reaches
+ * global and its own project; a task reaches those plus its own task. Tested the other
+ * way round, a `global` workflow could borrow a private one and republish its text to
+ * every project through `expand` - which is what the measured case did.
+ */
+const scopeCovers = (parent: Scope, child: Scope): boolean => {
+  if (child.kind === 'global') return true;
+  if (parent.kind === 'global') return false;
+  if (parent.projectId !== child.projectId) return false;
+  if (child.kind === 'project') return true;
+  return parent.kind === 'task' && parent.taskId === child.taskId;
+};
 function searchable(value: string): string {
   // Unicode words plus CJK bigrams: deterministic Chinese recall without an external model.
   const words = value.toLowerCase().match(/[a-z0-9_-]+|[\p{Script=Han}]+/gu) ?? [];
@@ -716,9 +732,28 @@ export class Store {
   readonly jobs: DurableJobs;
   constructor(readonly path: string, private readonly now: () => number = Date.now) {
     this.db = new DatabaseSync(path);
+    // Connection-local settings first, and before anything touches the file: they never
+    // need the write lock, while `DurableJobs` below creates a table.
+    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000;');
+    /**
+     * The journal switch is the one open-time setting that needs an exclusive lock.
+     *
+     * It used to head the statement below, so a second process opening the library while
+     * the first was mid-write failed right here - before a single table could be read -
+     * and the constructor threw `ERR_SQLITE_ERROR errcode 5 database is locked`, which no
+     * caller catches: the CLI or the other host's instance simply died. A library this
+     * version created is already WAL, so skipping the switch costs nothing. When it cannot
+     * be made, `synchronous` falls back to FULL, because NORMAL is only safe in WAL mode.
+     */
+    let wal = true;
+    try { this.db.exec('PRAGMA journal_mode=WAL;'); } catch (error) {
+      const code = (error as { errcode?: number }).errcode;
+      if (code !== 5 && code !== 6) throw error;
+      wal = false;
+    }
+    this.db.exec(`PRAGMA synchronous=${wal ? 'NORMAL' : 'FULL'};`);
     this.jobs = new DurableJobs(this.db, this.now);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000;
-      -- Durability stated rather than defaulted.
+    try { this.db.exec(`-- Durability stated rather than defaulted.
       --
       -- SQLite defaults to \`synchronous=FULL\`, which fsyncs on every commit. Measured on
       -- a copy of the real library: 3,000 event inserts took 2,973 ms at FULL (1,009 per
@@ -734,7 +769,9 @@ export class Store {
       -- enough that one fsync each is not a latency problem. \`synchronous=OFF\` measured
       -- faster still (78 ms) and is deliberately not used: it gives up the "no corruption"
       -- half as well.
-      PRAGMA synchronous=NORMAL;
+      --
+      -- The level is chosen below rather than written here: NORMAL is only safe under WAL,
+      -- and the journal switch can fail on a busy library.
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
       INSERT OR IGNORE INTO meta VALUES ('revision',0);
       CREATE TABLE IF NOT EXISTS knowledge(id TEXT PRIMARY KEY, kind TEXT NOT NULL,
@@ -862,12 +899,55 @@ export class Store {
       INSERT OR IGNORE INTO meta VALUES ('lastRescanAt',0);
       INSERT OR IGNORE INTO meta VALUES ('rescanIntervalMs',86400000);
       INSERT OR IGNORE INTO meta VALUES ('scanRoots','');
-    `);
+      `);
+    } catch (error) {
+      /**
+       * This statement is a write for the schema lock's purposes even when every table in
+       * it already exists, so a core that is mid-import makes a second process fail here.
+       * If `meta` is present the library is already initialised and the work is done;
+       * refusing the lock changed nothing. A library without it is a real failure.
+       */
+      const code = (error as { errcode?: number }).errcode;
+      if (!((code === 5 || code === 6) && this.hasTable('meta'))) throw error;
+    }
     this.migrate();
     this.ensureEventIndexes();
     this.ensureEvolveTables();
     this.ensureDerivedTables();
-    this.cleanup();
+    /**
+     * Opening the library is a read, not a maintenance run.
+     *
+     * This call used to be unconditional, which made every `new Store` a writer: the
+     * cleanup pass deletes lapsed events and re-queues abandoned outbox rows. Measured
+     * on a two-process probe - one process importing 400 rows every 100ms, the other
+     * opening the same file six times - three opens failed with
+     * `ERR_SQLITE_ERROR errcode 5 database is locked`, thrown out of the constructor,
+     * where no caller catches it. A core that is already serving therefore made the
+     * CLI, a second MCP server and the other host's instance unable to start.
+     *
+     * The pass is skipped when the write lock is held (SQLITE_BUSY=5, SQLITE_LOCKED=6);
+     * it is housekeeping that the maintenance tick and the CLI's own 60-second timer
+     * repeat within a second, so nothing is lost by waiting. Every read path already
+     * filters lapsed material and abandoned outbox rows on its own, so a skipped pass
+     * cannot serve stale data in the meantime.
+     */
+    try { this.cleanup(); } catch (error) {
+      const code = (error as { errcode?: number }).errcode;
+      if (code !== 5 && code !== 6) throw error;
+    }
+  }
+  /**
+   * Whether a table already exists. Read-only: querying `sqlite_master` never takes the
+   * write lock, which is what lets the initialisation steps tell "already done, the lock
+   * was just refused" apart from "this library is not initialised".
+   */
+  private hasTable(name: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name));
+  }
+  /** True when the failure is another connection holding the write lock, nothing worse. */
+  private static lockRefused(error: unknown): boolean {
+    const code = (error as { errcode?: number }).errcode;
+    return code === 5 || code === 6;
   }
   /**
    * Bring an existing database up to the current column set.
@@ -902,7 +982,14 @@ export class Store {
     // Backfill from the payload for rows written before the column existed. A row
     // whose payload was already cleared cannot be attributed and is left empty
     // rather than guessed at; it stays reachable by id.
-    this.db.exec(`UPDATE proposals SET project_id = COALESCE(json_extract(payload, '$.projectId'), '')
+    //
+    // The count comes first because the statement is a write even when it matches
+    // nothing, and this runs while the library is being opened: on a library that is
+    // already backfilled - every library after its first open - issuing it would make
+    // the open wait on the write lock for no reason.
+    const unattributed = Number((this.db.prepare(
+      "SELECT count(*) AS n FROM proposals WHERE project_id='' AND payload<>'{}'").get() as { n: number }).n);
+    if (unattributed) this.db.exec(`UPDATE proposals SET project_id = COALESCE(json_extract(payload, '$.projectId'), '')
       WHERE project_id = '' AND payload <> '{}'`);
     // Backfill the full-text index for anything active that has no row in it.
     //
@@ -1021,8 +1108,9 @@ export class Store {
   private ensureEventIndexes(): void {
     const row = this.db.prepare("SELECT value FROM meta WHERE key='eventIndexVersion'").get() as { value: number } | undefined;
     if (Number(row?.value ?? 0) >= 2) return;
-    this.transaction(() => {
-      this.db.exec(`
+    try {
+      this.transaction(() => {
+        this.db.exec(`
         DROP INDEX IF EXISTS events_task;
         DROP INDEX IF EXISTS events_project;
         DROP INDEX IF EXISTS events_session;
@@ -1033,7 +1121,13 @@ export class Store {
         INSERT INTO meta(key,value) VALUES('eventIndexVersion',2)
           ON CONFLICT(key) DO UPDATE SET value=excluded.value;
       `);
-    });
+      });
+    } catch (error) {
+      // Indexes are a performance property, not a correctness one, and the version marker
+      // makes this a one-time upgrade: a refused lock only means the upgrade happens on a
+      // later open. Throwing here would instead stop the open itself.
+      if (!Store.lockRefused(error)) throw error;
+    }
   }
   /**
    * Tables for the evolution pipeline.
@@ -1045,7 +1139,8 @@ export class Store {
    * be the same leak the rest of this file keeps closing.
    */
   private ensureEvolveTables(): void {
-    this.db.exec(`
+    try {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS evolve_runs(
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, started_at INTEGER NOT NULL,
         scanned INTEGER NOT NULL, distilled INTEGER NOT NULL, skipped TEXT NOT NULL,
@@ -1062,6 +1157,13 @@ export class Store {
         UNIQUE(project_id, from_signature, to_signature, relation));
       CREATE INDEX IF NOT EXISTS evolve_candidates_gate ON evolve_candidates(project_id, gate, confidence DESC);
     `);
+    } catch (error) {
+      // Same rule as the main schema: schema creation is a write even when it is a no-op,
+      // so a library another process is writing to is opened without this pass. The tables
+      // are only absent on a library that was never opened by this version, and the next
+      // open creates them.
+      if (!(Store.lockRefused(error) && this.hasTable('evolve_runs'))) throw error;
+    }
   }
   get revision(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='revision'").get()!.value); }
   private transactionDepth = 0;
@@ -1329,7 +1431,17 @@ export class Store {
       if (!child || child.status !== 'active' || child.revision !== dep.revision)
         throw new DomainError('dependency_unavailable', `Required dependency ${dep.workflowId}@${dep.revision} is not current`, 409);
       const parentScope = entry.content.scope, childScope = child.content.scope;
-      if (childScope.kind === 'project' && (parentScope.kind === 'global' || childScope.projectId !== parentScope.projectId))
+      /**
+       * A dependency may only reach a scope the parent already covers.
+       *
+       * This used to check one case - a project parent naming another project's child -
+       * which left two holes open: a `global` parent could depend on a `project` or
+       * `task` child, and any parent could depend on a `task` child. Measured: importing
+       * `global-parent -> beta-task` succeeded, and `expand` on it from project alpha
+       * returned the beta task workflow's overview and stage instructions. The parent is
+       * visible everywhere, so the child's text was readable by every project.
+       */
+      if (!scopeCovers(parentScope, childScope))
         throw new DomainError('dependency_scope', 'Required workflow belongs to an incompatible scope', 409);
       this.validateDependencies(child, all, path);
     }
@@ -1347,7 +1459,28 @@ export class Store {
     return { id: source.id, revision: source.revision, body: source.content.body,
       leaves: source.content.leaves.map(leaf => ({ ...leaf })) };
   }
-  retire(id: string, baseRevision: number): void {
+  /**
+   * Take an entry out of service.
+   *
+   * `projectId` is the caller's scope and is not optional in practice: without it this
+   * matched on id alone, so a credential for one project could retire another project's
+   * entry even though every read of it answered 404. `allowGlobal` is the human's
+   * decision: a `global` entry is what every project reads, so an adapter retiring one
+   * would change the rules for all of them - measured by retiring a global prohibition
+   * and watching `gate` flip from deny to allow.
+   */
+  retire(id: string, baseRevision: number, options: { projectId?: string; allowGlobal?: boolean } = {}): void {
+    const head = this.head(id);
+    if (!head) throw new DomainError('not_found', 'Knowledge entry is unavailable', 404);
+    if (options.projectId !== undefined) {
+      const scope = head.content.scope;
+      const allowed = scope.kind === 'global'
+        ? options.allowGlobal === true
+        : applicable(scope, options.projectId);
+      // Not distinguished from "no such entry": saying "it exists, but not for you"
+      // would let one credential probe another project's ids.
+      if (!allowed) throw new DomainError('not_found', 'Knowledge entry is unavailable', 404);
+    }
     this.transaction(() => {
       const result = this.db.prepare("UPDATE knowledge SET status='retired' WHERE id=? AND head=? AND status='active'").run(id, baseRevision);
       if (!result.changes) throw new DomainError('revision_conflict', 'Current knowledge revision not found', 409);
@@ -1413,7 +1546,17 @@ export class Store {
     const expanded = new Set<string>();
     const resolve = (flow: Workflow): unknown[] => flow.stages.flatMap(s => s.dependencies.filter(d => d.relationship !== 'reference').flatMap(d => {
       if (expanded.has(d.workflowId)) return [];
-      expanded.add(d.workflowId); const child = all.get(d.workflowId)!;
+      expanded.add(d.workflowId); const child = all.get(d.workflowId);
+      /**
+       * The import guard stops new pairs; this stops the ones already stored.
+       *
+       * A library written before the guard can hold a `global` parent pointing at a
+       * `project`/`task` child, and expansion is what turns that into text handed to
+       * every project. Checked here as well because `validateDependencies` runs on
+       * write, and the rows it never saw are exactly the ones that need it.
+       */
+      if (!child || !applicable(child.content.scope, projectId))
+        throw new DomainError('not_found', `Workflow dependency ${d.workflowId} is unavailable`, 404);
       return [{ id: child.id, revision: child.revision, workflow: child.content, source: this.workflowSource(child.content as Workflow) }, ...resolve(child.content as Workflow)];
     }));
     // Includes all required prerequisites of this stage and nested dependencies, never independent fragments.
@@ -3391,7 +3534,8 @@ export class Store {
    * keeps its own `CREATE TABLE IF NOT EXISTS` and that is harmless.
    */
   private ensureDerivedTables(): void {
-    this.db.exec(`
+    try {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS model_reviews(proposal_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, result TEXT NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS revision_notifications(revision INTEGER PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
       -- The optional semantic layer's only storage. Derived: rebuildable from the entries, never
@@ -3409,6 +3553,9 @@ export class Store {
         aliases TEXT NOT NULL, keywords TEXT NOT NULL, summary TEXT NOT NULL,
         created_at INTEGER NOT NULL, PRIMARY KEY(id, revision));
     `);
+    } catch (error) {
+      if (!(Store.lockRefused(error) && this.hasTable('model_reviews'))) throw error;
+    }
   }
   /**
    * Entries that still need a vector, newest first.
@@ -3472,12 +3619,22 @@ export class Store {
    * whose words match nothing, and a vector ranking restricted to lexical candidates would have
    * nothing to rank exactly when it is most useful. Bounded, because a library can be large and this
    * runs on the retrieval path.
+   *
+   * Scoped, like every other read: the previous version took `projectId` and never used it, so the
+   * ranking saw other projects' vectors. Measured on a two-project fixture, all five of project B's
+   * vectors outranked A's single one, A's own entry was cut from the top three, and the recorded
+   * `selectedIds` named entries the caller was not allowed to read - the response still filtered
+   * them out, but the slots they took were gone and recall was empty.
    */
-  embeddingsForProject(model: string, limit = 2000): Map<string, number[]> {
+  embeddingsForProject(model: string, projectId: string, limit = 2000): Map<string, number[]> {
     const found = new Map<string, number[]>();
     const rows = this.db.prepare(`SELECT e.id, e.vector FROM embeddings e
         JOIN knowledge k ON k.id=e.id AND k.head=e.revision AND k.status='active' AND k.kind<>'norm'
-        WHERE e.model=? LIMIT ?`).all(model, Math.max(1, Math.min(20_000, limit))) as Array<{ id: string; vector: Uint8Array }>;
+        JOIN revisions r ON r.id=k.id AND r.revision=k.head
+        WHERE e.model=?
+          AND (json_extract(r.content,'$.scope.kind')='global'
+            OR json_extract(r.content,'$.scope.projectId')=?)
+        LIMIT ?`).all(model, projectId, Math.max(1, Math.min(20_000, limit))) as Array<{ id: string; vector: Uint8Array }>;
     for (const row of rows) found.set(String(row.id), decodeVector(row.vector));
     return found;
   }
@@ -3485,9 +3642,15 @@ export class Store {
   embeddingCoverage(projectId: string, model: string): { eligible: number; embedded: number } {
     const eligible = Number((this.db.prepare(`SELECT count(*) n FROM knowledge k
         JOIN revisions r ON r.id=k.id AND r.revision=k.head
-        WHERE k.status='active' AND k.kind<>'norm'`).get() as { n: number }).n);
+        WHERE k.status='active' AND k.kind<>'norm'
+          AND (json_extract(r.content,'$.scope.kind')='global'
+            OR json_extract(r.content,'$.scope.projectId')=?)`).get(projectId) as { n: number }).n);
     const embedded = Number((this.db.prepare(`SELECT count(*) n FROM embeddings e
-        JOIN knowledge k ON k.id=e.id AND k.head=e.revision WHERE e.model=?`).get(model) as { n: number }).n);
+        JOIN knowledge k ON k.id=e.id AND k.head=e.revision
+        JOIN revisions r ON r.id=k.id AND r.revision=k.head
+        WHERE e.model=?
+          AND (json_extract(r.content,'$.scope.kind')='global'
+            OR json_extract(r.content,'$.scope.projectId')=?)`).get(model, projectId) as { n: number }).n);
     return { eligible, embedded };
   }
   /**
@@ -3637,12 +3800,34 @@ export class Store {
         confidence, gate: gate as EvolveCandidate['gate'], reason: String(row.reason),
       };
       if (dryRun) { promoted.push({ signature, proposalId: null, duplicate: false }); continue; }
-      const submitted = this.submit('evolution', {
-        idempotencyKey: `evolve:${options.projectId}:${signature}`,
-        projectId: options.projectId,
-        discovery: promotionText(candidate),
-        evidence: `evolve_candidates ${signature}：${candidate.occurrences} 次、跨 ${Math.round(candidate.spanMs / 60000)} 分钟、置信 ${candidate.confidence}`,
-      });
+      const key = `evolve:${options.projectId}:${signature}`;
+      /**
+       * A refreshed candidate is still the same finding.
+       *
+       * The key is derived from the signature, which is what keeps one finding from
+       * being filed twice - but the payload carries the live counts, so the second
+       * promotion of a candidate whose `occurrences` moved threw
+       * `idempotency_conflict` and the caller got an error instead of a duplicate
+       * receipt. Measured: promote, bump `occurrences`, promote again -> conflict.
+       * A conflict on this key means "this finding already has its proposal", and the
+       * candidate row it came from has been refreshed in place, so the answer is the
+       * existing proposal.
+       */
+      let submitted: { id: string; duplicate?: boolean };
+      try {
+        submitted = this.submit('evolution', {
+          idempotencyKey: key,
+          projectId: options.projectId,
+          discovery: promotionText(candidate),
+          evidence: `evolve_candidates ${signature}：${candidate.occurrences} 次、跨 ${Math.round(candidate.spanMs / 60000)} 分钟、置信 ${candidate.confidence}`,
+        });
+      } catch (error) {
+        if ((error as { code?: string }).code !== 'idempotency_conflict') throw error;
+        const existing = this.db.prepare('SELECT id FROM proposals WHERE principal=? AND idem=?')
+          .get('evolution', key) as { id: string } | undefined;
+        promoted.push({ signature, proposalId: existing?.id ?? null, duplicate: true });
+        continue;
+      }
       promoted.push({ signature, proposalId: submitted.id, duplicate: submitted.duplicate === true });
     }
     return { dryRun, promoted, withheld };

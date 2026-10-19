@@ -12,11 +12,24 @@ export interface Job { id: string; kind: JobKind; key: string; payload: Record<s
 /** Uses the authority connection: enqueue inside the caller's transaction for atomic commits. */
 export class DurableJobs {
   constructor(private db: DatabaseSync, private now: () => number = Date.now) {
-    db.exec(`CREATE TABLE IF NOT EXISTS maintenance_jobs(
+    /**
+     * Creating a table is a write, even when the table already exists: SQLite takes the
+     * schema lock before it discovers the `IF NOT EXISTS` no-op. A second process opening
+     * the library while a core was importing therefore failed right here, out of the
+     * constructor. When the lock is refused and the table is already there, the work this
+     * statement would do is done, so it is skipped; anything else is still raised.
+     */
+    try {
+      db.exec(`CREATE TABLE IF NOT EXISTS maintenance_jobs(
       id TEXT PRIMARY KEY, kind TEXT NOT NULL, idem TEXT NOT NULL UNIQUE, payload TEXT NOT NULL,
       status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL,
       lease_until INTEGER NOT NULL DEFAULT 0, error TEXT, result TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS maintenance_jobs_due ON maintenance_jobs(status,next_at);`);
+    } catch (error) {
+      const code = (error as { errcode?: number }).errcode;
+      const exists = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_jobs'").get());
+      if (!(code === 5 || code === 6) || !exists) throw error;
+    }
   }
   enqueue(kind: JobKind, key: string, payload: Record<string, unknown>): string {
     const at = this.now();

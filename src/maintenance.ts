@@ -190,7 +190,21 @@ export function createMaintenanceWorker(store: Store, dataDir: string, projectId
           }
           // 只在真写了东西时重建：没有新桥时重建索引是纯浪费（万级条目下约 2.4 秒）。
           if (saved) store.rebuildSearchIndex();
-          return { saved, failed, pending: pending.length, model: config.model };
+          /**
+           * Continue until the backlog is empty.
+           *
+           * The key used to carry `revision`, and saving a bridge does not bump it, so
+           * one pass of ten was all a knowledge version ever got: with a hundred entries
+           * waiting, the rest waited for the next revision - which the bridge itself
+           * never causes. Keyed on how many bridges exist instead, each completed batch
+           * queues the next distinct one, and `jobs.run` picks it up on the following
+           * tick. The key also stops repeating once nothing more can be saved.
+           */
+          if (job.payload.projectId && store.pendingBridgeEntries(1).length)
+            jobs.enqueue('term_bridge', `term_bridge:${String(job.payload.projectId)}:${store.bridgeCount()}`, {
+              projectId: job.payload.projectId, limit: job.payload.limit ?? 10,
+            });
+          return { saved, failed, pending: pending.length, model: config.model, remaining: store.pendingBridgeEntries(1).length };
         },
         evolve(job) {
           // Stage one and two only. Promotion is not called here on purpose: it files
@@ -200,7 +214,8 @@ export function createMaintenanceWorker(store: Store, dataDir: string, projectId
           const consolidated = store.consolidateEvolution({ projectId, dryRun: false });
           // 归纳之后顺带补模型桥：新条目一落地就带规则桥，模型桥在这里跟上。
           // 未配置模型时那个作业会自己跳过，所以这里不必先判断配置。
-          jobs.enqueue('term_bridge', `term_bridge:${projectId}:${store.revision}`, { limit: 10 });
+          // 键里带已补数量：同一个知识版本内也能连续补，而不是一次十轮就停。
+          jobs.enqueue('term_bridge', `term_bridge:${projectId}:${store.bridgeCount()}`, { projectId, limit: 10 });
           return {
             scanned: distilled.scanned,
             candidates: distilled.candidates.length,

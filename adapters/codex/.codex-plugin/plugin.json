@@ -3,5 +3,67 @@
   "version": "1.0.0",
   "description": "Retrieve versioned project knowledge, follow complete workflows, and submit experience as candidates for review.",
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./.mcp.json",
+  "hooks": {
+    "hooks": {
+      "SessionStart": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node \"${PLUGIN_ROOT}/scripts/hook.mjs\"",
+              "timeout": 8,
+              "statusMessage": "Loading project knowledge"
+            }
+          ]
+        }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node \"${PLUGIN_ROOT}/scripts/hook.mjs\"",
+              "timeout": 8,
+              "statusMessage": "Preparing project context"
+            }
+          ]
+        }
+      ],
+      "PreToolUse": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node \"${PLUGIN_ROOT}/scripts/hook.mjs\"",
+              "timeout": 8,
+              "statusMessage": "Checking project policy"
+            }
+          ]
+        }
+      ],
+      "PostToolUse": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node \"${PLUGIN_ROOT}/scripts/hook.mjs\"",
+              "timeout": 8
+            }
+          ]
+        }
+      ],
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node \"${PLUGIN_ROOT}/scripts/hook.mjs\"",
+              "timeout": 8
+            }
+          ]
+        }
+      ]
+    }
+  }
 }

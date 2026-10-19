@@ -49,7 +49,7 @@ export async function fuseWithVectors(input: {
    * produced `no_vectors` and fused nothing, because the lexical ranking it was restricted to was
    * empty. A ranking that can only reorder what word-overlap already found adds nothing.
    */
-  const stored = input.store.embeddingsForProject(String(config.model));
+  const stored = input.store.embeddingsForProject(String(config.model), input.projectId);
   if (!stored.size) return off('no_vectors', coverage);
   // The vector ranking sees only what has a vector; entries without one keep their lexical rank
   // rather than being pushed to the end, because "not embedded yet" is not a relevance judgement.
