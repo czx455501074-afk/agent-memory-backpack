@@ -2,8 +2,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { dirname } from 'node:path';
 import { z } from 'zod';
-import { Store, classificationApprovalGate } from './store.js';
-import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, outboxEntrySchema, DomainError } from './schema.js';
+import { Store, queryTokens } from './store.js';
+import { contextSchema, gateSchema, proposalSchema, eventSchema, expandSchema, knowledgeSchema, workflowSchema, taskSchema, taskStatus, outboxEntrySchema, evidenceReferenceSchema, DomainError } from './schema.js';
 import { FORBIDDEN_AUTOMATIC } from './evolve.js';
 import { coreSchema, type CoreConfig } from './config.js';
 import { exportArchive, importArchive, inspectArchive } from './archive.js';
@@ -15,7 +15,8 @@ import { enqueueWorkflowDraft, listWorkflowDrafts, readWorkflowDraft, approveWor
 import { createRetrievalService, selectionSource } from './retrieval-service.js';
 // Off unless both the endpoint and the model are configured; absence is the switch.
 import { embeddingConfigFrom } from './embeddings.js';
-import { relevantPassages } from './retrieval-excerpt.js';
+import { passagePage } from './retrieval-excerpt.js';
+import { mayAutomaticallyRecall } from './memory-policy.js';
 // 分块读取：长条目不再一次给全文（见 retrieval-chunk.ts 的实测背景）。
 import { chunkBody } from './retrieval-chunk.js';
 
@@ -525,9 +526,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
                  * whole change exists to remove — so the row carries the gate, and a
                  * row that needs nothing keeps exactly the fields it had before.
                  */
-                const gate = classificationApprovalGate(
-                  (proposal.payload as { classification?: unknown } | null)?.classification,
-                );
+                const gate = store.proposalClassificationGate(proposal.id, p.projectId);
                 return {
                   ...proposal,
                   ...(prefill ? { prefill } : {}),
@@ -602,9 +601,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
            * the write path enforces — so this response cannot promise something the
            * approval would then refuse.
            */
-          const classificationGate = classificationApprovalGate(
-            (proposal.payload as { classification?: unknown }).classification,
-          );
+          const classificationGate = store.proposalClassificationGate(p.id, p.projectId);
           return reply(res, 200, {
             ...proposal,
             modelReview: stored ?? { status: 'awaiting_model', authority: 'advisory' },
@@ -651,6 +648,13 @@ export function createCoreServer(store: Store, config: CoreConfig) {
              * itself, so the two branches below cannot be reached by accident.
              */
             classificationAcknowledged: z.boolean().default(false),
+            /**
+             * An optional note recorded beside a claim adopted without evidence.
+             *
+             * Never required. Keeping unsupported claims out of automatic injection is
+             * automatic, so no reviewer has to sign anything to keep the library honest.
+             */
+            waiverReason: z.string().trim().max(500).optional(),
           }).parse(body);
           /**
            * The gate, answered before anything is written.
@@ -663,9 +667,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
            */
           const preflight = (() => {
             try {
-              return classificationApprovalGate(
-                (store.getProposal(p.id, p.projectId).payload as { classification?: unknown }).classification,
-              );
+              return store.proposalClassificationGate(p.id, p.projectId);
             } catch { return null; }
           })();
           if (preflight?.required && !p.classificationAcknowledged) {
@@ -680,6 +682,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
           const knowledgeRevision = store.approveProposal(p.id, p.entry, {
             allowGlobalScope: p.allowGlobalScope, actor: principal.id, projectId: p.projectId,
             classificationAcknowledged: p.classificationAcknowledged,
+            ...(p.waiverReason ? { waiverReason: p.waiverReason } : {}),
           });
           return reply(res, 200, {
             knowledgeRevision,
@@ -832,15 +835,18 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             endLine: z.number().int().positive().optional(),
             /** 显式要全文时才给（保留旧行为，供导出、审计这类确实需要全文的调用方）。 */
             full: z.boolean().optional(),
+            taskId: z.string().optional(),
+            passageOffset: z.number().int().nonnegative().optional(),
           }).parse(body);
-          const knowledge=store.readKnowledge(p.projectId,p.knowledgeId,p.includeLeaves??false);
+          const knowledge=store.readKnowledge(p.projectId,p.knowledgeId,p.includeLeaves??false,p.taskId);
           const chars = String(knowledge.body ?? '').length;
           /**
            * `full` wins over `query`: an explicit request for the whole entry is not
            * narrowed by a question about it. Without this ordering the passage branch
            * emptied the body that `full=true` had asked for.
            */
-          const passages = p.query && !p.full ? relevantPassages(knowledge.body, p.query) : undefined;
+          const page = p.query && !p.full ? passagePage(knowledge.body, p.query, p.passageOffset) : undefined;
+          const passages = page?.passages;
           /**
            * 查询与分块不并用：`query` 本身就是在缩小范围，再叠一层分块只会让读者分不清
            * "这是全部命中段落"还是"这只是第几块"。两者取其一，并在回执里说清是哪一种。
@@ -862,6 +868,15 @@ export function createCoreServer(store: Store, config: CoreConfig) {
              */
             ...(passages?.length ? { body: '' } : {}),
             chars,
+            coverage: {
+              mode: p.full ? 'full' : page ? 'passages' : 'chunk',
+              complete: p.full === true || (!page && chunk?.totalChunks === 1 && chunk.chunkIndex === 0),
+              totalChars: chars,
+              ...(page ? { matchedPassages: page.total, returnedPassages: page.passages.length,
+                hasMore: page.hasMore, nextPassageOffset: page.nextOffset } : {}),
+              relatedIds: knowledge.relations.filter(link => link.direction.includes('supplement')).map(link => link.id),
+              note: '覆盖度仅描述本条正文的读取范围，不证明问题已查全；还需核对关联条目和适用条件。',
+            },
             ...(chunk ? {
               body: chunk.text,
               chunk: {
@@ -873,7 +888,8 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             ...(passages ? {
               passages,
               note: passages.length
-                ? `这是按查询取回的相关段落（共 ${passages.length} 段），不是全文；全文 ${chars} 字符未返回，要全文用 full=true，要更多段落就换关键词再取。`
+                ? `这是按查询取回的相关段落（本页 ${passages.length}/${page!.total} 段），不是全文；全文 ${chars} 字符未返回。`
+                  + (page!.hasMore ? `继续用 passageOffset=${page!.nextOffset} 和相同 knowledgeId@revision、query 取下一页。` : '本查询的匹配窗口已返回；其他主题仍需另查。')
                 : '没有段落命中该查询；换关键词，或用 chunkIndex 逐块读。',
             } : {}),
             ...(!chunk && !passages ? { note: '本次按 full=true 返回全文，长度 ' + chars + ' 字符。' } : {}),
@@ -954,9 +970,19 @@ export function createCoreServer(store: Store, config: CoreConfig) {
         }
         case '/v1/knowledge/unstructured': { const p = z.object({ projectId: z.string(), limit: z.number().int().positive().max(200).optional() }).parse(body); return reply(res, 200, { skills: store.unstructuredSkills(p.projectId, p.limit) }); }
         case '/v1/knowledge/search-universal': {
-          const p = z.object({ projectId: z.string(), query: z.string().optional().default(''), kind: z.string().optional(), limit: z.number().int().positive().max(200).optional(), autoRecall: z.boolean().optional(),literal:z.boolean().optional() }).parse(body);
+          const p = z.object({ projectId: z.string(), query: z.string().optional().default(''), kind: z.string().optional(), limit: z.number().int().positive().max(200).optional(), autoRecall: z.boolean().optional(),literal:z.boolean().optional(),
+            taskId: z.string().optional(), scope: z.enum(['global','project','task']).optional(),
+            offset: z.number().int().nonnegative().max(100000).default(0), knowledgeRevision: z.number().int().nonnegative().optional(),
+            searchSnapshot: z.string().max(64).optional(),
+            includeSources: z.boolean().optional(),
+          }).parse(body);
+          if (p.knowledgeRevision !== undefined && p.knowledgeRevision !== store.revision)
+            throw new DomainError('revision_conflict', '检索期间知识版本已变，请从 offset=0 重新检索', 409);
           const selection=p.kind!=='norm'&&!p.literal&&p.query.trim()?await selectKnowledge(p.projectId,p.query):{mode:'lexical_fallback' as const,selectedIds:[],reason:'explicit_full_text'};
-          const catalog=store.searchUniversal(p.projectId,'',p.kind,Number.MAX_SAFE_INTEGER);
+          const inScope = <T extends { scope: { kind: string } }>(entries: T[]) => p.scope ? entries.filter(entry=>entry.scope.kind===p.scope) : entries;
+          const catalog=inScope(store.searchUniversal(p.projectId,'',p.kind,Number.MAX_SAFE_INTEGER,p.taskId,p.includeSources));
+          const lexical=inScope(store.searchUniversal(p.projectId,p.query,p.kind,Number.MAX_SAFE_INTEGER,p.taskId,p.includeSources));
+          const lexicalById=new Map(lexical.map(entry=>[entry.id,entry]));
           // When the model selects nothing, fall back to the lexical ranking instead of
           // returning an empty set. The injection path has always done this; explicit
           // search did not, so the same query could find an entry through injection and
@@ -980,7 +1006,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             &&selection.selectedIds.length===0
             &&((selection.reason??'').includes('model_abstained')||selection.mode==='model');
           const effective=modelAbstained?{...selection,mode:'lexical_fallback' as const,reason:`model_abstained:${selection.reason??'no_selection'}`}:selection;
-          const bySelection=effective.selectedIds.flatMap(id=>catalog.filter(entry=>entry.id===id)).slice(0,p.limit??(p.autoRecall?3:100));
+          const bySelection=effective.selectedIds.flatMap(id=>catalog.filter(entry=>entry.id===id)).map(entry=>lexicalById.get(entry.id)??entry);
           /**
            * One degradation rule for both branches of this endpoint.
            *
@@ -1021,9 +1047,25 @@ export function createCoreServer(store: Store, config: CoreConfig) {
            */
           const decided=(selection.mode==='model'&&!modelAbstained)
             ||(p.autoRecall===true&&selection.mode==='index');
-          const results=p.kind==='norm'?store.searchUniversal(p.projectId,p.query,p.kind,p.limit)
-            :decided?bySelection:store.searchUniversal(p.projectId,p.query,p.kind,p.limit??(p.autoRecall?3:100));
-          return reply(res,200,{results,selection:effective,knowledgeRevision:store.revision});
+          // Explicit search preserves lexical evidence even when a model selected only
+          // a subset. Automatic injection keeps its more conservative contract.
+          const rankedCandidates = p.autoRecall && decided ? bySelection
+            : p.kind==='norm' || p.literal ? lexical
+            : [...bySelection, ...lexical.filter(entry=>!bySelection.some(selected=>selected.id===entry.id))];
+          const ranked = p.autoRecall ? rankedCandidates.filter(mayAutomaticallyRecall) : rankedCandidates;
+          const limit=p.limit??(p.autoRecall?3:100);
+          const snapshot=createHash('sha256').update(ranked.map(entry=>`${entry.id}@${entry.revision}`).join('|')).digest('hex');
+          if (p.searchSnapshot !== undefined && p.searchSnapshot !== snapshot)
+            throw new DomainError('revision_conflict', '检索结果或有效期已变化，请从 offset=0 重新检索', 409);
+          const results=ranked.slice(p.offset,p.offset+limit);
+          const terms=queryTokens(p.query);
+          const matched=new Set(results.flatMap(entry=>entry.why?.matched??[]));
+          const hasMore=p.offset+results.length<ranked.length;
+          return reply(res,200,{results,selection:effective,knowledgeRevision:store.revision,
+            page:{offset:p.offset,limit,total:ranked.length,hasMore,nextOffset:hasMore?p.offset+results.length:null,searchSnapshot:snapshot},
+            coverage:{queryTerms:terms,matchedTerms:terms.filter(term=>matched.has(term)),missingTerms:terms.filter(term=>!matched.has(term)),
+              complete:false,note:'这是检索索引和节选，不能据此声称已读完；按 page 续查并读取正文、关联条目。未命中词不等于库里没有答案。'},
+          });
         }
         case '/v1/knowledge/get': {
           const p = z.object({ projectId: z.string(), id: z.string().min(1) }).parse(body);
@@ -1155,6 +1197,7 @@ export function createCoreServer(store: Store, config: CoreConfig) {
             summary: z.string().max(2000).optional(), notes: z.string().max(4000).optional(),
             unfinished: z.array(z.string().min(1).max(2000)).max(50).optional(),
             verified: z.string().max(2000).optional(),
+            evidenceRefs: z.array(evidenceReferenceSchema).max(10).optional(),
             evidence: z.enum(['observed', 'verifiable', 'self-reported', 'unverifiable']).optional(),
             files: z.array(z.string().min(1).max(2000)).max(100).optional(),
             relatedExperiences: z.array(z.string().min(1).max(120)).max(100).optional(),

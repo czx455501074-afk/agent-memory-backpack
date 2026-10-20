@@ -18,6 +18,7 @@ import { defaultScanRoots, diff, discover, rescanDiff, summarize, summarizeResca
 // candidateToKnowledge lives with the rescan policy so the CLI and the running
 // core convert discovered text identically; two copies would drift.
 import { applyRescan, candidateToKnowledge as toKnowledge } from './rescan.js';
+import { scanContextFromDisk } from './source-scope.js';
 import { doctor, summarizeDoctor } from './doctor.js';
 import { Logger, LOG_LEVEL_ORDER, type LogLevel } from './log.js';
 import {
@@ -142,6 +143,10 @@ const parsed = (() => {
 })();
 const { values, positionals } = parsed;
 const command = positionals[0]; const dir = resolve(values['data-dir'] ?? defaultDataDir());
+const scopeForScan = () => scanContextFromDisk(dir, {
+  projectId: String(values.project), projectRoot: resolve(String(values['project-root'] ?? process.cwd())),
+  explicitProject: process.argv.some(arg => arg === '--project' || arg.startsWith('--project=')),
+});
 /**
  * Candidate core entries, most trustworthy first.
  *
@@ -389,7 +394,7 @@ try {
     // Install-time adoption: scan user agents for existing knowledge. Read-only by
     // default; --roots restricts the scan. Nothing is promoted here.
     const roots = values.roots ? String(values.roots).split(',').map(root => root.trim()).filter(Boolean) : defaultScanRoots();
-    const report = discover(roots);
+    const report = discover(roots, 5000, scopeForScan());
     const corePath = join(dir, 'core.json');
     let compared: ReturnType<typeof diff> | undefined;
     if (existsSync(corePath)) {
@@ -403,7 +408,7 @@ try {
       scannedRoots: report.scannedRoots,
       candidates: (compared ?? report.candidates.map(candidate => ({ ...candidate, change: 'new' as const })))
         .map(candidate => ({
-        id: candidate.id, kind: candidate.kind, title: candidate.title,
+        id: candidate.id, kind: candidate.kind, title: candidate.title, scope: candidate.scope, scopeBasis: candidate.scopeBasis, scopeReviewRequired: candidate.scopeReviewRequired,
         change: candidate.change, source: candidate.source, rationale: candidate.rationale,
         leafCount: candidate.leaves?.length ?? 0,
         // Leaf bodies are included so the user can review what travels with a
@@ -484,7 +489,7 @@ try {
         }, null, 2));
       } else {
         const roots = values.roots ? String(values.roots).split(',').map(root => root.trim()).filter(Boolean) : defaultScanRoots();
-        const report = discover(roots);
+        const report = discover(roots, 5000, scopeForScan());
         const compared = diff(report.candidates, store.allEntries().map(entry => ({ id: entry.id, title: entry.content.title })));
         const pending = compared.filter(candidate => candidate.change === 'new');
         /**
@@ -532,6 +537,8 @@ try {
         } else if (selected.length === 0) {
           console.log(JSON.stringify({ adopted: 0, note: pending.length === 0 ? 'Nothing new to adopt.' : `--only 选中的 id 都不在待采纳清单里（待采纳 ${pending.length} 条）。` }, null, 2));
         } else {
+          const unresolved = selected.filter(candidate => candidate.scopeReviewRequired);
+          if (unresolved.length) throw new Error(`有 ${unresolved.length} 份共享历史尚未确认项目归属。请先用 adopt --project PROJECT 明确目标并检查 dry-run，再用 --yes 采纳；文件仍在原处。`);
           const batch = selected.map(candidate => ({
             source: { path: candidate.source.path, hash: candidate.source.hash },
             kind: candidate.kind,
@@ -563,7 +570,7 @@ try {
     const store = new Store(join(dir, 'knowledge.sqlite'));
     try {
       const roots = values.roots ? String(values.roots).split(',').map(root => root.trim()).filter(Boolean) : defaultScanRoots();
-      const report = rescanDiff(discover(roots), store.adoptions());
+      const report = rescanDiff(discover(roots, 5000, scopeForScan()), store.adoptions());
 
       if (values.yes !== true) {
         const dry = {
@@ -592,7 +599,7 @@ try {
           console.log('  这次什么都没写。确认清单无误后加 --yes 才会刷新变更的源。');
         }
       } else {
-        const outcome = applyRescan(store, roots);
+        const outcome = applyRescan(store, roots, scopeForScan());
         const { report } = outcome;
         console.log(JSON.stringify({
           summary: outcome.summary, counts: report.counts,
@@ -1294,7 +1301,7 @@ try {
       const rescanTimer = setInterval(() => {
         if (!store.rescanDue()) return;
         try {
-          const outcome = applyRescan(store, configuredRoots);
+          const outcome = applyRescan(store, configuredRoots, scopeForScan());
           logger.info('rescan.done', {
             summary: outcome.summary, refreshed: outcome.refreshed.length,
             adopted: outcome.adopted, errors: outcome.errors,

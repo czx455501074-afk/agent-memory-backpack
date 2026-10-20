@@ -1,4 +1,5 @@
 import { readFileSync, statSync } from 'node:fs';
+import { mayAutomaticallyRecall } from './memory-policy.js';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Store } from './store.js';
@@ -137,7 +138,7 @@ export function createRetrievalService(store: Store, dataDir: string, options: {
      * retrieval and the model selector could never see, while the full-text path
      * could return them: two answers to the same question inside one task.
      */
-    const scoped=store.scopedEntries(projectId);
+    const scoped=store.scopedEntries(projectId).filter(entry=>mayAutomaticallyRecall(entry.content));
     const liveKey=scoped.map(e=>`${e.id}@${e.revision}`).sort().join('|');
     const digests=new Map<string,{revision:number;digest:{summary:string;whenToUse:string[];exclusions:string[];aliases:string[];versions:string[]}}>();
     /**

@@ -13,6 +13,20 @@ import { captureFailure, failureCandidate } from './failure-capture.mjs'
 import { captureMaterial, replayMaterials } from './material-capture.mjs'
 import { isContinuationQuery, recallKnowledge } from './recall.mjs'
 
+const evidenceReferencesSchema = {
+  type: 'array', maxItems: 10, items: { type: 'object', additionalProperties: false,
+    properties: {
+      kind: { type: 'string', enum: ['artifact', 'command', 'url', 'knowledge', 'event'] },
+      locator: { type: 'string', minLength: 1, maxLength: 2000 },
+      snapshot: { type: 'string', maxLength: 6000 },
+      snapshotHash: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+      reportedHash: { type: 'string', maxLength: 128 },
+      revision: { type: 'integer', minimum: 1 }, observedAt: { type: 'integer', minimum: 0 },
+      result: { type: 'string', maxLength: 1000 },
+    }, required: ['kind', 'locator'],
+  },
+}
+
 /** The packaged core entry point, resolved beside this adapter. */
 const ADAPTER_DIR = dirname(fileURLToPath(import.meta.url))
 /**
@@ -155,7 +169,8 @@ function assertReceipt(value, kind) {
     || typeof value.duplicate !== 'boolean') {
     throw new Error(`Agent Memory Backpack core returned an invalid ${kind} receipt.`)
   }
-  const allowed = value.duplicate === true ? PROPOSAL_STATES : [kind]
+  const allowed = value.duplicate === true ? PROPOSAL_STATES
+    : kind === 'pending' && value.disposition === 'discarded_low_value' ? ['rejected'] : [kind]
   if (!allowed.includes(value.state)) {
     throw new Error(`Agent Memory Backpack core returned an invalid ${kind} receipt.`)
   }
@@ -1885,6 +1900,7 @@ export async function apply(ctx) {
         summary: { type: 'string' }, notes: { type: 'string' },
         unfinished: { type: 'array', items: { type: 'string' } },
         verified: { type: 'string' }, evidence: { type: 'string', enum: ['unverifiable', 'self-reported', 'verifiable'] },
+        evidenceRefs: evidenceReferencesSchema,
         idempotencyKey: { type: 'string' },
       },
     },
@@ -1950,7 +1966,7 @@ export async function apply(ctx) {
 
   registerTool(jsonTool({
     name: 'amb_search_universal',
-    description: 'Search across all knowledge entries (skills, norms, workflows, memories, journals) by free-text query with optional kind and limit filters.',
+    description: 'Search knowledge by query, kind and scope. Supply taskId for task memories. Results are excerpts, not complete procedures. Follow page.nextOffset with the same query and knowledgeRevision; read relevant entries, relations and conditions before stopping. coverage.missingTerms are lexical clues, not proof that knowledge is absent.',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
@@ -1958,6 +1974,12 @@ export async function apply(ctx) {
         query: { type: 'string' },
         kind: { type: 'string' },
         limit: { type: 'integer', minimum: 1, maximum: 200 },
+        scope: { type: 'string', enum: ['global', 'project', 'task'] },
+        taskId: { type: 'string', minLength: 1, maxLength: 120 },
+        offset: { type: 'integer', minimum: 0, maximum: 100000 },
+        knowledgeRevision: { type: 'integer', minimum: 0 },
+        searchSnapshot: { type: 'string', maxLength: 64 },
+        includeSources: { type: 'boolean', description: 'Include archived originals for provenance review.' },
       },
     },
     async execute(args, exec) {
@@ -1967,6 +1989,12 @@ export async function apply(ctx) {
         ...(args?.kind ? { kind: String(args.kind) } : {}),
         ...(typeof args?.literal==='boolean' ? { literal:args.literal } : {}),
         ...(Number.isInteger(args?.limit) ? { limit: args.limit } : {}),
+        ...(typeof args?.scope === 'string' ? { scope: args.scope } : {}),
+        ...(typeof args?.taskId === 'string' ? { taskId: args.taskId } : {}),
+        ...(Number.isInteger(args?.offset) ? { offset: args.offset } : {}),
+        ...(Number.isInteger(args?.knowledgeRevision) ? { knowledgeRevision: args.knowledgeRevision } : {}),
+        ...(typeof args?.searchSnapshot === 'string' ? { searchSnapshot: args.searchSnapshot } : {}),
+        ...(typeof args?.includeSources === 'boolean' ? { includeSources: args.includeSources } : {}),
       }, { signal: exec.signal })
     },
   }))
@@ -2005,6 +2033,8 @@ export async function apply(ctx) {
         startLine: { type: 'integer', minimum: 1 },
         endLine: { type: 'integer', minimum: 1 },
         full: { type: 'boolean' },
+        taskId: { type: 'string', minLength: 1, maxLength: 120 },
+        passageOffset: { type: 'integer', minimum: 0 },
       }, required: ['knowledgeId'],
     },
     async execute(args, exec) {
@@ -2017,6 +2047,8 @@ export async function apply(ctx) {
         ...(Number.isInteger(args?.startLine) ? { startLine: args.startLine } : {}),
         ...(Number.isInteger(args?.endLine) ? { endLine: args.endLine } : {}),
         ...(args?.full === true ? { full: true } : {}),
+        ...(typeof args?.taskId === 'string' ? { taskId: args.taskId } : {}),
+        ...(Number.isInteger(args?.passageOffset) ? { passageOffset: args.passageOffset } : {}),
       }, { signal: exec.signal })
     },
   }))
@@ -2204,16 +2236,32 @@ export async function apply(ctx) {
         baseRevision: { type: 'integer', minimum: 1 },
         taskId: { type: 'string', minLength: 1, maxLength: 120 },
         evidence: { type: 'string', maxLength: 4000 },
+        evidenceRefs: evidenceReferencesSchema,
+        stageId: { type: 'string', minLength: 1, maxLength: 120 },
+        memoryContext: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            kind: { type: 'string', enum: ['norm', 'preference', 'memory', 'skill', 'material', 'journal'] },
+            scope: { type: 'string', enum: ['global', 'project', 'task'] },
+            durability: { type: 'string', enum: ['durable', 'temporary'] },
+            appliesWhen: { type: 'array', maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 2000 } },
+            invalidatedWhen: { type: 'array', maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 2000 } },
+          },
+        },
       }, required: ['idempotencyKey', 'discovery'],
     },
     async execute(args, exec) {
       const proposalPayload = {
         idempotencyKey: requireString(args?.idempotencyKey, 'idempotencyKey'),
         projectId: config.projectId,
+        ...(exec.agent?.id ? { sessionId: exec.agent.id } : {}),
         ...(typeof args?.workflowId === 'string' ? { workflowId: args.workflowId } : {}),
+        ...(typeof args?.stageId === 'string' ? { stageId: args.stageId } : {}),
         ...(Number.isSafeInteger(args?.baseRevision) && args.baseRevision >= 1 ? { baseRevision: args.baseRevision } : {}),
         ...(typeof args?.taskId === 'string' ? { taskId: args.taskId } : {}),
         ...(typeof args?.evidence === 'string' && args.evidence.trim() ? { evidence: args.evidence.trim() } : {}),
+        ...(Array.isArray(args?.evidenceRefs) ? { evidenceRefs: args.evidenceRefs } : {}),
+        ...(isRecordValue(args?.memoryContext) ? { memoryContext: args.memoryContext } : {}),
         discovery: requireString(args?.discovery, 'discovery'),
       }
       try {

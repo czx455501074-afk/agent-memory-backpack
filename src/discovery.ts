@@ -4,7 +4,8 @@ import { homedir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 // The same body limit the schema enforces, so a scanned document is never
 // rejected later at import with a message that names neither the file nor the rule.
-import { MAX_BODY_CHARS } from './schema.js';
+import { MAX_BODY_CHARS, type Scope } from './schema.js';
+import { sourceScope, type ScanScopeContext } from './source-scope.js';
 
 /**
  * Read-only discovery of knowledge the user already has in their agents.
@@ -64,6 +65,9 @@ export interface AdoptedCandidate {
    * report to keep console output readable.
    */
   body: string;
+  scope?: Scope;
+  scopeBasis?: string;
+  scopeReviewRequired?: boolean;
 }
 
 export interface ExcludedSource {
@@ -299,7 +303,7 @@ const isSkillEntry = (name: string): boolean => name.toLowerCase() === 'skill.md
  * complete workflow: its reference documents must travel with the entry rather
  * than be promoted as standalone fragments.
  */
-export function discover(roots: string[] = defaultScanRoots(), maxFiles = 5_000): DiscoveryReport {
+export function discover(roots: string[] = defaultScanRoots(), maxFiles = 5_000, scopeContext?: ScanScopeContext): DiscoveryReport {
   const candidates: AdoptedCandidate[] = [];
   const excluded: ExcludedSource[] = [];
   const seenId = new Set<string>();
@@ -430,7 +434,9 @@ export function discover(roots: string[] = defaultScanRoots(), maxFiles = 5_000)
     }
 
     const hash = sha256(text);
-    const id = `${classification.kind}:${hash.slice(0, 16)}`;
+    const ownership = scopeContext ? sourceScope(path, scopeContext, classification.kind) : undefined;
+    const id = `${classification.kind}:${hash.slice(0, 16)}`
+      + (ownership?.scope.kind === 'project' ? `:${sha256(ownership.scope.projectId).slice(0, 8)}` : '');
     if (seenId.has(id)) { excluded.push({ path, reason: 'same content already reported from another path' }); return; }
     seenId.add(id);
 
@@ -439,6 +445,7 @@ export function discover(roots: string[] = defaultScanRoots(), maxFiles = 5_000)
       id, kind: classification.kind, title: heading ? heading.replace(/^#+\s*/, '') : name,
       source: { path, hash, bytes: info.size }, rationale: classification.rationale, body: text,
       hostProvided: classification.kind === 'norm' && HOST_LOADED_INSTRUCTIONS.has(name.toLowerCase()),
+      ...(ownership ? { scope: ownership.scope, scopeBasis: ownership.basis, ...(ownership.requiresReview ? { scopeReviewRequired: true } : {}) } : {}),
     };
 
     // For a skill entry, gather the reference/leaf documents in the same skill

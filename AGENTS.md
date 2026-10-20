@@ -34,13 +34,13 @@ node scripts/verify-host-deployment.mjs         # 宿主跑的是哪一版：必
 
 | 目录 | 职责 | 备注 |
 |---|---|---|
-| `src/` | 核心：CLI、HTTP 服务、存储、检索、MCP、网页控制台 | 31 个文件；`store.ts` 最大（约 5,400 行），改它前先读契约 |
+| `src/` | 核心：CLI、HTTP 服务、存储、检索、MCP、网页控制台 | 40 个文件；`store.ts` 最大（约 6,500 行），改它前先读契约 |
 | `adapters/dsh/` | DSH 适配器：工具注册、面板、hook、outbox、spool | 面板前端是 `client.js` |
 | `adapters/codex/` | Codex 适配器：hook 脚本、失败捕获 | 与 DSH 侧共享若干逐字节相同的文件（有测试钉住） |
-| `test/` | 139 个测试文件（`*.test.ts` 与 `*.test.mjs` 两种） | `dist/test/*.test.js` 与 `test/*.test.mjs` 都被 `npm test` 收集 |
+| `test/` | 154 个测试文件（`*.test.ts` 与 `*.test.mjs` 两种） | `dist/test/*.test.js` 与 `test/*.test.mjs` 都被 `npm test` 收集 |
 | `verification/` | 契约检查、只读普查、可复现测量（`r5/`、`r6/`） | 这些是**证据**，不是测试：多为只读、退出码恒 0 |
 | `scripts/` | 安装、打包、部署、桌面验收、宿主版本判定 | `package.mjs` 含 `node --check` 全量语法门 |
-| `docs/` | 157 份文档：`implementation/` 为主，`handoffs/`、`plans/`、`internal/`、`diagnostics/` | 从 [`docs/README.md`](docs/README.md) 进 |
+| `docs/` | 146 份 Markdown 文档：`implementation/` 为主，`handoffs/`、`plans/`、`internal/`、`diagnostics/` | 从 [`docs/README.md`](docs/README.md) 进 |
 | `dist/` | `tsc` 输出（`dist/src`、`dist/test`） | **产物，不要手改** |
 | `core/` | 打包产物的本地副本（`runtime/` + `node_modules/`） | **产物**；仓库根这份不参与部署 |
 | `dist-console/`、`dist-console-out/`、`console.archived-electron/` | 早期 Electron 控制台，**已下线** | 不要再往里加代码 |

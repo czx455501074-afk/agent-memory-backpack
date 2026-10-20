@@ -80,8 +80,11 @@ async function startServer() {
       })
     }
     if (req.url === '/v1/proposals') {
+      if (body.discovery === '收到') return json(res, 200, { id: 'noise-receipt', state: 'rejected', duplicate: false, disposition: 'discarded_low_value' })
       return json(res, 200, { id: 'proposal-1', state: 'pending', duplicate: false })
     }
+    if (req.url === '/v1/knowledge/search-universal') return json(res, 200, { results: [], page: { hasMore: false } })
+    if (req.url === '/v1/knowledge/read') return json(res, 200, { id: body.knowledgeId, body: '', coverage: { complete: false } })
     if (req.url === '/v1/knowledge/supersede') {
       if (state.supersedeMode === 'malformed') return json(res, 200, { ok: true })
       return json(res, 200, {
@@ -316,13 +319,29 @@ test('loads and disposes DSH hooks and tools in the installed Cordis runtime', {
   assert.equal(delegated, true)
 
   const proposal = await registeredTools.get('amb_submit_experience').execute(
-    { idempotencyKey: 'fixture-proposal-1', discovery: 'A repeatable local fixture insight.', baseRevision: 1 },
+    { idempotencyKey: 'fixture-proposal-1', discovery: 'A repeatable local fixture insight.', baseRevision: 1,
+      memoryContext: { kind: 'memory', scope: 'project', durability: 'durable', appliesWhen: ['fixture runtime'], invalidatedWhen: ['fixture changes'] } },
     { agent, signal: new AbortController().signal },
   )
   assert.equal(proposal.state, 'pending')
   const proposalRequest = state.requests.find((request) => request.path === '/v1/proposals')
   assert.ok(proposalRequest.body.idempotencyKey)
   assert.equal(proposalRequest.body.projectId, 'fixture-project')
+  assert.deepEqual(proposalRequest.body.memoryContext.appliesWhen, ['fixture runtime'])
+  const exec = { agent, signal: new AbortController().signal }
+  await registeredTools.get('amb_search_universal').execute({ query: 'restore', scope: 'task', taskId: 'task-fixture', offset: 3, knowledgeRevision: 7, searchSnapshot: 'fixture-snapshot' }, exec)
+  const searchRequest = state.requests.filter(request => request.path === '/v1/knowledge/search-universal').at(-1).body
+  assert.equal(searchRequest.taskId, 'task-fixture')
+  assert.equal(searchRequest.offset, 3)
+  assert.equal(searchRequest.searchSnapshot, 'fixture-snapshot')
+  await registeredTools.get('amb_read_knowledge').execute({ knowledgeId: 'entry@1', query: 'restore', taskId: 'task-fixture', passageOffset: 3 }, exec)
+  const readRequest = state.requests.filter(request => request.path === '/v1/knowledge/read').at(-1).body
+  assert.equal(readRequest.passageOffset, 3)
+  assert.equal(readRequest.taskId, 'task-fixture')
+  const outboxBefore = state.requests.filter(request => request.path === '/v1/outbox/enqueue').length
+  const rejected = await registeredTools.get('amb_submit_experience').execute({ idempotencyKey: 'fixture-noise', discovery: '收到' }, exec)
+  assert.equal(rejected.state, 'rejected', 'a deliberate rejection is a core receipt, not a transport failure')
+  assert.equal(state.requests.filter(request => request.path === '/v1/outbox/enqueue').length, outboxBefore, 'noise rejection must not be queued for replay')
   assert.ok(state.requests.every((request) => request.protocol === '1'))
   assert.equal(JSON.stringify(state.requests.map(({ body }) => body)).includes('test-only-token'), false)
 

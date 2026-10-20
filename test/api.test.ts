@@ -159,7 +159,7 @@ test('管理 API：列出提案不改变知识版本，批准需完整结构化�
 test('管理 API：同一提案不可重复批准，且失败不产生半写', async () => {
   const f = await fixture();
   try {
-    const submitted = await f.post('/v1/proposals', { projectId: PROJECT, idempotencyKey: 'mgmt-once', discovery: '一次性候选。' });
+    const submitted = await f.post('/v1/proposals', { projectId: PROJECT, idempotencyKey: 'mgmt-once', discovery: '验证幂等采纳的候选。' });
     const id = String((submitted.data as { id: string }).id);
     const first = await f.adminPost('/v1/proposals/approve', { projectId: PROJECT, id, entry: workflow('mgmt-once-wf') });
     assert.equal(first.status, 200);

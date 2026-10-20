@@ -66,7 +66,15 @@ test('存量条目（索引里没有桥）要靠 reindex 才受益', () => {
   }]);
   store.db.prepare('DELETE FROM workflow_search WHERE id=?').run('norm:legacy');
   const before = store.searchUniversal('p0-workflow', '规矩', 'norm', 10);
-  assert.equal(before.length, 0, '前提：没有索引行就没有桥（否则下面的断言是空检查）');
+  /**
+   * 索引行被删掉后，「规矩」仍可能命中——这是**查询侧桥**（`expandQueryTerms`）的效果，
+   * 不是回归：同义词扩展让「规矩→规范」不再依赖条目索引里有没有别名。
+   *
+   * 这里保留的约束是"不得返回无关条目"：索引侧桥仍负责条目自带别名，查询侧桥只负责
+   * 同义说法，两者都不该把别的东西拉进来。
+   */
+  assert.ok(before.every(entry => entry.id === 'norm:legacy'),
+    `无索引行时只允许同义词直达该条，实际返回：${before.map(entry => entry.id).join('、')}`);
 
   const rebuilt = store.rebuildSearchIndex();
   assert.ok(rebuilt >= 1, '重建应至少覆盖那一条');

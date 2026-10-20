@@ -430,7 +430,7 @@ function showEditor(entryToEdit) {
   var title = raw.title || '';
   var kind = raw.kind || 'memory';
   var body = raw.body !== undefined ? raw.body : (raw.overview !== undefined ? raw.overview : (raw.did !== undefined ? raw.did : ''));
-  var scopeKind = raw.scope && raw.scope.kind === 'global' ? 'global' : 'project';
+  var scopeKind = raw.scope && ['global', 'task'].indexOf(raw.scope.kind) >= 0 ? raw.scope.kind : 'project';
   var baseRevision = entryToEdit ? (entryToEdit.revision || 0) : 0;
 
   var allKinds = [
@@ -464,6 +464,7 @@ function showEditor(entryToEdit) {
     '<div class="form-group"><label>作用范围</label>' +
     '<select id="ed-scope" class="select" style="width:100%;">' +
     '<option value="project"' + (scopeKind === 'project' ? ' selected' : '') + '>当前项目专属</option>' +
+    (raw.scope && raw.scope.kind === 'task' ? '<option value="task" selected>仅来源任务</option>' : '') +
     '<option value="global"' + (scopeKind === 'global' ? ' selected' : '') + '>全局共享</option>' +
     '</select></div>' +
     '</div>' +
@@ -656,7 +657,9 @@ function showProposalEditor(proposalId) {
     // re-derived here: the page prints the reason beside the button that would need the
     // acknowledgement, instead of hiding it one click deeper in the detail view.
     var gate = detail.classificationGate || null;
-    var scopeKind = detail.payload && detail.payload.scope && detail.payload.scope.kind === 'global' ? 'global'
+    var classification = detail.payload && detail.payload.classification || {};
+    var assessment = classification.assessment || {};
+    var scopeKind = classification.scope === 'task' && detail.payload && detail.payload.taskId ? 'task'
       : (prefill && prefill.scope === 'global' ? 'global' : 'project');
     var targetLine = target.available
       ? '<div class="card__path">目标流程：<code>' + esc(target.workflowId) + '</code>' +
@@ -737,7 +740,7 @@ function showProposalEditor(proposalId) {
         '<input type="text" id="pe-summary"></div>' +
         '<div class="form-group" id="pe-journal-fields" style="display:none;">' +
         '<label>本任务做了什么（采纳为「日记」时必填）</label>' +
-        '<input type="text" id="pe-did"></div>';
+        '<textarea id="pe-did" rows="4">' + esc(body) + '</textarea></div>';
     }
 
     box.innerHTML = '<div class="editor-card">' +
@@ -746,11 +749,13 @@ function showProposalEditor(proposalId) {
       '<button class="ghost btn-sm" id="pe-cancel">取消</button>' +
       '</div>' +
       targetLine + needsEvidence + modelLine + prefillLine +
+      (assessment.durability ? '<p class="muted">持久性：' + esc(assessment.durability) + '；' + esc((assessment.reasons || []).join('；')) + '</p>' : '') +
       '<p class="card__body">' + esc(detail.discovery || '') + '</p>' +
       formBody +
       '<div class="form-group"><label>作用范围</label>' +
       '<select id="pe-scope" class="select">' +
-      '<option value="project"' + (scopeKind === 'project' ? ' selected' : '') + '>项目专属（默认，最窄）</option>' +
+      '<option value="project"' + (scopeKind === 'project' ? ' selected' : '') + '>项目专属</option>' +
+      (detail.payload && detail.payload.taskId ? '<option value="task"' + (scopeKind === 'task' ? ' selected' : '') + '>仅来源任务</option>' : '') +
       '<option value="global"' + (scopeKind === 'global' ? ' selected' : '') + '>全局共享（将应用到所有项目）</option>' +
       '</select></div>' +
       '<div class="card__actions">' +
@@ -797,15 +802,18 @@ function showProposalEditor(proposalId) {
  */
 function buildApprovalEntry(detail) {
   var target = detail.target || {};
-  var scopeKind = (document.getElementById('pe-scope') || {}).value === 'global' ? 'global' : 'project';
-  var scope = scopeKind === 'global' ? { kind: 'global' } : { kind: 'project', projectId: getProject() };
+  var scopeKind = (document.getElementById('pe-scope') || {}).value || 'project';
+  var scope = scopeKind === 'global' ? { kind: 'global' }
+    : scopeKind === 'task' && detail.payload && detail.payload.taskId
+      ? { kind: 'task', projectId: getProject(), taskId: detail.payload.taskId }
+      : { kind: 'project', projectId: getProject() };
   if (target.available && target.entry && target.entry.kind === 'workflow') {
     var raw = (document.getElementById('pe-entry-json') || {}).value || '{}';
     var entry;
     try { entry = JSON.parse(raw); } catch (e) { throw new Error('流程 JSON 解析失败：' + e.message); }
     entry.id = target.workflowId;
     entry.kind = 'workflow';
-    entry.scope = scopeKind === 'global' ? { kind: 'global' } : (target.entry.scope && target.entry.scope.kind === 'project' ? target.entry.scope : scope);
+    entry.scope = scopeKind === 'task' || scopeKind === 'global' ? scope : (target.entry.scope && target.entry.scope.kind === 'project' ? target.entry.scope : scope);
     entry.baseRevision = target.baseRevision !== null && target.baseRevision !== undefined ? target.baseRevision : (target.entry.baseRevision || 0);
     return { entry: entry, allowGlobalScope: scopeKind === 'global' };
   }
@@ -860,6 +868,9 @@ function buildApprovalEntry(detail) {
     var did = ((document.getElementById('pe-did') || {}).value || '').trim();
     if (!did) throw new Error('采纳为「日记」需要填「本任务做了什么」（日记条目要求 did）');
     entry.did = did;
+    delete entry.body;
+    entry.outcome = 'unverified';
+    if (detail.payload && detail.payload.taskId) entry.taskId = detail.payload.taskId;
   }
   return { entry: entry, allowGlobalScope: scopeKind === 'global' };
 }
@@ -875,7 +886,9 @@ function buildApprovalEntry(detail) {
  */
 function programmaticApproval(detail) {
   var target = detail.target || {};
-  var scope = { kind: 'project', projectId: getProject() };
+  var scope = detail.payload && detail.payload.taskId && detail.payload.classification && detail.payload.classification.scope === 'task'
+    ? { kind: 'task', projectId: getProject(), taskId: detail.payload.taskId }
+    : { kind: 'project', projectId: getProject() };
   if (target.available && target.entry && target.entry.kind === 'workflow') {
     var entry = JSON.parse(JSON.stringify(target.entry));
     entry.baseRevision = target.baseRevision !== null && target.baseRevision !== undefined ? target.baseRevision : (target.entry.baseRevision || 0);
@@ -1277,6 +1290,8 @@ panel.addEventListener('click', function (event) {
       entry.platforms = Array.isArray(original.platforms) ? original.platforms : [];
       if (scopeKind === 'global') {
         entry.scope = { kind: 'global' };
+      } else if (scopeKind === 'task' && original.scope && original.scope.kind === 'task') {
+        entry.scope = original.scope;
       } else {
         entry.scope = (original.scope && original.scope.kind === 'project')
           ? original.scope

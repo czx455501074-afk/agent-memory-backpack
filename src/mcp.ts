@@ -5,7 +5,7 @@ import { CoreClient, assertGateResponse, assertPrepareResponse } from './client.
 import { readClientConfig, resolveConfigPath } from './config.js';
 import { dirname } from 'node:path';
 import { Logger } from './log.js';
-import { identifier, workflowSchema } from './schema.js';
+import { identifier, workflowSchema, memoryContextSchema, evidenceReferenceSchema } from './schema.js';
 import { pluginVersion } from './doctor.js';
 
 /**
@@ -78,12 +78,18 @@ export function createMcp(client: CoreClient, logger?: Logger) {
     inputSchema: { query: z.string().max(4000) }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/search', args));
   server.registerTool('amb_search_universal', {
-    description: 'Search across all knowledge entries (skills, norms, workflows, memories, journals) by free-text query with optional kind and limit filters.',
+    description: 'Search knowledge by query, kind and scope. Supply taskId for task memories. Results are excerpts, not complete procedures. Follow page.nextOffset with the same query and knowledgeRevision; read relevant entries, relations and conditions before stopping. coverage.missingTerms are lexical clues, not proof that knowledge is absent.',
     inputSchema: {
       literal: z.boolean().optional().describe('Use literal full-text search instead of model relevance selection.'),
       query: z.string().max(4000).default(''),
       kind: z.string().max(100).optional(),
       limit: z.number().int().positive().max(200).optional(),
+      scope: z.enum(['global', 'project', 'task']).optional(),
+      taskId: identifier.optional(),
+      offset: z.number().int().nonnegative().max(100000).optional(),
+      knowledgeRevision: z.number().int().nonnegative().optional(),
+      searchSnapshot: z.string().max(64).optional().describe('Pass page.searchSnapshot on continuation to detect ordering or expiry changes.'),
+      includeSources: z.boolean().optional().describe('Include archived originals for provenance review. Default search prefers curated records; archived source ids remain readable directly.'),
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/search-universal', args));
@@ -109,6 +115,8 @@ export function createMcp(client: CoreClient, logger?: Logger) {
       startLine: z.number().int().positive().optional(),
       endLine: z.number().int().positive().optional(),
       full: z.boolean().optional(),
+      taskId: identifier.optional(),
+      passageOffset: z.number().int().nonnegative().optional().describe('Continue query passages at coverage.nextPassageOffset with the same query and knowledgeId@revision.'),
     }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, args => call('/v1/knowledge/read', args));
   server.registerTool('amb_supersede_experience', {
@@ -158,6 +166,7 @@ export function createMcp(client: CoreClient, logger?: Logger) {
       summary: z.string().max(2000).optional(), notes: z.string().max(4000).optional(),
       unfinished: z.array(z.string().min(1).max(2000)).max(50).optional(),
       verified: z.string().max(2000).optional(), evidence: z.enum(['verifiable', 'self-reported', 'unverifiable']).optional(),
+      evidenceRefs: z.array(evidenceReferenceSchema).max(10).optional().describe('Bounded sanitized evidence snapshots with stable locators. Stored with the journal, outside its prose. Capture does not independently verify a claim.'),
       files: z.array(z.string().min(1).max(2000)).max(100).optional(),
       relatedExperiences: z.array(identifier).max(100).optional(), relatedProposals: z.array(identifier).max(100).optional(),
     }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -180,8 +189,12 @@ export function createMcp(client: CoreClient, logger?: Logger) {
       discovery: z.string().trim().min(1).max(12000).describe('Normalized description: the claim, when it applies, the check that makes it verifiable, and evidence as pointers. No raw transcripts, tool logs or whole source files'),
       workflowId: identifier.optional(),
       baseRevision: z.number().int().positive().optional(),
+      stageId: identifier.optional(),
       taskId: identifier.optional(),
+      sessionId: z.string().min(1).max(256).optional(),
+      evidenceRefs: z.array(evidenceReferenceSchema).max(10).optional().describe('Retain artifact/test excerpts, locators, observed times and results with the adopted entry. Include compact snapshots so later file changes cannot erase the evidence. No credentials or full logs.'),
       evidence: z.string().trim().max(4000).optional().describe('Observed verification evidence such as test pass output, command exit code, or verified facts'),
+      memoryContext: memoryContextSchema.optional().describe('Declare intended kind, scope, durability, applicability and invalidation conditions. Advisory only. One-off outages belong to the task journal; verified reusable conclusions need a separate candidate.'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, args => call('/v1/proposals', args));

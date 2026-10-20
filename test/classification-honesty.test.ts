@@ -26,13 +26,13 @@ import { classifyCandidate } from '../src/semantic.js';
  */
 
 /** Texts that report an episode. None of them may be classified as a norm. */
-const EXPERIENCE_SAMPLES: Array<{ label: string; text: string; expected: 'memory' | 'skill' }> = [
+const EXPERIENCE_SAMPLES: Array<{ label: string; text: string; expected: 'memory' | 'skill' | 'journal' }> = [
   {
     label: '自动捕获的失败事实（harness 写入的模板，含"不得"）',
     text: '【自动捕获的失败事实；待核实】 所属流程：工具执行与故障恢复；步骤：记录失败、检索已有经验、验证修复。'
       + ' 观察：exit_code=1，一个脚本在 junction 路径下静默失败、输出为零字节。'
       + ' 根因与修复：尚未验证；不得将本记录直接当作已采纳规范。',
-    expected: 'memory',
+    expected: 'journal',
   },
   {
     label: '实测发现的构建经验（含"必须"）',

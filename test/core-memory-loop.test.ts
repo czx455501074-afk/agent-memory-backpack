@@ -30,7 +30,8 @@ test('checkpoint requires completion evidence and preserves actual task summary 
     s.recordTask('p', { id: t.id, title: '部署', status: 'in_progress', summary: '已修改代码但未部署', notes: '长'.repeat(3500) });
     const stop = s.event('codex', { eventId: 'stop', projectId: 'p', adapter: 'codex', sessionId: 'session', kind: 'turn_ended', summary: '' });
     const journal = s.readKnowledge('p', String(stop.journalId));
-    assert.equal(journal.body, '已修改代码但未部署');
+    assert.match(journal.body, /^已修改代码但未部署/);
+    assert.ok(journal.body.includes('长'.repeat(3500)), '读取日记也应包含问题/限制，不能只返回 did');
     assert.equal(s.generateJournal(t.id, 'p').problems.length, 3500);
     assert.throws(() => s.checkpointTask('codex', { projectId: 'p', taskId: t.id, status: 'completed' }), /require/);
     const done = s.checkpointTask('codex', { projectId: 'p', taskId: t.id, status: 'completed', verified: 'artifact sha256 checked', evidence: 'verifiable', idempotencyKey: 'done' });

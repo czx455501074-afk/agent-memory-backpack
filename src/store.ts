@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DomainError, knowledgeSchema, proposalSchema, workflowSchema, type Knowledge, type KnowledgeDraft, type WorkflowDraft, type Workflow, type Scope } from './schema.js';
 import { reviewDecision, type ReviewDecision } from './policy.js';
 import { classifyCandidate, type SemanticAnalysis } from './semantic.js';
+import { assessMemory, memoryIsLive, mayAutomaticallyRecall, TEMPORARY_MEMORY_TTL, type MemoryContext, type MemoryAssessment } from './memory-policy.js';
 import { DurableJobs } from './jobs.js';
 import { MATERIAL_TTL_DAYS, expiryFrom, isLive, materialEntry, renew, type MaterialInput } from './material.js';
 import { positiveRetrievalClauses } from './retrieval-index.js';
@@ -11,9 +12,11 @@ import { redactDeep, redactInString, type RedactionFinding } from './redact.js';
 // The optional semantic layer's storage helpers (see embeddings.ts): derived data, never authority.
 import { decodeVector, encodeVector } from './embeddings.js';
 // 术语桥：让「用户怎么说」与「库里怎么写」对上（见 term-bridge.ts）。
-import { buildTermBridge } from './term-bridge.js';
+import { buildTermBridge, expandQueryTerms } from './term-bridge.js';
+import { inferDomain } from './domain-taxonomy.js';
 // 注入用的相关段落：正文开头往往不是答案所在（见 retrieval-excerpt.ts）。
 import { relevantPassages } from './retrieval-excerpt.js';
+import { captureSupport, retrievalContent, type EvidenceReference, type Support } from './evidence.js';
 // 分块视图：让注入能说清"相关段落在第几块"（见 retrieval-chunk.ts）。
 import { chunkBody } from './retrieval-chunk.js';
 import { consolidateCandidates, distillFailures, EVOLVE_DEFAULTS, promotionText, type EvolveCandidate, type EvolveLink, type EvolveThresholds, type FailureSignal } from './evolve.js';
@@ -74,7 +77,7 @@ function canonicalEvent(payload: Record<string, unknown>): Record<string, unknow
  * lives here rather than beside the classifier because that file's shape is frozen for
  * this change; the note is the link between the two.
  */
-export const CLASSIFIER_VERSION = 'semantic-2026-10-17';
+export const CLASSIFIER_VERSION = 'semantic-2026-10-20';
 /**
  * What a stored classification says about promoting a candidate unattended.
  *
@@ -295,7 +298,8 @@ function searchable(value: string): string {
  */
 function withBridge(contentJson: string, modelBridges?: Map<string, { aliases: string[]; keywords: string[] }>): string {
   try {
-    const content = JSON.parse(contentJson) as Record<string, unknown>;
+    const content = retrievalContent(JSON.parse(contentJson) as Record<string, unknown>);
+    contentJson = JSON.stringify(content);
     const id = String(content.id ?? '');
     const aliases = Array.isArray(content.aliases) ? content.aliases : [];
     const keywords = Array.isArray(content.keywords) ? content.keywords : [];
@@ -389,10 +393,31 @@ export function derivedTitle(text: string, fallback: string, limit = 60): string
  * any fragment alone returns a page of noise. Longer tokens are therefore listed
  * first so the caller can prefer the most specific match it can satisfy.
  */
-function queryTokens(query: string): string[] {
+export function queryTokens(query: string): string[] {
   return [...new Set(searchable(query).split(' ').filter(Boolean))]
     .sort((a, b) => b.length - a.length)
     .slice(0, 40);
+}
+
+/**
+ * Tokens for an **explicit** search: the user's own words first, bridged ones after.
+ *
+ * The two lists are deliberately separate functions, because they answer different
+ * questions. Automatic recall asks "does this entry really match what the agent is
+ * doing" — for that, a bridged synonym is a false positive waiting to happen, and the
+ * existing filter that drops entries matching only reference boilerplate relies on the
+ * literal tokens. An explicit search asks "find anything about this", where a miss is
+ * worse than an extra candidate, so the bridge belongs there.
+ *
+ * Bridged Chinese is returned as bigrams because that is how the index slices it;
+ * bridged English stays whole because the index stores English words whole.
+ */
+export function expandedQueryTokens(query: string): string[] {
+  const direct = [...new Set(searchable(query).split(' ').filter(Boolean))];
+  const bridge = expandQueryTerms(query);
+  const bridged = [...new Set([...bridge.latin, ...bridge.han])].filter(token => !direct.includes(token));
+  const byLength = (list: string[]) => list.sort((a, b) => b.length - a.length);
+  return [...byLength(direct), ...byLength(bridged)].slice(0, 60);
 }
 
 /**
@@ -441,6 +466,7 @@ const recallStopWords = new Set(['实现', '功能', '主动', '调用', '参考
   '可以', '帮我', '我们', '一下', '之后', '之前', '所有', '相关', '处理', '检查']);
 
 function automaticRelevance(content: Knowledge, query: string): { score: number; matched: string[]; coverage: number } {
+  if (!mayAutomaticallyRecall(content)) return { score: 0, matched: [], coverage: 0 };
   if (query.trim().replace(/@\d+$/, '') === content.id) return { score: 100, matched: [content.id], coverage: 1 };
   // Strip whole filler phrases before bigram tokenization; filtering afterwards
   // leaves artificial cross-boundary fragments (检查功能 -> 查功).
@@ -1496,6 +1522,7 @@ export class Store {
     // irrelevant to norms (expiry is a property of material alone), so the narrowed
     // read is equivalent and returns exactly the same rows.
     return this.currentOfKind(['norm'])
+      .filter(e => memoryIsLive(e.content, this.now()))
       .filter(e => e.content.kind === 'norm' && applicable(e.content.scope, projectId, options?.taskId))
       // Platform applicability is a real dimension of a norm, not documentation:
       // a rule the user marked `codex-only` must not be injected into DSH, and an
@@ -1511,12 +1538,13 @@ export class Store {
    * not callers that need the identity and status alongside it. This keeps the
    * scope filter while preserving the shape those callers already depend on.
    */
-  scopedEntries(projectId: string) {
-    return this.liveEntries().filter(e => applicable(e.content.scope, projectId));
+  scopedEntries(projectId: string, taskId?: string) {
+    return this.liveEntries().filter(e => applicable(e.content.scope, projectId, taskId));
   }
   search(projectId: string, query: string, limit = 8) {
     const entries = this.liveEntries(); const all = new Map(entries.map(x => [x.id, x]));
-    const tokens = queryTokens(query);
+    // Explicit search: a bridged miss costs nothing here, an unbridged miss costs the answer.
+    const tokens = expandedQueryTokens(query);
     // With no query this lists every workflow. That is what a browsing caller
     // wants — the console's workflow panel shows the catalog before anything is
     // typed. Injection is a different question, and `prepare()` decides it: an
@@ -1590,7 +1618,7 @@ export class Store {
      * 因为它传的是空字符串，于是 excerpt 永远退回正文开头、hitChunks 永远是 null。而当时的测试
      * 测的是 `knowledge()` 直调，所以没抓到。**测了函数不等于测了那条真正在跑的路。**
      */
-    excerptQuery?: string) {
+    excerptQuery?: string, taskId?: string) {
     const entries = this.liveEntries();
     const all = new Map(entries.map(x => [x.id, x]));
     const tokens = queryTokens(query);
@@ -1632,7 +1660,7 @@ export class Store {
       // what the task did.
       if (content.kind !== 'skill' && content.kind !== 'memory'
         && content.kind !== 'preference' && content.kind !== 'journal') continue;
-      if (!applicable(content.scope, projectId)) continue;
+      if (!applicable(content.scope, projectId, taskId)) continue;
       const body = content.kind === 'journal' ? content.did : content.body;
       result.push({
         id: entry.id, revision: entry.revision, kind: content.kind, title: content.title,
@@ -1693,8 +1721,8 @@ export class Store {
     return result;
   }
   /** Automatic selection has absolute evidence thresholds; explicit search does not. */
-  private automaticMatches(projectId: string, query: string) {
-    return new Map(this.liveEntries().filter(entry => applicable(entry.content.scope, projectId))
+  private automaticMatches(projectId: string, query: string, taskId?: string) {
+    return new Map(this.liveEntries().filter(entry => applicable(entry.content.scope, projectId, taskId))
       .map(entry => [entry.id, automaticRelevance(entry.content, query)] as const)
       .filter(([, reason]) => reason.score > 0));
   }
@@ -1710,14 +1738,15 @@ export class Store {
    * Universal search across all knowledge kinds: norm, preference, memory, skill, journal, workflow, material.
    * Allows manual filtering by kind and full-text keyword retrieval.
    */
-  searchUniversal(projectId: string, query = '', kindFilter?: string, limit = 100) {
-    const entries = this.liveEntries();
-    const tokens = queryTokens(query);
+  searchUniversal(projectId: string, query = '', kindFilter?: string, limit = 100, taskId?: string, includeSources = false) {
+    const entries = this.liveEntries(includeSources);
+    // Explicit search: the bridge is what lets an English question reach a Chinese entry.
+    const tokens = expandedQueryTokens(query);
     const matches = tokens.length ? matchAll(this.db, tokens, 0.3) : [];
     const reasonFor = new Map(matches.map(m => [m.id, m]));
     const matchedIds = new Set(matches.map(m => m.id));
 
-    let candidates = entries.filter(e => applicable(e.content.scope, projectId));
+    let candidates = entries.filter(e => applicable(e.content.scope, projectId, taskId));
     if (kindFilter && kindFilter !== 'all') {
       candidates = candidates.filter(e => e.content.kind === kindFilter);
     }
@@ -1725,7 +1754,7 @@ export class Store {
     if (tokens.length) {
       candidates = candidates.filter(e => {
         if (matchedIds.has(e.id)) return true;
-        const text = `${e.id} ${e.content.title} ${'body' in e.content ? e.content.body : ''}`.toLowerCase();
+        const text = JSON.stringify(retrievalContent(e.content)).toLowerCase();
         return tokens.some(t => text.includes(t.toLowerCase()));
       });
       candidates.sort((a, b) => {
@@ -1738,6 +1767,8 @@ export class Store {
     return candidates.slice(0, limit).map(entry => {
       const c = entry.content as Record<string, unknown>;
       const body = typeof c.body === 'string' ? c.body : (typeof c.overview === 'string' ? c.overview : (typeof c.did === 'string' ? c.did : (typeof c.summary === 'string' ? c.summary : '')));
+      const passages = query.trim() ? relevantPassages(body, query, 800) : [];
+      const assessment = entry.content.kind === 'memory' || entry.content.kind === 'journal' ? assessMemory(body) : undefined;
       return {
         id: entry.id,
         revision: entry.revision,
@@ -1751,7 +1782,22 @@ export class Store {
         scope: entry.content.scope,
         provenance: entry.content.provenance,
         evidence: entry.content.evidence,
-        excerpt: body.length > 300 ? `${body.slice(0, 300)}…` : body,
+        ...(entry.content.support ? { support: { status: entry.content.support.status, references: entry.content.support.references.length,
+          origin: entry.content.support.origin, note: 'Evidence retained; capture does not mean independently verified. Read the entry for snapshots.' } } : {}),
+        excerpt: passages[0]?.text ?? (body.length > 300 ? `${body.slice(0, 300)}…` : body),
+        ...(passages.length ? { matchedPassages: passages } : {}),
+        ...(entry.content.validity ? { validity: entry.content.validity } : {}),
+        ...(entry.content.applicability ? { applicability: entry.content.applicability } : {}),
+        ...(entry.content.curation ? { curation: {
+          batchId: entry.content.curation.batchId, role: entry.content.curation.role,
+          scopeStatus: entry.content.curation.scopeStatus, durability: entry.content.curation.durability,
+          domain: entry.content.curation.domain,
+          sources: entry.content.curation.sources.slice(0, 3).map(({ id, revision }) => ({ id, revision })),
+          sourceCount: entry.content.curation.sources.length,
+          members: entry.content.curation.members.slice(0, 5), memberCount: entry.content.curation.members.length,
+          continuation: 'Read this entry for the complete source evidence and member list.',
+        } } : {}),
+        ...(assessment?.mixedContexts ? { assessment, caution: '这是多个事件的历史记录，不能把其中的短期状态当成当前事实或通用禁则；请按日期与适用条件核对。' } : {}),
         chars: body.length,
         why: reasonFor.get(entry.id) ?? null,
       };
@@ -1800,10 +1846,10 @@ export class Store {
    * `read` is a retrieval path and must apply the expiry gate. (`liveEntries()`
    * is where that gate lives; see its comment.)
    */
-  private resolveVisible(id: string, projectId: string, options: { includeExpired?: boolean } = {}): Entry {
+  private resolveVisible(id: string, projectId: string, options: { includeExpired?: boolean; taskId?: string } = {}): Entry {
     const { id: bareId, requestedRevision } = this.resolveKnowledgeId(id);
-    const entry = this.liveEntries().find(candidate => candidate.id === bareId);
-    if (!entry || !applicable(entry.content.scope, projectId)) {
+    const entry = (options.includeExpired ? this.current() : this.liveEntries(true)).find(candidate => candidate.id === bareId);
+    if (!entry || !applicable(entry.content.scope, projectId, options.taskId)) {
       throw new DomainError('not_found', `Knowledge entry ${bareId} is unavailable`, 404);
     }
     if (!options.includeExpired && entry.content.kind === 'material' && !isLive(entry.content.expiresAt, this.now())) {
@@ -1850,7 +1896,7 @@ export class Store {
    * companion entry exist", which is exactly as relevant for a norm as for a
    * skill.
    */
-  readKnowledge(projectId: string, id: string, includeLeaves = false): {
+  readKnowledge(projectId: string, id: string, includeLeaves = false, taskId?: string): {
     id: string; revision: number; kind: Knowledge['kind']; title: string; body: string;
     /** Present only for skills; a memory has no structure to await. */
     needsStructure?: boolean;
@@ -1858,6 +1904,11 @@ export class Store {
     overview?: string;
     /** Material's own fields, so a reader knows the source and when it lapses. */
     url?: string; savedAt?: number; expiresAt?: number;
+    validity?: Knowledge['validity']; applicability?: Knowledge['applicability'];
+    scope: Scope; provenance: Knowledge['provenance']; evidence: Knowledge['evidence'];
+    assessment?: MemoryAssessment;
+    curation?: Knowledge['curation'];
+    support?: Knowledge['support'];
     /** Set for preferences and journals, so an inference is not read as a statement. */
     stated?: boolean; outcome?: 'success' | 'failure' | 'unverified';
     leaves: Array<{ path: string; body: string }>;
@@ -1870,7 +1921,7 @@ export class Store {
     relations: Array<{ direction: 'replaced' | 'supplemented' | 'replaced-by' | 'supplemented-by'; id: string; revision: number; reason: string }>;
   } {
     // Retrieval path: the expiry gate applies, so lapsed material is not served.
-    const entry = this.resolveVisible(id, projectId);
+    const entry = this.resolveVisible(id, projectId, { taskId });
     const content = entry.content;
     const relations = this.supersessions(entry.id, projectId).map(link => ({
       direction: (link.oldKnowledgeId === entry.id
@@ -1895,13 +1946,21 @@ export class Store {
         case 'norm':
         case 'preference':
         case 'material': return entryContent.body;
-        case 'journal': return entryContent.did;
+        case 'journal': return entryContent.did
+          + (entryContent.problems ? '\n\n## 问题与限制\n' + entryContent.problems : '')
+          + (entryContent.unfinished.length ? '\n\n## 未完成事项\n' + entryContent.unfinished.join('\n') : '');
         case 'workflow': return entryContent.overview;
       }
     };
     const base = {
       id: entry.id, revision: entry.revision, kind: content.kind, title: content.title,
       body: proseOf(content), relations,
+      scope: content.scope, provenance: content.provenance, evidence: content.evidence,
+      ...(content.curation ? { curation: content.curation } : {}),
+      ...(content.support ? { support: content.support } : {}),
+      ...(['memory', 'journal'].includes(content.kind) ? { assessment: assessMemory(proseOf(content)) } : {}),
+      ...(content.validity ? { validity: content.validity } : {}),
+      ...(content.applicability ? { applicability: content.applicability } : {}),
     };
     switch (content.kind) {
       case 'skill':
@@ -2085,7 +2144,7 @@ export class Store {
      * entry, so a model decision stays distinguishable from a local ranking.
      */
     const automaticMatches: Map<string, { score: number; matched: string[]; coverage: number; source?: string }> =
-      this.automaticMatches(projectId, query);
+      this.automaticMatches(projectId, query, options?.taskId);
     if(options?.selectedIds) {
       const byId = new Map(this.liveEntries().map(entry => [entry.id, entry] as const));
       const ranked = options.selectedIds.map((id,index) => {
@@ -2113,9 +2172,14 @@ export class Store {
        * can see and this matcher cannot, so requiring a literal token match here would throw
        * away the one path that works.
        */
-      .filter(([, value]) => value.source === 'model' || value.matched.length > 0 || value.coverage > 0);
+      .filter(([id, value]) => {
+        const content = byId.get(id)?.content;
+        return !!content && mayAutomaticallyRecall(content) && (value.source === 'model' || value.matched.length > 0 || value.coverage > 0);
+      });
+      const taskMatches = options.taskId ? [...automaticMatches].filter(([id]) => byId.get(id)?.content.scope.kind === 'task') : [];
       automaticMatches.clear();
       for(const [id,value] of ranked) automaticMatches.set(id,value);
+      for(const [id,value] of taskMatches) automaticMatches.set(id,value);
     }
     const rankAutomatic = <T extends { id: string }>(entries: T[], limit: number) => entries
       .filter(entry => automaticMatches.has(entry.id))
@@ -2129,7 +2193,7 @@ export class Store {
     // 空 query 是**故意的**：它让 knowledge() 列出全部候选，排序交给下面的 rankAutomatic。
     // 但片段必须按真实查询取（第六个参数），否则注入的永远是正文开头 —— 这个漏洞让"excerpt
     // 改成相关段落"的修复在真实路径上静默失效了一整轮。
-    const knowledge = hasQuery ? rankAutomatic(this.knowledge(projectId, '', Number.MAX_SAFE_INTEGER, 400, 0.5, query), 5) : [];
+    const knowledge = hasQuery ? rankAutomatic(this.knowledge(projectId, '', Number.MAX_SAFE_INTEGER, 400, 0.5, query, options?.taskId), 5) : [];
     /**
      * The record of what this retrieval did, and what it could not find.
      *
@@ -2374,6 +2438,7 @@ export class Store {
           '</memory-data>']
         : []),
       '【AMB 双向记忆】Codex/DSH 各项目会话共用此库。任务开始或遇到新错误，用 `amb_search_universal` 按任务/错误签名检索知识、经验与日记，再用 `amb_read_knowledge` 读相关正文并核对适用条件。\n'
+      + '节选不等于查全：按分页/未读提示续查关联资料，逐项核对问题；任务记忆带 taskId。\n'
       + '验证根因或新方案后用 `amb_submit_experience` 提交候选：**先写规范、全面的描述再落库**——一条一个结论，写明适用与不适用范围、可复算的判据、证据以指针形式给出；**不要把流水原文、工具输出或整段源文件写进正文**（原文会在检索里与真正的条目竞争，并吃掉注入预算，从而降低之后每一次调用的准确度）。再附流程/步骤、修复和证据。pending=待审；queued_local=仅本机排队，均未采纳。自动捕获的失败事实待核实，不是规范。Stop不表示任务完成。',
     ].join('\n\n');
     // A caller that already received this revision gets a pointer instead of the
@@ -2381,6 +2446,31 @@ export class Store {
     // without this the same ~12,000 characters are re-sent dozens of times in one
     // task; the design asks for same-version reuse (§5.2) and forbids weakening a
     // rule, so the decision list still travels in full and only the prose repeats.
+    /**
+     * The gap between "what the query reached" and "what the library holds".
+     *
+     * A prepare that returns nothing, or returns less than the index selected, looks
+     * identical to a prepare that found everything — and that ambiguity is how an agent
+     * starts working on half the relevant material. The receipt already carries the
+     * numbers; this turns them into one sentence that cannot be mistaken for "done".
+     */
+    const recallAdvice = (() => {
+      // With no query there is nothing to be incomplete about: the caller is browsing, not asking.
+      if (!String(query ?? '').trim()) return '';
+      const considered = Number((retrieval as { considered?: number })?.considered ?? 0);
+      const shown = Number((retrieval as { shown?: number })?.shown ?? 0);
+      const withheld = Number((retrieval as { withheld?: { count?: number } })?.withheld?.count ?? 0);
+      const gaps = Array.isArray((retrieval as { gaps?: unknown })?.gaps) ? (retrieval as { gaps: string[] }).gaps : [];
+      if (!considered || (!withheld && !gaps.length && shown > 0)) return '';
+      return [
+        '【动手前先补检】本次自动召回并不完整：',
+        `可见条目 ${considered} 条、本次注入 ${shown} 条`,
+        withheld ? `，${withheld} 条候选未通过字面复核` : '',
+        gaps.length ? `，未覆盖词：${gaps.slice(0, 6).join('、')}` : '',
+        '。在写代码或下结论之前，先用 amb_search_universal 换一种说法（含英文与同义说法）复核，',
+        '必要时用 amb_read_knowledge 读正文；确认没有更多相关条目再动手。',
+      ].join('');
+    })();
     const unchanged = options?.knownRevision !== undefined && options.knownRevision === this.revision;
     /**
      * Continuity is exempt from the same-version shortcut.
@@ -2403,7 +2493,9 @@ export class Store {
             // Progress is library content too, so it keeps the same boundary as the full block.
             ...(continuationBlock.length ? ['<memory-data>', ...continuationBlock, '</memory-data>'] : []),
           ].join('\n')
-        : context,
+        // The advice rides with the full block only: on an unchanged revision it was already
+        // given, and repeating it would undo the whole point of the pointer.
+        : (recallAdvice ? `${context}\n\n${recallAdvice}` : context),
       contextUnchanged: unchanged,
       budget: {
         limitChars: this.normBudgetChars,
@@ -2505,9 +2597,9 @@ export class Store {
    * matching the current constant and the current text, is already current and is
    * reported as skipped rather than rewritten.
    */
-  private classifyForStorage(text: string, projectId: string): SemanticAnalysis & { classifierVersion: string; textDigest: string } {
+  private classifyForStorage(text: string, projectId: string, context: { taskId?: string; memoryContext?: MemoryContext } = {}): SemanticAnalysis & { classifierVersion: string; textDigest: string } {
     return {
-      ...classifyCandidate(text, this.classificationCandidates(projectId)),
+      ...classifyCandidate(text, this.classificationCandidates(projectId), context),
       classifierVersion: CLASSIFIER_VERSION,
       textDigest: digest(text.trim()),
     };
@@ -2521,8 +2613,9 @@ export class Store {
    * the receipt here keeps both branches in one shape for callers while leaving the
    * internals unannotated.
    */
-  submit(principal: string, payload: { idempotencyKey: string; projectId: string; taskId?: string; workflowId?: string; stageId?: string; baseRevision?: number; discovery: string; evidence?: string }): {
+  submit(principal: string, payload: { idempotencyKey: string; projectId: string; taskId?: string; sessionId?: string; workflowId?: string; stageId?: string; baseRevision?: number; discovery: string; evidence?: string; evidenceRefs?: EvidenceReference[]; memoryContext?: MemoryContext }): {
     id: string; state: string; duplicate: boolean; duplicateOf?: string;
+    disposition?: 'discarded_low_value';
     /**
      * Present for a new submission; omitted on the retry branch.
      *
@@ -2549,6 +2642,7 @@ export class Store {
      * later receipt untrustworthy.
      */
     redacted?: RedactionFinding[];
+    evidenceStatus?: Support['status'];
   } {
     /**
      * Which review tier this candidate falls into, decided here rather than at each
@@ -2720,7 +2814,28 @@ export class Store {
           ? {}
           : { evidence: redactInString(submission.evidence, 'evidence', redactionFindings) }),
       };
-      const classification = this.classifyForStorage(payload.discovery, payload.projectId);
+      const task = submission.taskId ? this.getTask(submission.taskId, submission.projectId)
+        : submission.sessionId ? this.taskForSession(submission.projectId, submission.sessionId) : undefined;
+      /**
+       * Evidence the caller did not have to type.
+       *
+       * A session already records what it did, and every task/step event has a stable
+       * id that either resolves or does not. Asking an agent to restate those as
+       * evidence is asking it to do bookkeeping that a program does exactly — and the
+       * practical result of asking is that it does not, so the claim arrives with
+       * nothing behind it while the proof sits one table away.
+       *
+       * A submission that cites nothing therefore inherits the nearest events of its
+       * own task (or session) as `event` references, marked `autoCollected`. They are
+       * checkable, attaching them does not raise the evidence level, and a task with no
+       * events at all still ends up honestly `missing` rather than silently empty.
+       */
+      const cited = submission.evidenceRefs?.length ? submission.evidenceRefs
+        : this.autoEvidenceFor(submission.projectId, task?.id, submission.sessionId);
+      const support = captureSupport({ kind: 'proposal', id, principal, projectId: submission.projectId,
+        ...(task ? { taskId: task.id } : {}), sessionIds: [...new Set([...(task?.sessionIds ?? []), ...(submission.sessionId ? [submission.sessionId] : [])])].slice(0, 100),
+        capturedAt: this.now() }, submission.evidence, cited);
+      const classification = this.classifyForStorage(payload.discovery, payload.projectId, submission);
       /**
        * An identical candidate already waiting is a duplicate, not a new discovery.
        *
@@ -2748,8 +2863,26 @@ export class Store {
         "SELECT id,payload FROM proposals WHERE project_id=? AND state IN ('pending','needs_evidence') ORDER BY created_at",
       ).all(payload.projectId).find(row => {
         try {
-          const stored = JSON.parse(String((row as { payload: string }).payload)) as { discovery?: string };
-          return typeof stored.discovery === 'string' && digest(stored.discovery.trim()) === discoveryDigest;
+          const stored = JSON.parse(String((row as { payload: string }).payload)) as { discovery?: string; taskId?: string; sessionId?: string; evidence?: string; evidenceRefs?: EvidenceReference[]; memoryContext?: MemoryContext };
+          /**
+           * What counts as "the same submission": the text, the task, the session, and the
+           * evidence the caller cited.
+           *
+           * `memoryContext` is excluded on purpose — it is derived (auto-classification now
+           * fills it), so two identical texts would stop being duplicates the moment the
+           * plugin began inferring a domain. Automatic references are excluded for the same
+           * reason: they are collected from the event stream and grow as the session runs, so
+           * comparing them would make every resubmission look new.
+           */
+          const citedRefs = (refs?: EvidenceReference[]) => stableJson((refs ?? []).filter(ref => !ref.autoCollected));
+          return typeof stored.discovery === 'string' && digest(stored.discovery.trim()) === discoveryDigest
+            && stored.taskId === payload.taskId
+            // Only the caller's own declaration takes part here; the plugin's inference lives
+            // in `autoClassification` and must not decide whether two texts are the same submission.
+            && stableJson(stored.memoryContext ?? {}) === stableJson(payload.memoryContext ?? {})
+            && stored.sessionId === payload.sessionId
+            && stored.evidence === (stored.evidence === undefined && !submission.evidence ? undefined : support.summary)
+            && citedRefs(stored.evidenceRefs) === citedRefs(support.references);
         } catch { return false; }
       }) as { id: string } | undefined;
       /**
@@ -2792,6 +2925,8 @@ export class Store {
         || classification.needsSplit;
       const record = {
         ...stored,
+        evidenceRefs: support.references,
+        support,
         review: { tier: decision.tier, reason: decision.reason, constraint: decision.constraint },
         classification,
         /**
@@ -2831,10 +2966,27 @@ export class Store {
       if (pendingTwin) {
         return { id: pendingTwin.id, state: 'pending', duplicate: true, duplicateOf: pendingTwin.id, review: decision };
       }
+      const noise = classification.assessment?.value === 'noise';
+      /**
+       * 第一时间分类：把分类结果落进候选，不等人确认。
+       *
+       * 分类器在提交时已经跑过（`classifyForStorage`），但结果此前只作为审阅参考存着：
+       * 调用方不传 `memoryContext` 时，采纳后的条目 applicability 为空，"这条是规范还是
+       * 经验、属于哪类工作"要等几个月后由人回忆。
+       *
+       * 两条落定边界，都是有意的：
+       * - kind/scope 只在 `autoPromotable` 为真时落。norm 参与门禁，推断不能自封。
+       * - domain 只做导航，任何时候都落；未知域不写，词表受控。
+       */
+      const autoContext = this.autoApplicability(payload.discovery, classification, payload.memoryContext);
+      const state = noise ? 'rejected' : 'pending';
       this.db.prepare('INSERT INTO proposals(id,principal,idem,fingerprint,payload,state,created_at,expires_at,project_id) VALUES(?,?,?,?,?,?,?,?,?)')
-        .run(id, principal, payload.idempotencyKey, fingerprint, JSON.stringify(record), 'pending', this.now(),
+        .run(id, principal, payload.idempotencyKey, fingerprint, JSON.stringify({ ...record,
+          ...(autoContext ? { autoClassification: autoContext } : {}),
+          ...(noise ? { intake: { disposition: 'discarded_low_value', reason: classification.promotionBlockedReason } } : {}),
+        }), state, this.now(),
           conflict ? Number.MAX_SAFE_INTEGER : this.now() + 30 * DAY, payload.projectId);
-      this.jobs.enqueue('model_review', `proposal:${id}`, { proposalId: id, projectId: payload.projectId });
+      if (!noise) this.jobs.enqueue('model_review', `proposal:${id}`, { proposalId: id, projectId: payload.projectId });
       if (payload.taskId) {
         const task = this.getTask(payload.taskId, payload.projectId)!;
         this.recordTask(payload.projectId, { id: task.id, title: task.title, status: task.status,
@@ -2849,7 +3001,7 @@ export class Store {
        * confirm where it belongs.
        */
       return {
-        id, state: 'pending', duplicate: false, review: decision,
+        id, state, duplicate: false, review: decision, evidenceStatus: support.status,
         /**
          * What was replaced on the way in, so the submitter learns their text was altered.
          *
@@ -2874,6 +3026,8 @@ export class Store {
             ? `workflow ${payload.workflowId} 不存在或不可见，候选已按未归属保存，请人工确认它应归属哪个流程/步骤。`
             : '本条候选未标注归属流程，已按未归属保存，请人工确认它应归属哪个流程/步骤。',
         }),
+        ...(noise ? { note: '内容为确认语、状态词或缺乏信息的文本，已记录拒收回执，未进入长期知识或模型审核队列。' } : {}),
+        ...(noise ? { disposition: 'discarded_low_value' as const } : {}),
       };
     });
   }
@@ -3945,6 +4099,104 @@ export class Store {
     return Number(result.changes);
   }
   allEntries() { return this.current(); }
+
+  /** Offline, explicitly authorized data migration; one transaction and a durable receipt. */
+  applyCurationBatch(input: {
+    batchId: string; planHash: string; entries: KnowledgeDraft[];
+    sources: Array<{ id: string; revision: number; hash: string }>;
+  }): { batchId: string; state: string; changed: number; knowledgeRevision: number; duplicate: boolean } {
+    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(input.batchId) || !/^[a-f0-9]{64}$/.test(input.planHash))
+      throw new DomainError('invalid_request', 'Invalid curation batch identity');
+    return this.transaction(() => {
+      const key = `curation:batch:${input.batchId}`;
+      const old = this.db.prepare('SELECT value FROM meta WHERE key=?').get(key) as { value: string } | undefined;
+      if (old) {
+        const receipt = JSON.parse(old.value);
+        if (receipt.planHash !== input.planHash || receipt.state !== 'applied')
+          throw new DomainError('curation_conflict', 'Batch exists with different content or has been rolled back', 409);
+        return { batchId: input.batchId, state: 'applied', changed: receipt.changes.length, knowledgeRevision: this.revision, duplicate: true };
+      }
+      const sourceIds = new Set(input.sources.map(source => source.id));
+      for (const source of input.sources) {
+        const row = this.db.prepare(`SELECT k.head,k.status,r.content FROM knowledge k JOIN revisions r ON k.id=r.id AND k.head=r.revision WHERE k.id=?`).get(source.id) as { head: number; status: string; content: string } | undefined;
+        if (!row || row.status !== 'active' || row.head !== source.revision
+          || createHash('sha256').update(row.content).digest('hex') !== source.hash)
+          throw new DomainError('curation_source_changed', `Source changed since review: ${source.id}`, 409);
+      }
+      const changes = input.entries.map(draft => {
+        const entry = knowledgeSchema.parse(draft);
+        const before = this.head(entry.id);
+        if (before) {
+          if (!sourceIds.has(entry.id) || before.content.kind === 'norm')
+            throw new DomainError('curation_protected', `Cannot alter unreviewed or normative entry: ${entry.id}`, 409);
+          // Existing prose, authority, kind and scope stay byte-equivalent. Only browsing
+          // metadata and the archival retrieval role may change during this migration.
+          const protectedContent = (content: Knowledge) => {
+            const { labels, aliases, keywords, baseRevision, curation, ...rest } = content;
+            return rest;
+          };
+          if (stableJson(protectedContent(entry)) !== stableJson(protectedContent(before.content)))
+            throw new DomainError('curation_protected', `Curation cannot rewrite original prose or authority: ${entry.id}`, 409);
+          if (entry.kind === 'skill' && entry.curation)
+            throw new DomainError('curation_protected', 'A skill must retain its original retrieval role', 409);
+        } else {
+          if (!['memory', 'journal'].includes(entry.kind) || !entry.curation || entry.curation.batchId !== input.batchId
+            || entry.provenance !== 'agent' || entry.evidence === 'observed')
+            throw new DomainError('curation_protected', 'Derived entries must be non-normative, agent-authored and must not claim observed evidence', 409);
+          for (const reference of entry.curation.sources) {
+            const source = this.head(reference.id);
+            const expected = input.sources.find(item => item.id === reference.id);
+            if (!source || !expected || reference.revision !== expected.revision || reference.hash !== expected.hash
+              || !scopeCovers(entry.scope, source.content.scope))
+              throw new DomainError('curation_scope', `Unverified or broader source attribution: ${reference.id}`, 409);
+            if (reference.quote) {
+              const clean = redactDeep(source.content, 'source').value;
+              const prose = 'body' in clean ? clean.body : clean.kind === 'journal' ? clean.did : clean.kind === 'workflow' ? clean.overview : '';
+              if (!prose.includes(reference.quote)) throw new DomainError('curation_evidence', `Quote is not present in source: ${reference.id}`, 409);
+            }
+          }
+          if (entry.curation.role === 'record' && !entry.curation.sources.some(reference => reference.quote))
+            throw new DomainError('curation_evidence', 'A curated record requires an exact source quote', 409);
+        }
+        return { id: entry.id, beforeRevision: before?.revision ?? null, afterRevision: entry.baseRevision + 1 };
+      });
+      const knowledgeRevision = this.import(input.entries);
+      this.db.prepare('INSERT INTO meta(key,value) VALUES(?,?)').run(key, JSON.stringify({
+        batchId: input.batchId, planHash: input.planHash, state: 'applied', at: this.now(), changes,
+      }));
+      return { batchId: input.batchId, state: 'applied', changed: changes.length, knowledgeRevision, duplicate: false };
+    });
+  }
+
+  /** Forward rollback: restore old source contents as new revisions; retain derived history. */
+  rollbackCurationBatch(batchId: string) {
+    return this.transaction(() => {
+      const key = `curation:batch:${batchId}`;
+      const row = this.db.prepare('SELECT value FROM meta WHERE key=?').get(key) as { value: string } | undefined;
+      if (!row) throw new DomainError('not_found', 'Curation batch is unavailable', 404);
+      const receipt = JSON.parse(row.value) as { state: string; changes: Array<{ id: string; beforeRevision: number | null; afterRevision: number }> };
+      if (receipt.state === 'rolled_back') return { batchId, state: 'rolled_back', duplicate: true };
+      for (const change of receipt.changes) {
+        const head = this.head(change.id);
+        if (!head || head.status !== 'active' || head.revision !== change.afterRevision)
+          throw new DomainError('curation_rollback_conflict', `Entry changed after curation: ${change.id}`, 409);
+      }
+      const restore: KnowledgeDraft[] = [];
+      for (const change of receipt.changes) {
+        if (change.beforeRevision !== null) {
+          const old = this.db.prepare('SELECT content FROM revisions WHERE id=? AND revision=?').get(change.id, change.beforeRevision) as { content: string };
+          restore.push({ ...JSON.parse(old.content), baseRevision: change.afterRevision });
+        } else {
+          this.db.prepare("UPDATE knowledge SET status='retired' WHERE id=?").run(change.id);
+          this.db.prepare('DELETE FROM workflow_search WHERE id=?').run(change.id);
+        }
+      }
+      if (restore.length) this.import(restore);
+      else this.db.prepare("UPDATE meta SET value=value+1 WHERE key='revision'").run();
+      this.db.prepare('UPDATE meta SET value=? WHERE key=?').run(JSON.stringify({ ...receipt, state: 'rolled_back', rolledBackAt: this.now() }), key);
+      return { batchId, state: 'rolled_back', duplicate: false };
+    });
+  }
   /**
    * The library as it stood at one moment.
    *
@@ -4009,7 +4261,7 @@ export class Store {
    * verdict cannot promote itself must not be adopted on a bare click at all — from any
    * entry point, which is why it is enforced here and not in a client.
    */
-  approveProposal(id: string, entry: KnowledgeDraft, options: { allowGlobalScope?: boolean; actor?: string; projectId?: string; classificationAcknowledged?: boolean } = {}): number {
+  approveProposal(id: string, entry: KnowledgeDraft, options: { allowGlobalScope?: boolean; actor?: string; projectId?: string; classificationAcknowledged?: boolean; waiverReason?: string } = {}): number {
     /**
      * A blank title is filled in here, not refused.
      *
@@ -4021,10 +4273,10 @@ export class Store {
      * step that gets skipped — leaving either a disabled button or an entry named after
      * its own uuid. One rule at the core, and every surface inherits it.
      */
-    const validated = knowledgeSchema.parse(this.withCandidateTitle(id, entry));
+    let validated = knowledgeSchema.parse(this.withCandidateTitle(id, entry));
     return this.transaction(() => {
-      const row = this.db.prepare('SELECT state,payload,project_id FROM proposals WHERE id=?').get(id) as
-        { state: string; payload: string; project_id: string } | undefined;
+      const row = this.db.prepare('SELECT state,payload,project_id,principal,created_at FROM proposals WHERE id=?').get(id) as
+        { state: string; payload: string; project_id: string; principal: string; created_at: number } | undefined;
       if (!row || row.state !== 'pending') throw new DomainError('not_found', 'Proposal not found or not pending', 404);
       // The outer credential check looked at the envelope's projectId, never at the
       // *proposal* being approved. Without this a credential for one project could
@@ -4032,7 +4284,26 @@ export class Store {
       if (options.projectId !== undefined && row.project_id !== options.projectId)
         throw new DomainError('scope_denied', `Proposal ${id} belongs to another project`, 403);
 
-      const payload = JSON.parse(row.payload || '{}') as { projectId?: string; workflowId?: string; baseRevision?: number; classification?: unknown };
+      const payload = JSON.parse(row.payload || '{}') as { projectId?: string; taskId?: string; sessionId?: string; workflowId?: string; baseRevision?: number; classification?: unknown; discovery?: string; memoryContext?: MemoryContext; autoClassification?: MemoryContext;
+        evidence?: string; evidenceRefs?: EvidenceReference[]; support?: Support; supplements?: Support['supplements'] };
+      // Re-evaluate at the write boundary, including legacy candidates. A stale
+      // classification or an acknowledgement cannot turn an outage into a permanent rule.
+      const assessment = assessMemory(payload.discovery ?? '', payload.memoryContext);
+      if (assessment.durability === 'temporary') {
+        if (validated.scope.kind === 'global' || validated.kind === 'norm' || validated.kind === 'skill' || validated.kind === 'workflow')
+          throw new DomainError('temporary_memory_requires_event', '短期状态或未核实故障只能采纳为有有效期的事件/事实，不能成为全局知识、硬规范或技能；验证后另行提交有适用条件的新结论', 409);
+        if (payload.taskId && (validated.scope.kind !== 'task' || validated.scope.taskId !== payload.taskId))
+          throw new DomainError('temporary_memory_requires_task', '该短期事实必须留在来源任务，不能扩展为项目经验', 409);
+        validated = { ...validated,
+          applicability: payload.memoryContext,
+          validity: { expiresAt: Math.min(validated.validity?.expiresAt ?? Infinity, this.now() + TEMPORARY_MEMORY_TTL),
+            reason: '短期状态/未核实事件；到期后退出检索，历史保留；使用前重新验证',
+            appliesWhen: assessment.appliesWhen, invalidatedWhen: assessment.invalidatedWhen },
+        };
+      } else if (payload.memoryContext ?? payload.autoClassification) {
+        // 调用方的声明优先；没有声明时才用插件推断补位。
+        validated = { ...validated, applicability: (payload.memoryContext ?? payload.autoClassification) as MemoryContext };
+      }
       /**
        * The review gate, enforced where the write happens.
        *
@@ -4051,7 +4322,7 @@ export class Store {
        * "the program has no opinion" is a reason to ask a person, not a reason to
        * proceed.
        */
-      const gate = classificationApprovalGate(payload.classification);
+      const gate = this.proposalClassificationGate(id, row.project_id);
       if (gate.required && options.classificationAcknowledged !== true) {
         throw new DomainError('classification_confirmation_required',
           `该候选不能在没有人工确认的情况下采纳：${gate.reason}`
@@ -4100,6 +4371,34 @@ export class Store {
         }
       }
 
+      // Freeze evidence into the same immutable revision as the adopted claim. The
+      // proposal queue may later be cleared; its supporting material must survive it.
+      const prior = this.head(validated.id);
+      const origin = payload.support?.origin ?? { kind: 'proposal', id, principal: row.principal,
+        projectId: row.project_id, ...(payload.taskId ? { taskId: payload.taskId } : {}),
+        sessionIds: payload.sessionId ? [payload.sessionId] : [], capturedAt: row.created_at };
+      let support = captureSupport(origin, payload.evidence, payload.evidenceRefs, payload.supplements);
+      /**
+       * An unsupported claim may be recorded, but it never becomes advice.
+       *
+       * Everything here is automatic and asks nothing of a reviewer: the write is not
+       * blocked, no justification is collected, and no queue is created for a person to
+       * work through. What changes is the entry's own state — a waiver is attached at
+       * the same instant the claim is frozen, so the read path, the search receipt and
+       * the injection filter can all see that nothing stands behind this claim.
+       *
+       * The real protection lives in `mayAutomaticallyRecall`, which refuses both
+       * `missing` and waived entries. Putting the gate at promotion time instead would
+       * have turned every legacy item into a form to fill in, and blocking the write
+       * would have made an agent with nothing to cite go quiet — the two failure modes
+       * this change exists to remove.
+       */
+      if (support.status === 'missing') {
+        support = { ...captureSupport(origin, payload.evidence, payload.evidenceRefs, payload.supplements),
+          waiver: { reason: options.waiverReason?.trim() || '无证据：自动标记，不参与自动注入',
+            actor: options.actor ?? 'reviewer', at: this.now() } };
+      }
+      validated = { ...validated, support: { ...support, ...(prior ? { predecessor: { id: prior.id, revision: prior.revision } } : {}) } };
       const revision = this.importInsideTransaction([validated]);
       // The audit trail the design requires: who decided, when, and on what basis.
       // It lives in the payload so a cleared payload cannot erase the decision, and
@@ -4228,10 +4527,109 @@ export class Store {
       if (!row || row.project_id !== projectId) continue;
       let payload: Record<string, unknown> = {};
       try { payload = JSON.parse(row.payload || '{}') as Record<string, unknown>; } catch { /* an unreadable row cannot speak for itself, so it needs confirmation */ }
-      const gate = classificationApprovalGate(payload.classification);
+      const gate = this.proposalClassificationGate(id, projectId);
       if (gate.required) required.push({ id, gate });
     }
     return required;
+  }
+  /**
+   * Turn the classifier's verdict into a storable `applicability`.
+   *
+   * Nobody should have to remember, months later, whether a candidate was a rule or an
+   * experience. But an inference must not confer the one kind that takes part in gate
+   * decisions: when `autoPromotable` is false, kind and scope are left unset and the
+   * existing confirmation path still applies. `domain` is navigation only, so it is
+   * filled whenever the controlled vocabulary recognises the text.
+   */
+  private autoApplicability(text: string, classification: { kind: string; scope: string; autoPromotable: boolean }, existing?: MemoryContext): MemoryContext | undefined {
+    const inferred = inferDomain(text).domain;
+    if (existing) return !existing.domain && inferred ? { ...existing, domain: inferred } : existing;
+    const storable = ['norm', 'skill', 'memory', 'preference', 'material', 'journal'].includes(classification.kind);
+    const base: MemoryContext = {};
+    if (classification.autoPromotable && storable) {
+      base.kind = classification.kind as NonNullable<MemoryContext['kind']>;
+      base.scope = classification.scope as NonNullable<MemoryContext['scope']>;
+    }
+    if (inferred) base.domain = inferred;
+    return Object.keys(base).length ? base : undefined;
+  }
+  /**
+   * The nearest events of the same task or session, as checkable `event` references.
+   *
+   * Read-only and bounded: at most five, newest first, and only consulted when the
+   * caller cited nothing of its own. The `events_task` / `events_session` expression
+   * indexes exist for exactly this lookup, so it stays an index seek.
+   */
+  private autoEvidenceFor(projectId: string, taskId?: string, sessionId?: string): Array<{ kind: 'event'; locator: string; result: string; autoCollected: true }> {
+    const rows = taskId
+      ? this.db.prepare(`SELECT event_id, payload FROM events
+          WHERE json_extract(payload,'$.taskId')=? AND json_extract(payload,'$.projectId')=?
+          ORDER BY created_at DESC LIMIT 5`).all(taskId, projectId)
+      : sessionId
+        ? this.db.prepare(`SELECT event_id, payload FROM events
+            WHERE json_extract(payload,'$.sessionId')=? AND json_extract(payload,'$.projectId')=?
+            ORDER BY created_at DESC LIMIT 5`).all(sessionId, projectId)
+        : [];
+    return (rows as Array<{ event_id: string; payload: string }>).map(row => {
+      let label = 'event';
+      try { label = (JSON.parse(row.payload) as { kind?: string }).kind ?? 'event'; } catch { /* keep the default label */ }
+      return { kind: 'event' as const, locator: row.event_id, result: label, autoCollected: true as const };
+    });
+  }
+  /**
+   * Whether adopting this candidate would promote a claim that nothing supports.
+   *
+   * Read-only, and deliberately the same three-part test the write path applies
+   * (`summary`, `references`, `supplements` all empty). It exists so the HTTP edge
+   * can name the missing field in its refusal instead of surfacing a bare 409; the
+   * store still enforces the rule, because a gate living only in the edge is the
+   * mistake the classification gate already had to repair.
+   */
+  proposalEvidenceGate(id: string, projectId: string): { required: boolean; code: string; reason: string } {
+    const row = this.db.prepare('SELECT payload FROM proposals WHERE id=? AND project_id=?').get(id, projectId) as { payload: string } | undefined;
+    if (!row) throw new DomainError('not_found', 'Proposal is unavailable', 404);
+    let payload: Record<string, unknown> = {};
+    try { payload = JSON.parse(row.payload) as Record<string, unknown>; } catch { /* an unreadable payload carries no evidence either */ }
+    const hasSummary = typeof payload.evidence === 'string' && payload.evidence.trim().length > 0;
+    const references = Array.isArray(payload.evidenceRefs) ? payload.evidenceRefs : [];
+    const supplements = Array.isArray(payload.supplements) ? payload.supplements : [];
+    return !hasSummary && references.length === 0 && supplements.length === 0
+      ? { required: true, code: 'evidence_required',
+        reason: '该候选没有摘要、引用或补充材料，采纳后会成为无任何支撑的生效知识' }
+      : { required: false, code: 'evidence_present', reason: '' };
+  }
+  /** Model advice may tighten the review gate, never relax the deterministic one. */
+  proposalClassificationGate(id: string, projectId: string): ClassificationGate {
+    const row = this.db.prepare('SELECT payload FROM proposals WHERE id=? AND project_id=?').get(id, projectId) as { payload: string } | undefined;
+    if (!row) throw new DomainError('not_found', 'Proposal is unavailable', 404);
+    let payload: Record<string, unknown> = {};
+    try { payload = JSON.parse(row.payload); } catch { /* missing verdict needs review */ }
+    const gate = classificationApprovalGate(payload.classification);
+    if (gate.required) return gate;
+    if (typeof payload.discovery === 'string') {
+      const current = classifyCandidate(payload.discovery, [], {
+        ...(typeof payload.taskId === 'string' ? { taskId: payload.taskId } : {}),
+        ...(payload.memoryContext && typeof payload.memoryContext === 'object' ? { memoryContext: payload.memoryContext as MemoryContext } : {}),
+      });
+      if (!current.autoPromotable) return { ...gate, required: true, code: 'classification_confirmation_required',
+        reason: current.promotionBlockedReason ?? '当前分类器要求重新核对该候选' };
+    }
+    const review = this.db.prepare('SELECT result FROM model_reviews WHERE proposal_id=? AND project_id=?').get(id, projectId) as { result: string } | undefined;
+    if (!review) return gate;
+    try {
+      const result = JSON.parse(review.result);
+      if (result.mode !== 'model' || result.status !== 'analyzed') return gate;
+      const stale = typeof result.inputHash === 'string'
+        && result.inputHash !== createHash('sha256').update(row.payload).digest('hex');
+      const analysis = result.analysis;
+      if (stale || analysis?.relation === 'low_value' || analysis?.needsSplit === true
+        || (analysis?.kind && analysis.kind !== gate.kind) || (analysis?.scope && analysis.scope !== gate.scope)) {
+        return { ...gate, required: true, code: 'classification_confirmation_required',
+          reason: stale ? '模型建议基于旧文本，需重新核对'
+            : '模型建议与规则判定不一致，或识别出低价值/混合内容，需核对后确认；模型不能自行批准或删除知识' };
+      }
+    } catch { /* advice that cannot be decoded grants no permission */ }
+    return gate;
   }
   /**
    * Backfill the stored classification of the candidates still waiting for review.
@@ -4308,7 +4706,10 @@ export class Store {
         continue;
       }
 
-      const next = this.classifyForStorage(text, projectId);
+      const next = this.classifyForStorage(text, projectId, {
+        ...(typeof payload.taskId === 'string' ? { taskId: payload.taskId } : {}),
+        ...(payload.memoryContext && typeof payload.memoryContext === 'object' ? { memoryContext: payload.memoryContext as MemoryContext } : {}),
+      });
       const nextKind = typeof next.kind === 'string' ? next.kind : 'none';
       const nextAuto = typeof next.autoPromotable === 'boolean' ? next.autoPromotable : null;
       count(after, nextKind);
@@ -4781,6 +5182,7 @@ export class Store {
     projectId: string; sessionId?: string; taskId?: string; title?: string; idempotencyKey?: string;
     status?: TaskStatus; summary?: string; notes?: string; unfinished?: string[];
     verified?: string; evidence?: 'observed' | 'verifiable' | 'self-reported' | 'unverifiable';
+    evidenceRefs?: EvidenceReference[];
     files?: string[]; relatedExperiences?: string[]; relatedProposals?: string[];
   }): Record<string, unknown> {
     return this.transaction(() => {
@@ -4806,7 +5208,10 @@ export class Store {
         throw new DomainError('verification_required', 'Completed checkpoints require verified text and verifiable evidence');
       this.recordTask(input.projectId, { ...input, id: task.id, title: input.title ?? task.title, status,
         sessionIds: input.sessionId ? [...new Set([...task.sessionIds, input.sessionId])] : task.sessionIds });
-      const journal = this.writeJournal(task.id, input.projectId);
+      const support = captureSupport({ kind: 'checkpoint', id: task.id, principal, projectId: input.projectId, taskId: task.id,
+        sessionIds: [...new Set([...task.sessionIds, ...(input.sessionId ? [input.sessionId] : [])])].slice(0, 100), capturedAt: this.now() },
+        input.verified ?? task.verified, [...(input.evidenceRefs ?? []), ...(input.files ?? []).map(locator => ({ kind: 'artifact' as const, locator }))]);
+      const journal = this.writeJournal(task.id, input.projectId, support);
       const receipt = { stored: true, taskId: task.id, ...journal, duplicate: false, fingerprint };
       if (input.idempotencyKey) this.db.prepare('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)')
         .run(`checkpoint:${digest([principal, input.idempotencyKey])}`, JSON.stringify(receipt));
@@ -5128,6 +5533,9 @@ export class Store {
       // The diary is a record, not a verification: `self-reported` is the honest
       // level, because nothing here was independently checked by the plugin.
       evidence: 'self-reported' as const,
+      support: captureSupport({ kind: 'checkpoint', id: task.id, principal: 'core-journal', projectId, taskId: task.id,
+        sessionIds: task.sessionIds.slice(0, 100), capturedAt: task.updatedAt }, task.verified,
+        task.files.map(locator => ({ kind: 'artifact' as const, locator }))),
       platforms: [] as Array<'dsh' | 'codex'>,
       taskId: task.id,
       did,
@@ -5150,7 +5558,7 @@ export class Store {
     };
   }
   /** Record the journal as knowledge, so it survives the task record. */
-  writeJournal(taskId: string, projectId: string) {
+  writeJournal(taskId: string, projectId: string, support?: Support) {
     const journal = this.generateJournal(taskId, projectId);
     const existing = this.current().find(entry => entry.content.kind === 'journal'
       && (entry.content as { taskId?: string }).taskId === taskId);
@@ -5158,9 +5566,17 @@ export class Store {
     // generated journal; it is not part of the journal entry schema, so it is
     // dropped before the entry is stored.
     const { verification: _verification, ...entry } = journal;
-    const withRevision = existing
-      ? { ...entry, baseRevision: existing.revision }
-      : entry;
+    const prior = existing?.content.support;
+    let retained = support ?? (prior?.summary === entry.support.summary ? prior : entry.support);
+    if (support && prior?.summary === support.summary) {
+      const references = new Map(prior.references.map(reference => [`${reference.kind}:${reference.locator}`, reference]));
+      for (const reference of support.references) {
+        const old = references.get(`${reference.kind}:${reference.locator}`);
+        references.set(`${reference.kind}:${reference.locator}`, reference.snapshot === undefined && old?.snapshot !== undefined ? old : reference);
+      }
+      retained = captureSupport(support.origin, support.summary, [...references.values()], support.supplements);
+    }
+    const withRevision = { ...entry, support: retained, baseRevision: existing?.revision ?? 0 };
     const revision = this.import([withRevision]);
     return { journalId: journal.id, revision, replaced: Boolean(existing), outcome: journal.outcome };
   }
@@ -5431,7 +5847,9 @@ export class Store {
       const kindChanged = head.content.kind !== validated.kind;
       if (kindChanged) throw new DomainError('kind_changed', 'A refresh must keep the adopted knowledge kind', 409);
 
-      const incoming: Knowledge = { ...validated, id: head.content.id, baseRevision: head.revision } as Knowledge;
+      // A source refresh updates bytes, not a previous scope decision. This also
+      // prevents a later scan from widening a manually narrowed project entry.
+      const incoming: Knowledge = { ...validated, id: head.content.id, scope: head.content.scope, baseRevision: head.revision } as Knowledge;
       const knowledgeRevision = this.importInsideTransaction([incoming]);
 
       this.db.prepare(`INSERT INTO supersessions(old_knowledge_id,old_revision,new_knowledge_id,new_revision,action,reason,evidence,origin,replaced_local_edit,created_at)
@@ -5657,10 +6075,11 @@ export class Store {
    * them eventually forgets, and the entry that is forgotten is the one the user
    * most needed gone.
    */
-  private liveEntries(): Entry[] {
+  private liveEntries(includeSources = false): Entry[] {
     const now = this.now();
     return this.current().filter(entry =>
-      entry.content.kind !== 'material' || isLive(entry.content.expiresAt, now));
+      (includeSources || entry.content.curation?.role !== 'source')
+      && memoryIsLive(entry.content, now) && (entry.content.kind !== 'material' || isLive(entry.content.expiresAt, now)));
   }
   /**
    * Purge lapsed temporary material, returning what was removed.

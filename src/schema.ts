@@ -46,8 +46,85 @@ export const provenanceSchema = z.enum(['user', 'external', 'agent']);
  * agent saying "tests passed" must never be recorded as if it were verified.
  */
 export const evidenceLevelSchema = z.enum(['observed', 'verifiable', 'self-reported', 'unverifiable']);
+export const memoryContextSchema = z.object({
+  kind: z.enum(['norm', 'preference', 'memory', 'skill', 'material', 'journal']).optional(),
+  scope: z.enum(['global', 'project', 'task']).optional(),
+  durability: z.enum(['durable', 'temporary']).optional(),
+  /**
+   * 工作类别：这条讲的是哪摊事（受控词表见 `domain-taxonomy.ts`）。
+   *
+   * 与 kind/scope 正交：kind 说"是什么"，scope 说"管多大"，domain 说"属于哪类工作"。
+   * 只服务检索与导航，不参与权限、门禁与采纳判定。校验放在写入路径（未知域拒收），
+   * 不放在 schema 层，避免 schema 反过来依赖域词表。
+   */
+  domain: shortText.optional(),
+  appliesWhen: z.array(shortText).max(20).optional(),
+  invalidatedWhen: z.array(shortText).max(20).optional(),
+}).strict();
+export const validitySchema = z.object({
+  expiresAt: z.number().int().positive(),
+  reason: shortText,
+  appliesWhen: z.array(shortText).max(20).default([]),
+  invalidatedWhen: z.array(shortText).max(20).default([]),
+}).strict();
+export const evidenceReferenceSchema = z.object({
+  kind: z.enum(['artifact', 'command', 'url', 'knowledge', 'event']),
+  locator: z.string().trim().min(1).max(2000),
+  snapshot: z.string().max(6000).optional(),
+  /** Computed on the retained, sanitized snapshot, not proof that the claim is true. */
+  snapshotHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  reportedHash: z.string().max(128).optional(),
+  /**
+   * The plugin filled this reference in from the session's own event stream instead of
+   * the caller citing it. Recorded so a reader can tell an automatic capture from a
+   * deliberate citation; attaching it never raises the evidence level.
+   */
+  autoCollected: z.boolean().optional(),
+  revision: z.number().int().positive().optional(),
+  observedAt: z.number().int().nonnegative().optional(),
+  result: z.string().max(1000).optional(),
+}).strict();
+export const supportSchema = z.object({
+  origin: z.object({ kind: z.enum(['proposal', 'checkpoint', 'source']), id: identifier, principal: identifier,
+    projectId: identifier.optional(), taskId: identifier.optional(), sessionIds: z.array(z.string().min(1).max(256)).max(100),
+    capturedAt: z.number().int().nonnegative(),
+  }).strict(),
+  summary: z.string().max(4000), references: z.array(evidenceReferenceSchema).max(110),
+  supplements: z.array(z.object({ evidence: z.string().max(2000), at: z.number(), actor: z.string().max(200) }).strict()).max(100),
+  status: z.enum(['missing', 'referenced', 'captured']), snapshotHash: z.string().regex(/^[a-f0-9]{64}$/),
+  /**
+   * A person's explicit decision to promote a claim that cites nothing.
+   *
+   * It is recorded next to the evidence rather than in a decision log so a later
+   * backup, export or revision cannot separate the claim from the reason it was let
+   * in. A waived entry is readable and reviewable, but it is never auto-injected:
+   * "a human accepted the risk once" is not the same as "this is supported".
+   */
+  waiver: z.object({ reason: shortText, actor: identifier, at: z.number().int().nonnegative() }).strict().optional(),
+  predecessor: z.object({ id: identifier, revision: z.number().int().positive() }).strict().optional(),
+}).strict();
+export const curationSchema = z.object({
+  batchId: identifier,
+  role: z.enum(['record', 'source', 'collection']),
+  scopeStatus: z.enum(['confirmed', 'unresolved']),
+  durability: z.enum(['historical', 'durable', 'temporary', 'uncertain']),
+  domain: shortText.optional(),
+  sources: z.array(z.object({
+    id: identifier, revision: z.number().int().positive(), hash: z.string().length(64),
+    quote: z.string().max(1000).optional(),
+  }).strict()).max(300).default([]),
+  members: z.array(identifier).max(300).default([]),
+  note: shortText.optional(),
+}).strict();
 const common = {
   id: identifier, title: shortText, scope: scopeSchema,
+  /** Optional for compatibility; reading never renews a temporary claim. */
+  validity: validitySchema.optional(),
+  applicability: memoryContextSchema.optional(),
+  /** Provenance and retrieval role, not a source of instruction authority. */
+  curation: curationSchema.optional(),
+  /** Evidence is retained outside prose and full-text indexes. A capture is not verification. */
+  support: supportSchema.optional(),
   baseRevision: z.number().int().nonnegative().default(0),
   /** Browsing aids. Never used for authority, only for finding things. */
   labels: z.array(shortText).max(30).default([]),
@@ -267,10 +344,22 @@ export type EvidenceLevel = z.infer<typeof evidenceLevelSchema>;
  */
 export const proposalSchema = z.object({
   idempotencyKey: identifier, projectId: identifier, taskId: identifier.optional(),
+  sessionId: z.string().min(1).max(256).optional(),
   workflowId: identifier.optional(), stageId: identifier.optional(),
   baseRevision: z.number().int().positive().optional(),
   discovery: z.string().trim().min(1).max(12000),
   evidence: z.string().trim().max(4000).optional(),
+  evidenceRefs: z.array(evidenceReferenceSchema).max(10).optional(),
+  /** Agent declarations aid triage; they grant no authority or wider scope. */
+  memoryContext: memoryContextSchema.optional(),
+  /**
+   * 插件在提交时自行推导的分类结果（kind/scope/domain）。
+   *
+   * 与 `memoryContext` 分开存放：后者是调用方的**声明**，参与"是不是同一条提交"的判定；
+   * 前者是插件的**推断**，不参与去重（否则同一段文字会因为插件开始推断而被当成新提交），
+   * 只在条目被采纳、调用方没给声明时补位。
+   */
+  autoClassification: memoryContextSchema.optional(),
 }).strict();
 export const eventSchema = z.object({
   eventId: identifier, adapter: z.enum(['codex', 'dsh']), projectId: identifier,

@@ -6,11 +6,15 @@
 ![Node](https://img.shields.io/badge/node-24.13--24.x-brightgreen.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)
 ![Protocol](https://img.shields.io/badge/protocol-v1-blue.svg)
-![Contracts](https://img.shields.io/badge/contracts-39%2F39-brightgreen.svg)
-![Tests](https://img.shields.io/badge/tests-816%20passing-brightgreen.svg)
+![Contracts](https://img.shields.io/badge/contracts-53%2F53-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-902%20passing-brightgreen.svg)
 ![Storage](https://img.shields.io/badge/storage-SQLite%20(local)-informational.svg)
 
-**这是什么**：一个本地知识库插件——核心是只监听 `127.0.0.1` 的 HTTP 服务加一个 SQLite 文件，DSH 与 Codex 各有一个适配器，另有 MCP 入口与托盘桌面控制台。没有云端、没有外部推理、没有账号。
+**这是什么**：一个本地知识库插件——核心是只监听 `127.0.0.1` 的 HTTP 服务加一个 SQLite 文件，DSH 与 Codex 各有一个适配器，另有 MCP 入口与托盘桌面控制台。默认在本机运行，无需云账号；可选模型与向量服务由用户自行配置。
+
+2026-10-20：[记忆归属、临时事实有效期和检索续查改进](docs/implementation/memory-quality-2026-10-20.md)，以及 [五个同类项目的一手研究](docs/implementation/peer-memory-systems-2026-10-20.md)。
+
+续作：[存量历史与技能导航整理](docs/implementation/memory-curation-2026-10-20.md)、[证据随采纳和日记保留](docs/implementation/evidence-retention-2026-10-20.md)。
 
 **给谁用**：同时使用 DSH 和/或 Codex、希望两个 agent 遵守同一套规范并复用同一批经验的人。
 

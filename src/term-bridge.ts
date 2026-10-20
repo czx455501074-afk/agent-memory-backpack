@@ -64,6 +64,31 @@ const CONCEPT_GROUPS: string[][] = [
   ['训练', 'train', 'training', 'lora'],
   ['画布', 'canvas'],
   ['记忆', 'memory', '记住', 'remember'],
+  // 工程与运维高频说法：取自本仓库真实文档与对话，不是通用同义词典。
+  ['上下文', 'context', '窗口'],
+  ['预算', 'budget', '配额', 'quota'],
+  ['工具', 'tool', 'tools', '函数', 'function'],
+  ['定义', 'schema', 'definition', '签名', 'signature'],
+  ['证据', 'evidence', 'proof'],
+  ['分类', 'classify', 'classification', '归类', 'category'],
+  ['索引', 'index', 'indexing'],
+  ['召回', 'recall', '命中', 'hit'],
+  ['归档', 'archive', '快照', 'snapshot'],
+  ['回滚', 'rollback', 'revert', '撤销'],
+  ['超时', 'timeout'],
+  ['限流', 'rate limit', 'throttle', '限速'],
+  ['错误', 'error', '异常', 'exception'],
+  ['重试', 'retry', '重放', 'replay'],
+  ['配置', 'config', 'configuration', '设置'],
+  ['路径', 'path', '目录', 'directory'],
+  ['会话', 'session', '对话', 'conversation'],
+  ['任务', 'task', '作业'],
+  ['项目', 'project', '仓库', 'repo'],
+  ['状态', 'status', 'state'],
+  ['备份', 'backup', '恢复', 'restore'],
+  ['模型', 'model', 'llm', '大模型'],
+  ['提示词', 'prompt', 'prompts'],
+  ['评测', 'eval', 'benchmark', '基准'],
 ];
 
 /** 中英对照扩展：库里有该组任一词，就把整组作为别名补上。 */
@@ -186,4 +211,41 @@ export function buildTermBridge(input: {
   ])].filter(term => term.length >= 2 && term.length <= 200).slice(0, 40);
 
   return { aliases, keywords };
+}
+
+/**
+ * 查询侧的桥：把用户用的说法换成同组里的其它说法（中↔英）。
+ *
+ * 为什么必须做在查询侧：`withBridge()` 只给**条目**补别名，条目里的中文「上下文」会带上
+ * `context`，于是英文查询能命中中文条目；反过来不成立——用户问 `context budget` 时，
+ * 索引里若没有中文条目带 `context` 这个别名，就什么也搜不到。双向都要通，只在索引侧补
+ * 一半，等于只修了单向。
+ *
+ * 边界（三条，都是有意的）：
+ * 1. 只扩展**命中概念组**的词，不扩展任意词。否则每个查询都会膨胀成一页泛词。
+ * 2. 中文扩展词按 2-gram 返回，因为索引就是这样切的（`searchable()`）；英文扩展词整词返回，
+ *    因为索引里的英文就是整词。两边的 token 形状必须与索引同构，否则永远匹配不上。
+ * 3. 结果去重并限量，由调用方再截断。扩展词只增加候选，不改变"原查询优先"的排序。
+ */
+export function expandQueryTerms(query: string): { latin: string[]; han: string[] } {
+  const { han, latin } = extractTerms(String(query ?? ''));
+  const lowered = new Set([...han, ...latin].map(term => term.toLowerCase()));
+  const latinOut = new Set<string>();
+  const hanOut = new Set<string>();
+  for (const group of CONCEPT_GROUPS) {
+    const hit = group.some(word => lowered.has(word.toLowerCase())
+      || [...lowered].some(term => term.includes(word.toLowerCase()) || word.toLowerCase().includes(term)));
+    if (!hit) continue;
+    for (const word of group) {
+      if (/^[a-z0-9][a-z0-9 _.-]*$/i.test(word)) latinOut.add(word.toLowerCase());
+      else if (/^\p{Script=Han}+$/u.test(word)) {
+        // 与 `searchable()` 同构：长度 1 保留，其它按 2 字滑窗。
+        if (word.length === 1) hanOut.add(word);
+        else for (let i = 0; i + 2 <= word.length; i += 1) hanOut.add(word.slice(i, i + 2));
+      }
+    }
+  }
+  // 原词已经在查询里，不重复返回。
+  for (const term of lowered) { latinOut.delete(term); hanOut.delete(term); }
+  return { latin: [...latinOut].slice(0, 24), han: [...hanOut].slice(0, 48) };
 }

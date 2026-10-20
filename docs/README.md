@@ -15,6 +15,10 @@
 
 ## 按主题找
 
+**记忆质量（2026-10-20）**：[类型、归属、有效期与检索续查改进](implementation/memory-quality-2026-10-20.md)；[Mem0 / Letta / Graphiti / claude-mem / QMD 一手研究](implementation/peer-memory-systems-2026-10-20.md)。含只读存量审计入口、已实现约束与尚未验证的行为收益。
+
+**存量整理与证据**：[三代理整理、来源归档与可回滚迁移](implementation/memory-curation-2026-10-20.md)；[候选采纳、日记与文件导入的证据保留](implementation/evidence-retention-2026-10-20.md)。
+
 **R5 各条线的交付**（每份含问题、改法、证据、未完成项）：`r5-retrieval.md`（检索链路）、`r5-classification.md`（分类器诚实性）、`r5-queue.md`（审核队列可用性）、`r5-session.md`（会话层收敛）、`r5-wiring.md`（面板接线）、`r5-host-archiving.md`（宿主侧归档）、`r5-review-prefill.md`（审核预填）、`r5-candidate-flow.md`（候选流转与自动提炼）。
 
 **召回与预算**：`r5-injection-budget.md`、`r5-recall-budget.md`（字符预算与渐进披露，含真实测量）。

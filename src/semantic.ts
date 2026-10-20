@@ -1,4 +1,5 @@
 import { DomainError } from './schema.js';
+import { assessMemory, type MemoryAssessment, type MemoryContext } from './memory-policy.js';
 
 /**
  * Semantic analysis and similarity ranking module.
@@ -38,6 +39,8 @@ export interface ClassificationContext {
   evidence?: EvidenceClassification;
   /** An external authority this text came from (a file name, a document title, a URL). */
   sourceRef?: string;
+  taskId?: string;
+  memoryContext?: MemoryContext;
 }
 
 export interface SemanticAnalysis {
@@ -64,6 +67,7 @@ export interface SemanticAnalysis {
   autoPromotable: boolean;
   /** Why `autoPromotable` is false — the sentence a reviewer is shown. Absent when it is true. */
   promotionBlockedReason?: string;
+  assessment?: MemoryAssessment;
 }
 
 /**
@@ -270,15 +274,16 @@ export function classifyCandidate(
 ): SemanticAnalysis {
   const trimmed = text.trim();
   if (trimmed.length < 5) {
-    const shortVerdict = promotionVerdict('memory', 'project', trimmed, context, false);
+    const assessment = assessMemory(trimmed, context.memoryContext);
     return {
       kind: 'memory',
       scope: 'project',
       relation: 'low_value',
       confidence: 0.9,
       needsSplit: false,
-      autoPromotable: shortVerdict.autoPromotable,
-      promotionBlockedReason: shortVerdict.promotionBlockedReason,
+      assessment,
+      autoPromotable: assessment.value !== 'noise',
+      ...(assessment.value === 'noise' ? { promotionBlockedReason: '确认语或无信息文本不进入长期知识' } : {}),
       reasoning: '内容过短，无显著知识复用价值',
     };
   }
@@ -302,10 +307,12 @@ export function classifyCandidate(
   if (countTypes >= 2) {
     needsSplit = true;
     suggestedSplit = [];
-    if (hasNorm) suggestedSplit.push({ kind: 'norm', text: '规范要求部分' });
-    if (hasPref) suggestedSplit.push({ kind: 'preference', text: '习惯偏好部分' });
-    if (hasProc) suggestedSplit.push({ kind: 'skill', text: '操作流程部分' });
-    if (hasMat) suggestedSplit.push({ kind: 'material', text: '外部资料部分' });
+    const clauses = trimmed.split(/[；;\n]+/).filter(Boolean);
+    const original = (test: (clause: string) => boolean) => clauses.filter(test).join('\n') || trimmed;
+    if (hasNorm) suggestedSplit.push({ kind: 'norm', text: original(isNormative) });
+    if (hasPref) suggestedSplit.push({ kind: 'preference', text: original(isPreference) });
+    if (hasProc) suggestedSplit.push({ kind: 'skill', text: original(isProcedural) });
+    if (hasMat) suggestedSplit.push({ kind: 'material', text: original(isMaterial) });
   }
 
   /**
@@ -320,7 +327,7 @@ export function classifyCandidate(
    */
   if (hasNorm) kind = 'norm';
   else if (hasPref) kind = 'preference';
-  else if (hasMat) kind = 'material';
+  else if (hasMat && !narrative) kind = 'material';
   else if (hasProc) kind = 'skill';
   else kind = 'memory';
 
@@ -328,9 +335,21 @@ export function classifyCandidate(
   let scope: ScopeClassification = 'project';
   if (/(?:这一次|仅限本任务|当前任务|临时使用|一次性|本次会话)/.test(trimmed)) {
     scope = 'task';
-  } else if (/(?:全局|通用|所有项目|全平台|跨项目|任何时候)/.test(trimmed)) {
+  } else if (/(?:所有项目|全平台|跨项目|任何时候|全局(?:规范|规则|偏好)|全局通用)/.test(trimmed)
+    && !/(?:仅限|只适用|不适用|不应推广|不得推广|不是|并非)[^。\n]{0,12}(?:全局|所有项目|跨项目)/.test(trimmed)) {
     scope = 'global';
   }
+
+  const assessment = assessMemory(trimmed, context.memoryContext);
+  if (assessment.value === 'episodic') kind = 'journal';
+  if (assessment.mixedContexts) needsSplit = true;
+  // A transient observation belongs to the originating task when one is known.
+  if (assessment.durability === 'temporary' && context.taskId) scope = 'task';
+  if (context.memoryContext?.scope === 'task') scope = 'task';
+  if (context.memoryContext?.scope === 'project') scope = 'project';
+  // Declared global scope is a review request, never an inferred permission.
+  if (context.memoryContext?.scope === 'global' && assessment.durability !== 'temporary') scope = 'global';
+  if (assessment.durability === 'temporary' && context.taskId) scope = 'task';
 
   // 3. Relation analysis against existing knowledge
   let relation: RelationClassification = 'new';
@@ -371,11 +390,24 @@ export function classifyCandidate(
   }
 
   const verdict = promotionVerdict(kind, scope, trimmed, context, narrative);
+  const blocked = assessment.value === 'noise' || assessment.durability === 'temporary'
+    || needsSplit || (scope === 'task' && !context.taskId)
+    || !!(context.memoryContext?.kind && context.memoryContext.kind !== kind);
+  if (blocked) {
+    verdict.autoPromotable = false;
+    verdict.promotionBlockedReason = assessment.value === 'noise' ? '低价值内容不进入长期知识'
+      : assessment.durability === 'temporary' ? '短期状态或未核实故障仅作事件记录，需有效期及重验证，不得固化为长期经验'
+      : needsSplit ? '混合了多种内容，需拆分后确认类型和作用域'
+      : scope === 'task' && !context.taskId ? '缺少任务标识，不能把任务内容静默放宽为项目内容'
+      : '提交者声明的类型与规则判定不一致，需要核对';
+  }
   return {
     kind,
     scope,
-    relation,
-    confidence: Math.min(0.95, 0.6 + bestSim * 0.35),
+    relation: assessment.value === 'noise' ? 'low_value' : relation,
+    assessment,
+    // Similarity to another entry says nothing about kind/scope correctness.
+    confidence: needsSplit ? 0.45 : assessment.value === 'episodic' ? 0.9 : 0.6,
     needsSplit,
     suggestedSplit,
     conflictingEntryId,

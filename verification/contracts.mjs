@@ -393,7 +393,7 @@ const CONTRACTS = [
     id: 'injection-uses-the-real-query',
     why: 'prepare 为了列出全部候选给 knowledge() 传空 query（那是故意的），而片段与"读第几块"必须按真实查询取。把 excerpt 改成"相关段落"之后，prepare 路径上一点没变——因为它传的是空字符串，于是 excerpt 永远是正文开头、hitChunks 永远是 null；而当时的测试测的是 knowledge() 直调，所以全绿。**测了函数不等于测了那条真正在跑的路。**',
     file: 'src/store.ts',
-    must: ['excerptQuery', '400, 0.5, query)', 'hitChunks'],
+    must: ['excerptQuery', '400, 0.5, query, options?.taskId)', 'hitChunks'],
     other: [
       ['test/injection-uses-the-real-query.test.ts', ['片段必须按查询取，不能等于正文开头', '浏览目录时不该指路']],
     ],
@@ -415,7 +415,44 @@ const CONTRACTS = [
     file: 'scripts/deploy-plugin.mjs',
     must: ['部署目标被占用'],
   },
+  {
+    id: 'temporary-experience-is-not-a-permanent-rule',
+    why: '暂态故障不能因确认或旧分类快照成为永久规则；失效应同时约束检索、注入和门禁。',
+    file: 'src/store.ts',
+    must: ['temporary_memory_requires_event', 'temporary_memory_requires_task', 'TEMPORARY_MEMORY_TTL', 'memoryIsLive(e.content', 'memoryIsLive(entry.content'],
+    other: [['src/memory-policy.ts', ['mixedContexts', 'requiresRevalidation']], ['test/memory-quality.test.ts', ['temporary facts expire on every retrieval path']]],
+  },
+  {
+    id: 'explicit-retrieval-reports-continuation',
+    why: '模型只选部分条目不能截掉全文命中；节选必须给分页、版本与未读状态。',
+    file: 'src/server.ts',
+    must: ['...bySelection, ...lexical.filter', 'nextPassageOffset', 'searchSnapshot', 'missingTerms', 'complete:false'],
+    other: [['src/mcp.ts', ['passageOffset', 'searchSnapshot']], ['adapters/dsh/index.mjs', ['passageOffset', 'searchSnapshot']]],
+  },
+  {
+    id: 'source-location-is-not-global-applicability',
+    why: '项目文档不应统一 global，共享 memories 位置也不能决定其事实全局适用。',
+    file: 'src/source-scope.ts',
+    must: ['shared_history_requires_project_attribution', 'explicit_project_import'],
+    other: [['src/discovery.ts', ['scopeReviewRequired', 'sourceScope(path, scopeContext']], ['src/rescan.ts', ['entry.scopeReviewRequired']]],
+  },
 ];
+
+CONTRACTS.push({
+  id: 'evidence-survives-adoption-and-journal-storage',
+  why: '证据不能只留在候选队列或被日记诊断字段丢弃；快照随修订保留且不污染检索。',
+  file: 'src/evidence.ts', must: ['captureSupport', 'snapshotHash', 'retrievalContent'],
+  other: [['src/store.ts', ['support: { ...support', 'evidenceStatus: support.status', 'writeJournal(task.id, input.projectId, support)']],
+    ['src/mcp.ts', ['evidenceRefs:']], ['adapters/dsh/index.mjs', ['evidenceReferencesSchema', 'sessionId: exec.agent.id']]],
+});
+CONTRACTS.push({
+  id: 'curation-retains-evidence-and-reversible-receipts',
+  why: '存量归纳需保留原文、精确来源、范围边界和可回滚批次；历史不作为自动建议。',
+  file: 'src/curation.ts',
+  must: ['Invalid exact quote', 'scopeStatus', 'Cannot archive a skill', 'Incomplete source reading'],
+  other: [['src/store.ts', ['applyCurationBatch', 'rollbackCurationBatch', 'curation_source_changed', 'curation_rollback_conflict', "liveEntries(includeSources = false)"]],
+    ['src/memory-policy.ts', ['mayAutomaticallyRecall', "scopeStatus === 'confirmed'"]], ['src/server.ts', ['rankedCandidates.filter(mayAutomaticallyRecall)']]],
+});
 
 const results = [];
 for (const contract of CONTRACTS) {

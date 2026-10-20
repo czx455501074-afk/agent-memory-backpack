@@ -1,6 +1,8 @@
 import { discover, rescanDiff, summarizeRescan, type AdoptedCandidate, type RescanReport } from './discovery.js';
 import type { Knowledge } from './schema.js';
 import type { Store } from './store.js';
+import type { ScanScopeContext } from './source-scope.js';
+import { captureSupport } from './evidence.js';
 
 /**
  * Periodic rescan orchestration.
@@ -27,11 +29,16 @@ import type { Store } from './store.js';
  */
 export function candidateToKnowledge(candidate: AdoptedCandidate): Knowledge {
   const base = {
-    id: candidate.id, title: candidate.title, scope: { kind: 'global' as const }, baseRevision: 0,
+    id: candidate.id, title: candidate.title, scope: candidate.scope ?? { kind: 'global' as const }, baseRevision: 0,
     labels: [] as string[], provenance: 'user' as const, evidence: 'observed' as const, platforms: [] as Array<'dsh' | 'codex'>,
     // 术语桥留空：采纳是"原文照搬"，规则生成的桥由索引侧统一补（见 store.ts 的 withBridge）。
     // 写空数组而不是让它缺省，是因为 `default([])` 只影响 parse —— 类型上这些字段仍然要求存在。
     aliases: [] as string[], keywords: [] as string[],
+    support: captureSupport({ kind: 'source', id: candidate.id, principal: 'filesystem-import',
+      ...(candidate.scope && candidate.scope.kind !== 'global' ? { projectId: candidate.scope.projectId } : {}),
+      sessionIds: [], capturedAt: Date.now() }, '已读取来源文件；原文保存在本条正文，读到文件不代表其中结论已验证。',
+      [{ kind: 'artifact', locator: candidate.source.path, reportedHash: candidate.source.hash,
+        snapshot: candidate.body.slice(0, 6000), result: `source bytes=${candidate.source.bytes}; full normalized source is retained in this revision` }]),
   };
   if (candidate.kind === 'skill') {
     return {
@@ -73,13 +80,17 @@ export interface RescanOutcome {
  * Each source is applied independently: one unreadable or conflicting file must
  * not abort the rest of the scan, so failures are collected rather than thrown.
  */
-export function applyRescan(store: Store, roots: string[]): RescanOutcome {
-  const report = rescanDiff(discover(roots), store.adoptions());
+export function applyRescan(store: Store, roots: string[], scopeContext?: ScanScopeContext): RescanOutcome {
+  const report = rescanDiff(discover(roots, 5000, scopeContext), store.adoptions());
   const refreshed: RescanOutcome['refreshed'] = [];
   const errors: RescanOutcome['errors'] = [];
   const toAdopt: Array<{ source: { path: string; hash: string }; kind: string; title: string; knowledge: Knowledge }> = [];
 
   for (const entry of report.entries) {
+    if (entry.scopeReviewRequired && entry.status !== 'unchanged') {
+      errors.push({ source: entry.source.path, message: '共享目录中的记忆/日记尚未确认项目归属，未自动采纳；用 adopt --project PROJECT --only ID 明确归属，或在管理界面审查' });
+      continue;
+    }
     if (entry.status === 'changed') {
       try {
         const result = store.refreshAdoption({

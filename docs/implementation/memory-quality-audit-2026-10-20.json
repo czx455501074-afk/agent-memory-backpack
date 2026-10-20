@@ -1,0 +1,119 @@
+{
+  "readOnly": true,
+  "checkedAt": "2026-10-19T16:40:16.403Z",
+  "active": {
+    "total": 231,
+    "kinds": {
+      "memory": 46,
+      "journal": 34,
+      "norm": 4,
+      "skill": 147
+    },
+    "scopes": {
+      "project": 52,
+      "task": 12,
+      "global": 167
+    },
+    "expired": 0,
+    "temporaryWithoutExpiry": 0,
+    "compositeMemories": 8,
+    "noise": 0,
+    "globalJournals": 7
+  },
+  "pending": {
+    "total": 12,
+    "kinds": {
+      "memory": 11,
+      "norm": 1
+    },
+    "scopes": {
+      "project": 11,
+      "task": 1
+    },
+    "durability": {
+      "unknown": 12
+    },
+    "noise": 0,
+    "kindChanged": 0,
+    "scopeChanged": 0
+  },
+  "samples": [
+    {
+      "id": "memory:0755a40e3dacfa94",
+      "location": "active",
+      "kind": "memory",
+      "finding": "multi_event_history_stored_as_single_memory",
+      "reasons": [
+        "包含多个带日期的事件或任务段落，应保留为历史日记并按事件整理，不能视为一条通用事实",
+        "存在短期状态或故障信号，需要失效时间和再次验证"
+      ]
+    },
+    {
+      "id": "memory:578755cd1d3eb374",
+      "location": "active",
+      "kind": "memory",
+      "finding": "multi_event_history_stored_as_single_memory",
+      "reasons": [
+        "包含多个带日期的事件或任务段落，应保留为历史日记并按事件整理，不能视为一条通用事实"
+      ]
+    },
+    {
+      "id": "memory:5d72a8be021375bb",
+      "location": "active",
+      "kind": "memory",
+      "finding": "multi_event_history_stored_as_single_memory",
+      "reasons": [
+        "包含多个带日期的事件或任务段落，应保留为历史日记并按事件整理，不能视为一条通用事实"
+      ]
+    },
+    {
+      "id": "memory:e9fa868360145a8a",
+      "location": "active",
+      "kind": "memory",
+      "finding": "multi_event_history_stored_as_single_memory",
+      "reasons": [
+        "包含多个带日期的事件或任务段落，应保留为历史日记并按事件整理，不能视为一条通用事实",
+        "存在短期状态或故障信号，需要失效时间和再次验证"
+      ]
+    },
+    {
+      "id": "memory:f86740e5d9b5ebee",
+      "location": "active",
+      "kind": "memory",
+      "finding": "multi_event_history_stored_as_single_memory",
+      "reasons": [
+        "包含多个带日期的事件或任务段落，应保留为历史日记并按事件整理，不能视为一条通用事实",
+        "存在短期状态或故障信号，需要失效时间和再次验证"
+      ]
+    },
+    {
+      "id": "memory:fb876607cbafc1bc",
+      "location": "active",
+      "kind": "memory",
+      "finding": "multi_event_history_stored_as_single_memory",
+      "reasons": [
+        "包含多个带日期的事件或任务段落，应保留为历史日记并按事件整理，不能视为一条通用事实"
+      ]
+    },
+    {
+      "id": "memory:fe53754fba84821f",
+      "location": "active",
+      "kind": "memory",
+      "finding": "multi_event_history_stored_as_single_memory",
+      "reasons": [
+        "包含多个带日期的事件或任务段落，应保留为历史日记并按事件整理，不能视为一条通用事实"
+      ]
+    },
+    {
+      "id": "memory:fff83ff45e96e902",
+      "location": "active",
+      "kind": "memory",
+      "finding": "multi_event_history_stored_as_single_memory",
+      "reasons": [
+        "包含多个带日期的事件或任务段落，应保留为历史日记并按事件整理，不能视为一条通用事实",
+        "提供了适用条件与验证线索；线索仍需核对，不等于插件已验证"
+      ]
+    }
+  ],
+  "note": "Classification is advisory. No content, scope, expiry, proposal state or database schema was changed. Global journal attribution and mixed historical records require source-based review; do not guess their project from keywords."
+}
